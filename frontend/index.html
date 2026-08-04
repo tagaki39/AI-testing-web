@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AI Web 测试平台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f5f7fa; color: #1a1a2e; padding: 24px;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 24px; margin-bottom: 4px; }
+  .subtitle { color: #888; font-size: 13px; margin-bottom: 24px; }
+  .card {
+    background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  label { font-size: 13px; font-weight: 600; display: block; margin-bottom: 8px; }
+  textarea {
+    width: 100%; border: 1px solid #e0e4e8; border-radius: 8px;
+    padding: 12px; font-size: 14px; font-family: inherit; resize: vertical;
+    min-height: 60px;
+  }
+  textarea:focus { outline: none; border-color: #4f8cff; }
+  .row { display: flex; gap: 12px; margin-top: 12px; }
+  button {
+    padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer;
+    font-size: 14px; font-weight: 600; transition: all 0.2s;
+  }
+  .primary { background: #1a1a2e; color: #fff; }
+  .primary:hover { opacity: 0.9; }
+  .secondary { background: #eef1f5; color: #1a1a2e; }
+  .secondary:hover { background: #e2e6ec; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #status { margin-top: 12px; font-size: 13px; color: #666; min-height: 20px; }
+  .step {
+    border: 1px solid #e8ebef; border-radius: 8px; padding: 12px;
+    margin-bottom: 10px; background: #fafbfc;
+  }
+  .step-header { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+  .badge {
+    padding: 2px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;
+  }
+  .badge.passed { background: #e6f7ed; color: #1a9c4f; }
+  .badge.failed { background: #fdecec; color: #d43c3c; }
+  .step-detail { margin-top: 8px; font-size: 13px; color: #555; }
+  .step-error { margin-top: 8px; font-size: 13px; color: #d43c3c; background: #fdf3f3;
+                padding: 8px; border-radius: 6px; }
+  .step img { margin-top: 10px; max-width: 100%; border: 1px solid #eee; border-radius: 6px; }
+  .summary { display: flex; gap: 24px; font-size: 14px; margin-bottom: 16px; }
+  .summary .num { font-size: 28px; font-weight: 700; }
+  .summary .green { color: #1a9c4f; } .summary .red { color: #d43c3c; }
+  #dsl-editor { font-family: "Cascadia Code", Consolas, monospace; font-size: 13px; min-height: 200px; }
+  .hint { font-size: 12px; color: #999; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🧪 AI Web 测试平台</h1>
+  <div class="subtitle">自然语言描述 → AI 生成 DSL → Playwright 自动执行 → 步骤级证据</div>
+
+  <div class="card">
+    <label>① 描述你的测试需求（自然语言）</label>
+    <textarea id="prompt" placeholder="例如：打开 https://example.com，验证页面包含文字 Example Domain"></textarea>
+    <div class="row">
+      <button class="primary" id="btn-generate" onclick="generate()">🤖 AI 生成 DSL</button>
+      <button class="secondary" onclick="fillExample()">填入示例</button>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <label>② 生成的 DSL（可手动修改后再执行）</label>
+    <textarea id="dsl-editor" placeholder='{"name": "...", "base_url": "...", "steps": [...]}'></textarea>
+    <div class="row">
+      <button class="primary" id="btn-execute" onclick="execute()" disabled>▶ 执行测试</button>
+      <span class="hint" style="align-self:center">变量示例：{"email": "test@x.com"} 会替换 DSL 中的 ${email}</span>
+    </div>
+  </div>
+
+  <div class="card" id="report-card" style="display:none">
+    <label>③ 执行报告</label>
+    <div class="summary" id="summary"></div>
+    <div id="steps"></div>
+  </div>
+</div>
+
+<script>
+let currentCase = null;
+
+function setStatus(msg, error) {
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.style.color = error ? "#d43c3c" : "#666";
+}
+
+async function generate() {
+  const prompt = document.getElementById("prompt").value.trim();
+  if (!prompt) { setStatus("请先描述测试需求", true); return; }
+  const btn = document.getElementById("btn-generate");
+  btn.disabled = true;
+  setStatus("AI 正在生成 DSL…（需要 10-30 秒）");
+  try {
+    const resp = await fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "生成失败");
+    currentCase = data.case;
+    document.getElementById("dsl-editor").value = JSON.stringify(currentCase, null, 2);
+    document.getElementById("btn-execute").disabled = false;
+    setStatus("✅ DSL 生成成功，点击「执行测试」运行");
+  } catch (e) {
+    setStatus("❌ " + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function execute() {
+  let caseObj;
+  try {
+    caseObj = JSON.parse(document.getElementById("dsl-editor").value);
+  } catch (e) {
+    setStatus("❌ DSL 不是合法 JSON: " + e.message, true);
+    return;
+  }
+  // 从 DSL 的 input_contract 提取默认值作为输入变量
+  const inputValues = {};
+  for (const c of (caseObj.input_contract || [])) {
+    if (c.value) inputValues[c.key] = c.value;
+  }
+  const btn = document.getElementById("btn-execute");
+  btn.disabled = true;
+  setStatus("Playwright 正在执行…");
+  try {
+    const resp = await fetch("/api/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ case: caseObj, input_values: inputValues }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "执行失败");
+    renderReport(data.report);
+    setStatus("✅ 执行完成");
+  } catch (e) {
+    setStatus("❌ " + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderReport(report) {
+  document.getElementById("report-card").style.display = "block";
+  const passed = report.passed_steps;
+  const total = report.total_steps;
+  const allPassed = report.status === "passed";
+  document.getElementById("summary").innerHTML = `
+    <div><span class="num ${allPassed ? "green" : "red"}">${passed}/${total}</span><br>步骤通过</div>
+    <div><span class="num ${allPassed ? "green" : "red"}">${allPassed ? "✅ 通过" : "❌ 失败"}</span><br>用例状态</div>
+    <div><span class="num">${report.latest_url ? report.latest_url : "-"}</span><br>最后页面</div>
+  `;
+  document.getElementById("steps").innerHTML = report.results.map((r, i) => `
+    <div class="step">
+      <div class="step-header">
+        <span style="color:#999">${i + 1}.</span>
+        <strong>${r.action}</strong>
+        <span style="color:#888">${r.target || ""}</span>
+        <span style="color:#888">${r.value || ""}</span>
+        <span class="badge ${r.status}">${r.status === "passed" ? "通过" : "失败"}</span>
+      </div>
+      ${r.error ? `<div class="step-error">${escapeHtml(r.error)}</div>` : ""}
+      ${r.screenshot ? `<img src="${r.screenshot}" alt="步骤${i + 1}截图">` : ""}
+    </div>
+  `).join("");
+}
+
+function fillExample() {
+  document.getElementById("prompt").value =
+    "打开 https://example.com，验证页面包含文字 \"Example Domain\"";
+}
+
+function escapeHtml(s) {
+  const div = document.createElement("div");
+  div.textContent = s;
+  return div.innerHTML;
+}
+</script>
+</body>
+</html>
