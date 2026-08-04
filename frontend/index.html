@@ -87,31 +87,44 @@
 </div>
 
 <script>
+// ═══════════════════════════════════════════════════════════════════
+// 前端 JS：只做三件事（"前端 = 采集输入 + 调 API + 渲染结果"）
+//   1. generate()    采集需求 → POST /api/generate → 展示 DSL
+//   2. execute()     读 DSL → POST /api/execute → 展示报告
+//   3. renderReport() 把后端返回的 JSON 渲染成步骤卡片 + 截图
+// 注意：前端不含任何测试执行逻辑——执行永远在后端（架构边界）
+// ═══════════════════════════════════════════════════════════════════
+
+// 当前 AI 生成的 DSL（保留在内存，方便直接执行）
 let currentCase = null;
 
+// 页面底部状态提示（成功灰色 / 失败红色）
 function setStatus(msg, error) {
   const el = document.getElementById("status");
   el.textContent = msg;
   el.style.color = error ? "#d43c3c" : "#666";
 }
 
+// ① 调用 AI 生成 DSL
 async function generate() {
-  const prompt = document.getElementById("prompt").value.trim();
+  const prompt = document.getElementById("prompt").value.trim();  // 读输入框
   if (!prompt) { setStatus("请先描述测试需求", true); return; }
   const btn = document.getElementById("btn-generate");
-  btn.disabled = true;
+  btn.disabled = true;   // 防止重复点击
   setStatus("AI 正在生成 DSL…（需要 10-30 秒）");
   try {
+    // fetch = 浏览器原生发 HTTP 请求；POST + JSON 请求体
     const resp = await fetch("/api/generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt }),   // JS 对象 → JSON 字符串
     });
-    const data = await resp.json();
+    const data = await resp.json();       // 响应 JSON → JS 对象
     if (!resp.ok) throw new Error(data.detail || "生成失败");
     currentCase = data.case;
+    // 把 DSL 填入编辑框（null, 2 = 格式化缩进 2 空格，方便人读）
     document.getElementById("dsl-editor").value = JSON.stringify(currentCase, null, 2);
-    document.getElementById("btn-execute").disabled = false;
+    document.getElementById("btn-execute").disabled = false;   // 解锁执行按钮
     setStatus("✅ DSL 生成成功，点击「执行测试」运行");
   } catch (e) {
     setStatus("❌ " + e.message, true);
@@ -120,15 +133,17 @@ async function generate() {
   }
 }
 
+// ② 执行测试
 async function execute() {
   let caseObj;
   try {
+    // 用户可能手动改过 DSL 编辑框 → 重新解析 JSON（非法 JSON 直接报错）
     caseObj = JSON.parse(document.getElementById("dsl-editor").value);
   } catch (e) {
     setStatus("❌ DSL 不是合法 JSON: " + e.message, true);
     return;
   }
-  // 从 DSL 的 input_contract 提取默认值作为输入变量
+  // 从 DSL 的 input_contract 提取默认值作为输入变量（如 ${email} → test@x.com）
   const inputValues = {};
   for (const c of (caseObj.input_contract || [])) {
     if (c.value) inputValues[c.key] = c.value;
@@ -153,16 +168,20 @@ async function execute() {
   }
 }
 
+// ③ 渲染报告：后端返回的 JSON → HTML 卡片
 function renderReport(report) {
-  document.getElementById("report-card").style.display = "block";
+  document.getElementById("report-card").style.display = "block";  // 显示报告区
   const passed = report.passed_steps;
   const total = report.total_steps;
   const allPassed = report.status === "passed";
+  // 顶部汇总：通过数 / 状态 / 最后页面
   document.getElementById("summary").innerHTML = `
     <div><span class="num ${allPassed ? "green" : "red"}">${passed}/${total}</span><br>步骤通过</div>
     <div><span class="num ${allPassed ? "green" : "red"}">${allPassed ? "✅ 通过" : "❌ 失败"}</span><br>用例状态</div>
     <div><span class="num">${report.latest_url ? report.latest_url : "-"}</span><br>最后页面</div>
   `;
+  // 逐步骤渲染：动作 + 目标 + 值 + 状态徽章 + 错误信息 + 截图
+  // .map() 把每个步骤转成 HTML 字符串，.join("") 拼成一段
   document.getElementById("steps").innerHTML = report.results.map((r, i) => `
     <div class="step">
       <div class="step-header">
@@ -178,14 +197,16 @@ function renderReport(report) {
   `).join("");
 }
 
+// 辅助：把示例需求填入输入框（演示用）
 function fillExample() {
   document.getElementById("prompt").value =
     "打开 https://example.com，验证页面包含文字 \"Example Domain\"";
 }
 
+// 辅助：转义 HTML 特殊字符（防止错误信息里的 <script> 被执行——安全细节）
 function escapeHtml(s) {
   const div = document.createElement("div");
-  div.textContent = s;
+  div.textContent = s;          // textContent 赋值 = 浏览器自动转义
   return div.innerHTML;
 }
 </script>

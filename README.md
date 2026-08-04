@@ -108,9 +108,11 @@ AI 只负责生成结构化测试步骤，执行是确定性的 Playwright 代�
 
 ### 2. 定位策略
 
-优先 `get_by_role("button", name="登录")` 语义定位——基于 ARIA 无障碍树，不依赖 DOM 结构和 CSS 类名，前端改版后测试依然稳定。`data-testid` > 语义定位 > 文本 > CSS 兜底。
+写 DSL 时优先使用语义定位（`get_by_role("button", name="登录")`）——它基于浏览器的无障碍树（Accessibility Tree），不依赖 DOM 结构和 CSS 类名，前端改版后测试依然稳定，且不需要被测系统埋点。
 
-使用模糊匹配（`exact=False`）：真实页面常见 icon 前缀空格、CSS text-transform 大小写等，accessible name 与可见文本常不一致；歧义仍由三分法拦截。
+执行器内部按稳定性降级：`data-testid`（页面有测试属性时最稳）→ 语义定位 → 文本 → CSS 兜底。
+
+使用模糊匹配（`exact=False`）：真实页面常见 icon 前缀空格、CSS text-transform 大小写等，accessible name 与可见文本常不一致；歧义仍由三分法拦截（2+ 匹配直接报错，绝不自动选第一个）。
 
 ### 3. AI 生成质量保障
 
