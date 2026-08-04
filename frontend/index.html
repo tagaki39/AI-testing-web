@@ -125,7 +125,11 @@ async function generate() {
     // 把 DSL 填入编辑框（null, 2 = 格式化缩进 2 空格，方便人读）
     document.getElementById("dsl-editor").value = JSON.stringify(currentCase, null, 2);
     document.getElementById("btn-execute").disabled = false;   // 解锁执行按钮
-    setStatus("✅ DSL 生成成功，点击「执行测试」运行");
+    // meta.snapshot_used：AI 是否参考了真实页面结构（ARIA 快照）
+    const snapshotUsed = data.meta && data.meta.snapshot_used;
+    setStatus(snapshotUsed
+      ? "✅ DSL 生成成功（AI 已参考真实页面结构），点击「执行测试」运行"
+      : "✅ DSL 生成成功（未获取到页面快照，已降级生成），点击「执行测试」运行");
   } catch (e) {
     setStatus("❌ " + e.message, true);
   } finally {

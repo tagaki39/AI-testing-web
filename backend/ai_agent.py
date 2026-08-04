@@ -33,6 +33,7 @@ import urllib.request
 import urllib.error
 
 from dsl import DSLCase, validate_case
+from snapshot import capture_page_snapshot
 
 # ── 配置（环境变量）───────────────────────────────────────────────────────────
 # os.getenv("名字", 默认值)：读环境变量，没设置就用默认值。
@@ -76,7 +77,7 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
 
-def _call_llm(user_prompt: str) -> str:
+def _call_llm(user_prompt: str, system_prompt: str | None = None) -> str:
     """调用 DeepSeek chat completions API，返回文本内容。
 
     这是最原始的 HTTP POST 请求，拆解每一步：
@@ -87,6 +88,8 @@ def _call_llm(user_prompt: str) -> str:
 
     请求体格式是 OpenAI 兼容规范（DeepSeek 兼容它）：
       messages = [system（角色设定）] + [user（用户输入）]
+
+    参数 system_prompt：可覆盖默认 SYSTEM_PROMPT（阶段 1 提取 URL 时用专用 prompt）
     """
     if not API_KEY:
         raise RuntimeError("未配置 AI_API_KEY（环境变量或 .env 文件）")
@@ -94,7 +97,7 @@ def _call_llm(user_prompt: str) -> str:
     payload = {
         "model": MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.2,   # 低温度 → 输出更稳定，不容易乱编（生成测试要确定性）
@@ -110,6 +113,32 @@ def _call_llm(user_prompt: str) -> str:
     with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"]
+
+
+# ── 阶段 1：从用户需求中提取入口 URL（与原项目 explore 前置一致）────────────────
+
+EXTRACT_URL_PROMPT = """你是 URL 提取器。
+从用户的测试需求中提取被测网站的入口 URL（以 http:// 或 https:// 开头）。
+
+规则：
+1. 如果没有明确提到 URL，返回 {"url": null}
+2. 只输出 JSON，格式：{"url": "https://..."} 或 {"url": null}"""
+
+
+def _extract_entry_url(user_prompt: str) -> str | None:
+    """阶段 1：LLM 从用户需求中提取入口 URL。
+
+    为什么用 LLM 提取而不是正则？
+      用户可能说"打开 automation exercise 网站"（没写 URL）——
+      正则提取不到，LLM 能根据上下文判断。提取失败返回 None，降级处理。
+    """
+    try:
+        text = _call_llm(user_prompt, system_prompt=EXTRACT_URL_PROMPT)
+        data = _extract_json(text)
+        url = data.get("url")
+        return url if isinstance(url, str) and url.strip() else None
+    except Exception:
+        return None   # 提取失败 → 降级为无快照生成
 
 
 def _extract_json(text: str) -> dict:
@@ -130,18 +159,52 @@ def _extract_json(text: str) -> dict:
 
 # ── 对外接口 ───────────────────────────────────────────────────────────────────
 
-def generate_dsl(user_prompt: str) -> DSLCase:
-    """对外入口：自然语言需求 → 校验通过的 DSLCase。
+def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
+    """对外入口：自然语言需求 → 校验通过的 DSLCase + 生成元信息。
 
-    三步流水线：
-      1. _call_llm()    → 调 DeepSeek，拿原始文本
-      2. _extract_json() → 容错提取 JSON
-      3. validate_case() → Pydantic 强校验（安全边界）
+    两阶段流水线（与原项目"先探索页面再生成"一致）：
+      阶段 1: _extract_entry_url() → LLM 从需求中提取入口 URL
+      阶段 2a: capture_page_snapshot() → Playwright 打开页面抓 ARIA 快照
+      阶段 2b: _call_llm() → 快照注入 prompt → 生成 DSL
+      阶段 3: validate_case() → Pydantic 强校验（安全边界）
+
+    降级策略（快照失败不中断主链路，与原项目保护原则一致）：
+      - URL 提取失败  → 无快照直接生成
+      - 页面打不开     → 无快照直接生成
+      - 快照为空       → 无快照直接生成
+
+    返回 (case, meta)：meta 记录本次生成是否参考了页面结构，
+    供前端展示"AI 已基于真实页面生成"。
 
     第 3 步是"最后一道防线"：AI 就算输出了合法 JSON，
     只要 action 不在白名单、缺字段、类型不对，照样拒绝。
     校验失败会抛异常，由 main.py 捕获后返回 400 给前端。
     """
-    raw_text = _call_llm(user_prompt)
+    # ── 阶段 1：提取入口 URL（AI 从自然语言中找）────────────────────
+    entry_url = _extract_entry_url(user_prompt)
+
+    # ── 阶段 2a：抓页面快照（失败降级为 None）───────────────────────
+    snapshot = capture_page_snapshot(entry_url) if entry_url else None
+
+    # ── 阶段 2b：组装 prompt → 生成 DSL ─────────────────────────────
+    if snapshot:
+        # 快照注入：把真实页面结构作为上下文给 LLM
+        # 这是"检索增强"的核心——LLM 基于真实元素生成，不盲猜
+        grounded_prompt = (
+            f"目标页面入口: {entry_url}\n\n"
+            f"以下是目标页面的真实结构（ARIA snapshot），"
+            f"请基于其中存在的元素生成 DSL：\n\n{snapshot}\n\n"
+            f"用户测试需求: {user_prompt}"
+        )
+    else:
+        grounded_prompt = user_prompt
+
+    raw_text = _call_llm(grounded_prompt)
     raw_json = _extract_json(raw_text)
-    return validate_case(raw_json)   # ← 安全边界：不通过就不执行
+    case = validate_case(raw_json)   # ← 安全边界：不通过就不执行
+
+    meta = {
+        "snapshot_used": bool(snapshot),
+        "entry_url": entry_url,
+    }
+    return case, meta

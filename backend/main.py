@@ -72,12 +72,13 @@ class ExecuteRequest(BaseModel):
 def api_generate(req: GenerateRequest):
     """自然语言 → AI 生成 DSL（只生成不执行，让用户先审阅）。
 
-    返回 {"ok": true, "case": {...}} 给前端展示。
+    返回 {"ok": true, "case": {...}, "meta": {...}} 给前端展示。
+    meta.snapshot_used 表示 AI 是否参考了真实页面结构（ARIA 快照）。
     AI 生成失败（网络/校验）→ HTTP 400 + 错误信息。
     """
     try:
-        case = generate_dsl(req.prompt)
-        return {"ok": True, "case": case.model_dump()}   # 模型 → dict → JSON
+        case, meta = generate_dsl(req.prompt)
+        return {"ok": True, "case": case.model_dump(), "meta": meta}   # 模型 → dict → JSON
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"AI 生成失败: {str(exc)[:300]}")
 
