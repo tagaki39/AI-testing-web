@@ -126,10 +126,18 @@ async function generate() {
     document.getElementById("dsl-editor").value = JSON.stringify(currentCase, null, 2);
     document.getElementById("btn-execute").disabled = false;   // 解锁执行按钮
     // meta.snapshot_used：AI 是否参考了真实页面结构（ARIA 快照）
+    // meta.preflight：Preflight 校验是否发现问题并自动修正
     const snapshotUsed = data.meta && data.meta.snapshot_used;
-    setStatus(snapshotUsed
-      ? "✅ DSL 生成成功（AI 已参考真实页面结构），点击「执行测试」运行"
-      : "✅ DSL 生成成功（未获取到页面快照，已降级生成），点击「执行测试」运行");
+    const preflight = data.meta && data.meta.preflight;
+    let msg;
+    if (preflight && preflight.repaired) {
+      msg = `✅ DSL 生成成功（Preflight 自动修正 ${preflight.issues.length} 处定位），点击「执行测试」运行`;
+    } else if (snapshotUsed) {
+      msg = "✅ DSL 生成成功（AI 已参考真实页面结构），点击「执行测试」运行";
+    } else {
+      msg = "✅ DSL 生成成功（未获取到页面快照，已降级生成），点击「执行测试」运行";
+    }
+    setStatus(msg);
   } catch (e) {
     setStatus("❌ " + e.message, true);
   } finally {

@@ -33,6 +33,7 @@ import urllib.request
 import urllib.error
 
 from dsl import DSLCase, validate_case
+from runner import _parse_target, _KNOWN_ROLES
 from snapshot import capture_page_snapshot
 
 # ── 配置（环境变量）───────────────────────────────────────────────────────────
@@ -157,6 +158,79 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
+# ── Preflight 校验（生成后验证 target 能否命中，失败自动重生）──────────────────
+# 这是"AI 生成质量闭环"的核心（原项目同款机制）：
+#   AI 生成 DSL → 用真实页面快照验证每个 target → 不存在的/歧义的
+#   → 把问题反馈给 LLM 重新生成 → 修正后再次校验
+# 效果：AI 自己发现并修正错误，而不是执行时才失败、人工再改。
+
+def _snapshot_check(snapshot: str, role: str | None, name: str) -> tuple[bool, int]:
+    """在 ARIA 快照文本中查找 role+name 或纯文本，返回 (是否找到, 出现次数)。
+
+    快照格式（aria_snapshot 输出）：
+      - button "Add to cart"        ← role+name 格式
+      - text: Your Cart             ← 纯文本格式
+    匹配用"包含"而非"精确"：accessible name 可能有前缀空格/大小写差异。
+    """
+    if role:
+        # 匹配 role "xxx" 形式，取引号内的 name 列表
+        pattern = re.compile(rf'\b{re.escape(role)}\s+"([^"]*)"')
+        matched = [m for m in pattern.findall(snapshot) if name.lower() in m.lower()]
+        return bool(matched), len(matched)
+    # 纯文本：直接在快照里找
+    return name.lower() in snapshot.lower(), snapshot.lower().count(name.lower())
+
+
+def _preflight_targets(case: DSLCase, snapshot: str) -> list[str]:
+    """校验 DSL 每个 target 是否能在页面快照中命中，返回问题列表。
+
+    三种结果：
+      命中 1 次      → 通过
+      不存在          → "快照中不存在"（必须重生修正）
+      命中 2+ 次      → "存在 N 个同名元素，建议用 scope 消歧"（原项目同款约束）
+
+    css=/test_id= 无法用快照文本验证（它们是 DOM 属性不是语义）→ 跳过。
+    """
+    issues: list[str] = []
+    for step in case.steps:
+        t = step.target
+        if not t:
+            continue   # goto / 无 target 断言，无需验证
+
+        parsed = _parse_target(t)   # 复用 runner 的解析（单一实现）
+        if parsed is None:
+            continue
+        role, name = parsed.role, parsed.name
+        if not name:
+            name = parsed.text
+        if not name:
+            continue   # 纯 css/test_id，无法验证
+
+        found, count = _snapshot_check(snapshot, role, name)
+        if not found:
+            issues.append(f"{t!r}: 页面快照中不存在")
+        elif count > 1 and role:
+            issues.append(f"{t!r}: 页面存在 {count} 个同名 {role}，建议使用 scope 消歧")
+
+    return issues
+
+
+def _repair_with_llm(user_prompt: str, entry_url: str | None, snapshot: str, issues: list[str]) -> DSLCase:
+    """把 Preflight 发现的问题反馈给 LLM，要求基于真实页面重新生成完整 DSL。"""
+    repair_prompt = (
+        f"目标页面入口: {entry_url}\n"
+        f"页面真实结构（ARIA snapshot）:\n{snapshot}\n\n"
+        f"你上次生成的 DSL 存在以下定位问题（共 {len(issues)} 处）：\n"
+        + "\n".join(f"- {i}" for i in issues)
+        + "\n\n请基于页面真实结构修正这些 target："
+        "存在多个同名元素时，scope 的值必须是页面中真实可见的文本"
+        "（如商品名称，不能是 CSS 类名）；不存在的元素改用快照中真实存在的元素。"
+        "输出完整的修正后 DSL JSON（其余步骤保持不变）。只输出 JSON。"
+    )
+    raw_text = _call_llm(repair_prompt)
+    return validate_case(_extract_json(raw_text))
+
+
 # ── 对外接口 ───────────────────────────────────────────────────────────────────
 
 def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
@@ -206,5 +280,18 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     meta = {
         "snapshot_used": bool(snapshot),
         "entry_url": entry_url,
+        "preflight": None,           # Preflight 校验结果（有快照时才执行）
     }
+
+    # ── 阶段 3：Preflight 校验（有快照才做，失败自动重生一次）────────
+    if snapshot:
+        issues = _preflight_targets(case, snapshot)
+        if issues:
+            try:
+                case = _repair_with_llm(user_prompt, entry_url, snapshot, issues)
+                meta["preflight"] = {"repaired": True, "issues": issues}
+            except Exception:
+                # 重生失败（LLM 又输出非法格式）→ 保留原 case，不中断
+                meta["preflight"] = {"repaired": False, "issues": issues}
+
     return case, meta
