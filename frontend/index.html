@@ -178,11 +178,17 @@ function renderReport(report) {
   const passed = report.passed_steps;
   const total = report.total_steps;
   const allPassed = report.status === "passed";
-  // 顶部汇总：通过数 / 状态 / 最后页面
+  // 顶部汇总：通过数 / 状态 / 耗时 / 定位策略分布
+  const totalSec = ((report.total_duration_ms || 0) / 1000).toFixed(1);
+  const stats = report.locator_stats || {};
+  const statsText = Object.keys(stats).length
+    ? Object.entries(stats).map(([k, v]) => `${k}:${v}`).join(" · ")
+    : "-";
   document.getElementById("summary").innerHTML = `
     <div><span class="num ${allPassed ? "green" : "red"}">${passed}/${total}</span><br>步骤通过</div>
     <div><span class="num ${allPassed ? "green" : "red"}">${allPassed ? "✅ 通过" : "❌ 失败"}</span><br>用例状态</div>
-    <div><span class="num">${report.latest_url ? report.latest_url : "-"}</span><br>最后页面</div>
+    <div><span class="num">${totalSec}s</span><br>总耗时</div>
+    <div><span class="num" style="font-size:14px">${statsText}</span><br>定位策略</div>
   `;
   // 逐步骤渲染：动作 + 目标 + 值 + 状态徽章 + 错误信息 + 截图
   // .map() 把每个步骤转成 HTML 字符串，.join("") 拼成一段

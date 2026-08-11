@@ -34,6 +34,7 @@ runner.py — Playwright 执行引擎（整个项目的心脏）
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from playwright.sync_api import sync_playwright, expect
 
@@ -190,16 +191,19 @@ def _resolve_scope_containers(page, scope) -> list[object]:
 # ── 定位器解析（三分法入口）──────────────────────────────────────────────────────
 
 def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, timeout_ms: int = 15000):
-    """核心定位函数：target + 可选 scope → 唯一 Playwright locator。
+    """核心定位函数：target + 可选 scope → (命中策略名, 唯一 Playwright locator)。
 
     处理流程：
       1. 解析 target → ParsedTarget
       2. 解析 scope → 候选容器列表（无 scope 就是全页面）
       3. 遍历容器 × 遍历定位策略（test_id→role→text→css）
       4. 每个 locator 数匹配数（count()）：
-           == 1 → 就是它，返回
+           == 1 → 就是它，返回（附带策略名，供统计定位分布）
            >  1 → AmbiguousError（歧义，提示用 scope）
            == 0 → 试下一个策略（降级）
+
+    返回值带策略名是"量化设计"：每次执行自动记录定位策略命中分布，
+    积累后产出"语义定位命中率 83%"这类面试数据。
 
     allow_lazy=True（wait_for 步骤专用）：
       元素可能正在渲染（页面异步加载），count()==0 不代表不存在。
@@ -220,7 +224,7 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
                 raise LocatorNotFoundError(f"定位失败 ({strategy}): {exc}") from exc
 
             if count == 1:
-                return locator
+                return strategy, locator
             if count > 1:
                 hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
                 raise LocatorAmbiguousError(
@@ -230,7 +234,7 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
             if allow_lazy:
                 try:
                     locator.wait_for(state="visible", timeout=timeout_ms)
-                    return locator
+                    return strategy, locator
                 except Exception:
                     continue   # 超时 → 尝试下一个策略（降级）
 
@@ -277,6 +281,8 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
       assert_text → 断言文本（有 target 断言元素内文本，无 target 断言整页）
     """
     # 先构造"证据骨架"（默认全绿，失败时改 status/error）
+    # duration_ms / resolved_by 是量化字段：每步耗时 + 定位策略命中
+    step_started_at = perf_counter()
     evidence = {
         "step_index": index,
         "action": step.action,
@@ -287,6 +293,8 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
         "error": None,
         "url": None,
         "screenshot": None,
+        "duration_ms": 0,
+        "resolved_by": None,     # 定位策略：test_id / role / text / css / None(goto/整页断言)
     }
     try:
         if step.action == "goto":
@@ -301,11 +309,12 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
         else:
             # 先定位（三分法），再执行动作
             # wait_for 允许"等待出现"（allow_lazy），其他动作要求元素已存在
-            locator = _resolve_locator(
+            resolved_by, locator = _resolve_locator(
                 page, step.target, step.scope,
                 allow_lazy=(step.action == "wait_for"),
                 timeout_ms=step.timeout_ms,
             )
+            evidence["resolved_by"] = resolved_by   # 记录定位策略命中
 
             if step.action == "click":
                 locator.click(timeout=step.timeout_ms)
@@ -339,6 +348,8 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
         except Exception:
             pass
 
+    # 量化字段：本步耗时（毫秒）
+    evidence["duration_ms"] = max(0, int((perf_counter() - step_started_at) * 1000))
     return evidence
 
 
@@ -388,6 +399,15 @@ def execute_case(case: DSLCase, variables: dict[str, str] | None = None) -> dict
 
     # 统计：全过才算通过
     passed = sum(1 for r in results if r["status"] == "passed")
+
+    # ── 量化汇总（面试数据来源）─────────────────────────────
+    total_ms = sum(r.get("duration_ms") or 0 for r in results)
+    locator_stats: dict[str, int] = {}
+    for r in results:
+        strategy = r.get("resolved_by")
+        if strategy:
+            locator_stats[strategy] = locator_stats.get(strategy, 0) + 1
+
     return {
         "run_id": run_id,
         "case_name": case.name,
@@ -395,5 +415,9 @@ def execute_case(case: DSLCase, variables: dict[str, str] | None = None) -> dict
         "passed_steps": passed,
         "status": "passed" if passed == len(results) else "failed",
         "latest_url": latest_url,
+        # 量化数据：总耗时 / 平均每步耗时 / 定位策略分布
+        "total_duration_ms": total_ms,
+        "avg_step_ms": total_ms // len(results) if results else 0,
+        "locator_stats": locator_stats,
         "results": results,
     }
