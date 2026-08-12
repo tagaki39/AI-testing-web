@@ -7,18 +7,23 @@ dsl.py — DSL 数据结构定义（整个项目的"规则书"）
   数据流的第一站和最后一站：
     用户输入 → AI 生成 JSON →【这里校验】→ 执行器 → 结果 JSON
 
-【核心思想：安全边界】
-  - AI 的输出是不可信的（可能格式错、字段错、凭空造 action）
-  - 本文件用 Pydantic 声明"合法 DSL 长什么样"
-  - 任何不符合规则的输入，在进入执行器之前就被拒绝
-  - 这个文件只声明规则，不写任何执行逻辑
+【v2 结构化设计（吸收评审）】
+  1. target 从字符串升级为结构化 Locator 模型：
+       {"role": "button", "name": "登录"}      ← 语义定位
+       {"text": "Products"}                    ← 文本定位
+       {"test_id": "login-button"}             ← data-testid
+       {"css": ".btn"}                         ← CSS 兜底
+     不再需要自创 "button=登录 inside=... exact=true" 解析语言
+  2. scope 独立成 Scope 模型：role/test_id + has_text 组合
+  3. 动作集扩展：goto/click/fill/select/check/wait_for/
+     assert_visible/assert_text/assert_url（9 种）
+  4. 向后兼容：target/scope 仍接受字符串写法（旧用例不破坏）
 
 【Pydantic 是什么】
   一个第三方库：你声明规则（类型注解），它自动执行校验、类型转换、序列化。
-  例如 action: Literal["goto", ...] 声明后，写 "hover" 就直接报错。
 
 【学习路径】
-  从上往下读：LocatorTarget（定位目标）→ LocatorScope（消歧容器）
+  从上往下读：Locator（定位目标）→ Scope（消歧容器）
   → DSLStep（单步）→ DSLCase（整个用例）→ validate_case（校验入口）
 ══════════════════════════════════════════════════════════════════════
 """
@@ -27,41 +32,33 @@ from pydantic import BaseModel, Field
 from typing import Literal
 
 
-class LocatorTarget(BaseModel):
-    """结构化元素定位（比字符串格式更精确、无歧义）。
+class Locator(BaseModel):
+    """结构化元素定位（v2：多字段组合，按优先级解析）。
 
-    四种定位方式任选其一，对应 Playwright 四种定位 API：
-      {"role": "button", "name": "登录"}   → 语义定位（最稳，官方推荐，不需要埋点）
-      {"text": "登录"}                     → 文本定位（无语义元素的兜底）
-      {"test_id": "login-button"}          → data-testid（开发埋点后最稳，但需要对方配合）
-      {"css": ".login-btn"}                → CSS 兜底（尽量避免，改版就坏）
+    role + name → 语义定位（最稳，官方推荐，不需要埋点）
+    test_id     → data-testid 定位（需要被测系统埋点）
+    text        → 文本定位（无语义元素的兜底）
+    css         → CSS 兜底（尽量避免）
 
-    为什么需要它？字符串 "button=登录" 也能表达同样意思（见 DSLStep），
-    但结构化对象让"解析"和"校验"都更可靠——字段名明确，不会拼错。
+    为什么结构化而不是字符串 "button=登录"？
+      字符串会膨胀成自创解析语言（button=Add to cart inside=Blue Top exact=true）；
+      结构化让 Pydantic 校验、Preflight 验证、patch 修复全部简单可靠。
     """
 
     role: str | None = None      # 语义角色: button / link / textbox / heading ...
-    name: str | None = None      # accessible name（元素在无障碍树里的名字，必须与 role 配套）
-    text: str | None = None      # 可见文本（页面显示的字）
+    name: str | None = None      # accessible name（与 role 配套）
     test_id: str | None = None   # data-testid 属性值
+    text: str | None = None      # 可见文本
     css: str | None = None       # CSS 选择器
 
 
-class LocatorScope(BaseModel):
+class Scope(BaseModel):
     """作用域：先定位"容器"，再在容器内找目标 → 解决同名元素歧义。
 
-    典型场景：页面有 6 个 "Add to cart" 按钮，直接按名字找会歧义。
-    解法：先锁定"包含 Blue Top 的容器"，再在容器内部找按钮。
-
+    典型场景：页面有 6 个 "Add to cart"，先锁定包含 Blue Top 的容器。
       {"role": "listitem", "has_text": "Blue Top"}
-        → page.get_by_role("listitem").filter(has_text="Blue Top")
-        → 在返回的容器内继续找目标
-
       {"test_id": "product-card", "has_text": "Blue Top"}
-        → 页面有 data-testid 时更精确
-
-    这是 Playwright 推荐的 locator chaining（链式定位）思路：
-    目标 = 容器.filter(...).get_by_role(...)
+      {"has_text": "Blue Top"}（不知道容器角色时——执行器会降级爬父级）
     """
 
     role: str | None = None
@@ -72,20 +69,24 @@ class LocatorScope(BaseModel):
 class DSLStep(BaseModel):
     """一个测试步骤（DSL 的最小单元）。
 
-    action 是 Literal 白名单——只允许这 5 种动作，
-    AI 生成 "hover"、"scroll" 等不在名单里的动作会被 Pydantic 直接拒绝。
+    action 是 Literal 白名单——只允许这 9 种动作：
+      goto / click / fill / select / check / wait_for /
+      assert_visible / assert_text / assert_url
 
-    target 支持两种格式（兼容 AI 生成的字符串 + 人工编辑的结构化对象）：
-      字符串:  "button=登录" / "css=.x" / "登录"（纯文本兜底）
+    target 支持结构化（Locator，推荐）和字符串（兼容旧用例）：
       结构化:  {"role": "button", "name": "登录"}
+      字符串:  "button=登录" / "css=.x" / "登录"（纯文本兜底）
 
-    scope 可选，用于同名元素消歧（见 LocatorScope）。
+    scope 可选，用于同名元素消歧（见 Scope）。
     """
 
-    action: Literal["goto", "click", "input", "wait_for", "assert_text"]
-    target: str | LocatorTarget | None = None
-    scope: str | LocatorScope | None = None
-    value: str | None = None       # 输入值 / 断言文本 / 目标 URL
+    action: Literal[
+        "goto", "click", "fill", "input", "select", "check",
+        "wait_for", "assert_visible", "assert_text", "assert_url",
+    ]   # input 是 fill 的兼容别名（旧用例 / AI 偶尔输出）
+    target: str | Locator | None = None
+    scope: str | Scope | None = None
+    value: str | None = None       # 输入值 / 选项文本 / 断言文本 / URL 片段
     timeout_ms: int = 15000        # 单步超时（毫秒）
 
 

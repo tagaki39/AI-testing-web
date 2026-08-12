@@ -62,19 +62,26 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
   "input_contract": [{"key": "变量名", "value": "默认值"}],
   "steps": [
     {"action": "goto", "value": "https://xxx.com"},
-    {"action": "input", "target": "textbox=用户名", "value": "${变量名}"},
-    {"action": "click", "target": "button=登录"},
-    {"action": "wait_for", "target": "heading=首页"},
-    {"action": "assert_text", "value": "要验证的文字"}
+    {"action": "fill", "target": {"role": "textbox", "name": "用户名"}, "value": "${变量名}"},
+    {"action": "click", "target": {"role": "button", "name": "登录"}},
+    {"action": "wait_for", "target": {"role": "heading", "name": "首页"}},
+    {"action": "assert_visible", "target": {"text": "购物车"}},
+    {"action": "assert_url", "value": "/inventory.html"}
   ]
 }
 
 规则：
-1. action 只能是: goto, click, input, wait_for, assert_text
-2. target 定位格式：优先使用语义定位 "角色=名称"，例如 button=登录、link=首页、textbox=邮箱、heading=标题
-3. 用户没提供的登录信息，用 input_contract 定义变量，steps 里用 ${变量名} 引用
-4. assert_text 用于验证页面包含某段文字
-5. 只输出 JSON，不要输出任何解释或代码块标记"""
+1. action 只能是: goto, click, fill, select, check, wait_for, assert_visible, assert_text, assert_url
+2. target 使用结构化定位（多字段组合，按优先级）：
+   - 语义定位: {"role": "button", "name": "登录"}
+   - 文本定位: {"text": "Products"}（快照中 'text: xxx' 的标题必须用 text，禁止 role=heading）
+   - 测试 id:  {"test_id": "login-button"}
+   - CSS 兜底: {"css": ".btn"}
+3. 同名元素消歧用 scope（先定位容器再找目标）：
+   {"action": "click", "scope": {"has_text": "Blue Top"}, "target": {"role": "button", "name": "Add to cart"}}
+4. 用户提供的测试数据（如账号密码）用 ${var} 占位，并加入 input_contract 给出默认值
+5. assert_text 用于验证页面/元素包含某段文字；assert_visible 验证元素可见；assert_url 验证当前 URL 包含片段
+6. 只输出 JSON，不要输出任何解释或代码块标记"""
 
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
@@ -397,7 +404,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             + "\n\n规则："
             "1. 用户提供的测试数据（如账号密码）用 ${var} 占位，并加入 input_contract 给出默认值；"
             "2. 快照中以 'text: xxx' 形式出现的标题（span/div 无 heading 语义）"
-            "必须用 text=xxx 定位，禁止写 heading=xxx。"
+            '必须用 {"text": "xxx"} 定位，禁止用 {"role": "heading"}。'
         )
     else:
         grounded_prompt = user_prompt

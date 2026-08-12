@@ -327,6 +327,12 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
             # goto 不需要定位，直接跳转；相对路径会拼 base_url（简化版直接传完整 URL）
             page.goto(_substitute(step.value, variables) or "", wait_until="domcontentloaded", timeout=step.timeout_ms)
 
+        elif step.action == "assert_url":
+            # URL 断言不需要定位：验证当前 URL 包含期望片段（登录跳转最实用）
+            expected = _substitute(step.value, variables) or ""
+            if expected not in page.url:
+                raise AssertionError(f"URL 断言失败，期望包含: {expected}，实际: {page.url}")
+
         elif step.action == "assert_text" and not step.target:
             # 无 target 的断言 → 验证整个页面包含文本
             text = _substitute(step.value, variables) or ""
@@ -334,20 +340,30 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
 
         else:
             # 先定位（三分法），再执行动作
-            # wait_for 允许"等待出现"（allow_lazy），其他动作要求元素已存在
+            # wait_for / assert_visible 允许"等待出现"（元素可能渲染中）
+            allow_lazy = step.action in ("wait_for", "assert_visible")
             resolved_by, locator = _resolve_locator(
                 page, step.target, step.scope,
-                allow_lazy=(step.action == "wait_for"),
+                allow_lazy=allow_lazy,
                 timeout_ms=step.timeout_ms,
             )
             evidence["resolved_by"] = resolved_by   # 记录定位策略命中
 
             if step.action == "click":
                 locator.click(timeout=step.timeout_ms)
-            elif step.action == "input":
+            elif step.action in ("fill", "input"):
+                # input 是旧版别名，统一走 fill（Playwright 语义）
                 locator.fill(_substitute(step.value, variables) or "", timeout=step.timeout_ms)
+            elif step.action == "select":
+                # 下拉框：按可见文本选选项
+                locator.select_option(label=_substitute(step.value, variables) or "", timeout=step.timeout_ms)
+            elif step.action == "check":
+                # 复选框：勾选（已勾选则跳过）
+                locator.check(timeout=step.timeout_ms)
             elif step.action == "wait_for":
                 locator.wait_for(state="visible", timeout=step.timeout_ms)
+            elif step.action == "assert_visible":
+                expect(locator).to_be_visible(timeout=step.timeout_ms)
             elif step.action == "assert_text":
                 text = _substitute(step.value, variables) or ""
                 expect(locator).to_contain_text(text, timeout=step.timeout_ms)
