@@ -460,7 +460,8 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     if multi_snapshot:
         # 把探索路径也注入：Planner 能看到"怎么走到每个页面"
         path_lines = [
-            f"- {h.get('action')} {h.get('target')} {h.get('value') or ''} @ {h.get('url')}"
+            f"- {h.get('action')} {json.dumps(h.get('target'), ensure_ascii=False) if h.get('target') else ''} "
+            f"{h.get('value') or ''} @ {h.get('url')}"
             for h in (explore_result or {}).get("history", [])
         ]
         grounded_prompt = (
