@@ -83,6 +83,9 @@ class ParsedTarget:
 def _parse_target(target: str | dict | None) -> ParsedTarget | None:
     """把 DSL target 解析成 ParsedTarget，支持字符串和结构化两种格式。
 
+    注意：DSL 经 Pydantic 解析后，dict 格式的 target 实际是
+    LocatorTarget 模型实例（不是 dict）——必须先统一转回 dict。
+
     字符串格式解析规则（从左到右尝试）：
       "css=..."       → CSS 定位
       "test_id=..."   → data-testid 定位
@@ -91,6 +94,10 @@ def _parse_target(target: str | dict | None) -> ParsedTarget | None:
     """
     if target is None:
         return None
+
+    if not isinstance(target, str):
+        # Pydantic 模型实例（LocatorTarget）→ 转回 dict
+        target = target.model_dump() if hasattr(target, "model_dump") else dict(target)
 
     if isinstance(target, dict):
         # 结构化格式：直接取出各字段
@@ -145,20 +152,38 @@ def _build_locators(container, t: ParsedTarget) -> list[tuple[str, object]]:
 # 解决"页面有 6 个 Add to cart"这类同名歧义：
 # 先找到包含目标文本的容器，再在容器内查找。
 
+def _text_scope_containers(page, text: str) -> list[object]:
+    """文本作用域：找到包含文本的元素，向上爬最多 3 层父级作为候选容器。
+
+    ⚠️ 依赖 DOM 层级，前端改结构可能失效——所以它只作为"兜底"：
+    结构化 scope 找不到容器时自动降级到这里（原项目同款设计）。
+    """
+    base = page.get_by_text(text).first
+    containers = [base]
+    current = base
+    for _ in range(3):
+        current = current.locator("xpath=..")   # xpath=.. 表示"父元素"
+        containers.append(current)
+    return containers
+
+
 def _resolve_scope_containers(page, scope) -> list[object]:
     """返回候选"容器"列表；无作用域时返回 [page]（全页面查找）。
 
-    结构化 scope（推荐）：
-      {"role": "listitem", "has_text": "Blue Top"}
-        → page.get_by_role("listitem").filter(has_text="Blue Top")
-        先按角色筛一批，再过滤出包含目标文本的
+    降级链（与原项目"product role → 文本爬父级"同思路）：
+      1. 结构化 role/test_id + has_text（最精确，先尝试）
+      2. 结构化容器 0 匹配时 → 自动追加"has_text 文本爬父级"容器
+         （很多页面容器是无角色 div，AI 只知道文本不知道角色）
+      3. 只有 has_text / 字符串 scope → 直接文本爬父级
 
-    字符串 scope（兜底，兼容 "inside Blue Top" 格式）：
-      page.get_by_text("Blue Top") 找到文本元素 → 向上爬最多 3 层父级
-      ⚠️ 依赖 DOM 层级，前端改结构可能失效——优先用结构化 scope
+    字符串 scope（兼容 "inside Blue Top" 格式）也走第 3 级。
     """
     if scope is None:
         return [page]
+
+    if not isinstance(scope, str):
+        # Pydantic 模型实例（LocatorScope）→ 转回 dict（同 _parse_target 处理）
+        scope = scope.model_dump() if hasattr(scope, "model_dump") else dict(scope)
 
     if isinstance(scope, dict):
         containers = []
@@ -172,20 +197,18 @@ def _resolve_scope_containers(page, scope) -> list[object]:
             if scope.get("has_text"):
                 c = c.filter(has_text=scope["has_text"])
             containers.append(c)
+
+        # 降级：AI 只给了 has_text（不知道容器角色），或角色容器不存在
+        # → 追加文本爬父级容器作为兜底（放在最后，精确的优先尝试）
+        if scope.get("has_text"):
+            containers.extend(_text_scope_containers(page, scope["has_text"]))
+
         if not containers:
             raise LocatorNotFoundError(f"scope 无效: {scope}")
         return containers
 
-    # 字符串 scope（兼容格式 "inside Blue Top"）：
-    # 找到包含该文本的元素，向上爬最多 3 层，每层尝试匹配目标。
-    # ⚠️ 这是兜底方案，依赖 DOM 层级；优先使用结构化 scope（role + has_text）。
-    base = page.get_by_text(scope).first
-    containers = [base]
-    current = base
-    for _ in range(3):
-        current = current.locator("xpath=..")   # xpath=.. 表示"父元素"
-        containers.append(current)
-    return containers
+    # 字符串 scope：文本爬父级
+    return _text_scope_containers(page, scope)
 
 
 # ── 定位器解析（三分法入口）──────────────────────────────────────────────────────
