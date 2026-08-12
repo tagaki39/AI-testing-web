@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 
 from playwright.sync_api import sync_playwright
 
-from runner import _resolve_locator
+from runner import _resolve_locator, _substitute
 
 # ── 预算（bounded：探索必须有限）───────────────────────────────────────────────
 MAX_STEPS = 8        # 最多执行 8 个动作
@@ -217,8 +217,12 @@ def _decide(state: ExploreState, llm_call) -> dict | None:
 
 # ── act：ref → locator → 执行（LLM=Planner，这里=Executor）────────────────────
 
-def _act(page, decision: dict, elements: list[dict]) -> str:
-    """执行 LLM 决策的动作，返回动作名。定位失败/执行失败抛异常。"""
+def _act(page, decision: dict, elements: list[dict], runtime_inputs: dict) -> str:
+    """执行 LLM 决策的动作，返回动作名。定位失败/执行失败抛异常。
+
+    fill 的值支持 ${var} 占位：LLM 上下文里只有占位符，
+    真实值由 runtime_inputs 在本地注入（敏感信息不进 LLM）。
+    """
     action = decision.get("action")
     value = decision.get("value") or ""
 
@@ -238,9 +242,9 @@ def _act(page, decision: dict, elements: list[dict]) -> str:
     if action == "click":
         locator.click()
     elif action == "fill":
-        locator.fill(value)
+        locator.fill(_substitute(value, runtime_inputs) or "")
     elif action == "press":
-        locator.press(value or "Enter")
+        locator.press(_substitute(value, runtime_inputs) or "Enter")
     else:
         raise ValueError(f"不支持的探索动作: {action}")
     return action
@@ -248,14 +252,15 @@ def _act(page, decision: dict, elements: list[dict]) -> str:
 
 # ── 主入口 ──────────────────────────────────────────────────────────────────────
 
-def explore(goal: str, entry_url: str, llm_call) -> dict:
+def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = None) -> dict:
     """bounded exploration 主循环。
 
     参数:
-      goal:      用户测试目标（自然语言）
-      entry_url: 入口 URL
-      llm_call:  LLM 调用函数（由 ai_agent 注入，避免循环依赖）
-                 签名: llm_call(prompt, system_prompt) -> str
+      goal:          用户测试目标（已脱敏，LLM 看到的只有 ${var} 占位符）
+      entry_url:     入口 URL
+      llm_call:      LLM 调用函数（由 ai_agent 注入，避免循环依赖）
+                     签名: llm_call(prompt, system_prompt) -> str
+      runtime_inputs: 本地运行时值（账号密码等，fill 时注入，不进 LLM）
 
     返回:
       {
@@ -293,7 +298,7 @@ def explore(goal: str, entry_url: str, llm_call) -> dict:
             target = {"role": element["role"], "name": element["name"]} if element and "role" in element \
                 else ({"text": element["text"]} if element else None)
             try:
-                _act(page, decision, state.elements)
+                _act(page, decision, state.elements, runtime_inputs or {})
                 state.history.append({
                     "url": state.current_url,
                     "action": decision["action"],

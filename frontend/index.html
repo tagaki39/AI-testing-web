@@ -156,9 +156,19 @@ async function execute() {
     return;
   }
   // 从 DSL 的 input_contract 提取默认值作为输入变量（如 ${email} → test@x.com）
+  // 兼容 v2 schema（default 字段）与旧格式（value 字段）
   const inputValues = {};
   for (const c of (caseObj.input_contract || [])) {
-    if (c.value) inputValues[c.key] = c.value;
+    const v = c.default ?? c.value;
+    if (v) inputValues[c.key] = v;
+  }
+  // 无默认值的变量（如 secret 密码）→ 执行时本地询问用户输入
+  // 设计：敏感信息不进 LLM、不进 DSL，只在执行时本地注入
+  for (const c of (caseObj.input_contract || [])) {
+    if (inputValues[c.key] !== undefined) continue;
+    const v = window.prompt(`请输入变量 ${c.key}（${c.description || c.type || "必填"}）`, "");
+    if (v === null) { setStatus("已取消执行", true); return; }
+    inputValues[c.key] = v;
   }
   const btn = document.getElementById("btn-execute");
   btn.disabled = true;

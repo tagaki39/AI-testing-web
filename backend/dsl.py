@@ -28,7 +28,7 @@ dsl.py — DSL 数据结构定义（整个项目的"规则书"）
 ══════════════════════════════════════════════════════════════════════
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Literal
 
 
@@ -90,6 +90,30 @@ class DSLStep(BaseModel):
     timeout_ms: int = 15000        # 单步超时（毫秒）
 
 
+class InputContractItem(BaseModel):
+    """变量契约（v2：结构化 schema）。
+
+    关键字段 secret：标记敏感信息（密码/token）——执行器本地注入，
+    LLM 上下文中永远只有 ${key} 占位符，没有真实值。
+    """
+
+    key: str = Field(min_length=1)
+    type: Literal["string", "number", "boolean", "file", "secret"] = "string"
+    required: bool = True
+    secret: bool = False
+    default: str | None = None            # 默认值（可选）
+    description: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy(cls, data):
+        """兼容旧格式 {"key": "email", "value": "test@x.com"} → default。"""
+        if isinstance(data, dict) and "value" in data and "default" not in data:
+            data = dict(data)
+            data["default"] = data.pop("value")
+        return data
+
+
 class DSLCase(BaseModel):
     """一个完整测试用例 = 元信息 + 步骤列表 + 变量契约。
 
@@ -101,7 +125,7 @@ class DSLCase(BaseModel):
     description: str | None = None
     base_url: str | None = None           # 入口 URL（goto 相对路径时拼接用）
     steps: list[DSLStep] = Field(min_length=1)   # 至少 1 步，空用例直接拒绝
-    input_contract: list[dict] = []       # 变量定义，如 [{"key":"email","value":"test@x.com"}]
+    input_contract: list[InputContractItem] = []
 
 
 def validate_case(data: dict) -> DSLCase:

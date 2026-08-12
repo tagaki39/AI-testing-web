@@ -412,10 +412,15 @@ def execute_case(case: DSLCase, variables: dict[str, str] | None = None) -> dict
     """
     variables = dict(variables or {})
     # 把 input_contract 里的默认值合并进来（DSL 声明的变量默认值）
+    # 兼容：模型实例（v2 schema，default 字段）与旧 dict（value 字段）
     for contract in case.input_contract:
-        key = contract.get("key") or contract.get("context_key")
-        if key and contract.get("value") is not None:
-            variables.setdefault(key, contract["value"])
+        c = contract.model_dump() if hasattr(contract, "model_dump") else contract
+        key = c.get("key") or c.get("context_key")
+        default = c.get("default")
+        if default is None:
+            default = c.get("value")   # 旧格式兼容
+        if key and default is not None:
+            variables.setdefault(key, default)
 
     # 每轮执行独立目录（run-1, run-2, ...）
     run_id = len(list(ARTIFACTS_DIR.glob("run-*"))) + 1
