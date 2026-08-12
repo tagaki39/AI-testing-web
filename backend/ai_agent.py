@@ -31,6 +31,7 @@ import os
 import re
 import urllib.request
 import urllib.error
+from urllib.parse import urlparse
 
 from dsl import DSLCase, validate_case
 from explore_flow import explore
@@ -116,30 +117,123 @@ def _call_llm(user_prompt: str, system_prompt: str | None = None) -> str:
     return data["choices"][0]["message"]["content"]
 
 
-# ── 阶段 1：从用户需求中提取入口 URL（与原项目 explore 前置一致）────────────────
+# ── 阶段 1：从用户需求中解析入口 URL（代码优先 + LLM fallback）────────────────
 
-EXTRACT_URL_PROMPT = """你是 URL 提取器。
-从用户的测试需求中提取被测网站的入口 URL（以 http:// 或 https:// 开头）。
+# 域名正则：匹配 "saucedemo.com" / "www.saucedemo.com" / "https://saucedemo.com/login"
+# 不补 www（LLM 可能错补 www 而真实站点没有）；补 https 由代码统一处理
+_URL_RE = re.compile(
+    r'(?:(?:https?://)?(?:www\.)?)'
+    r'([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)'
+    r'(?:/[^\s]*)?'
+)
+
+# 邮箱正则：先剥掉邮箱，防止 "admin@example.com" 里的域名被误抓
+_EMAIL_RE = re.compile(r'\S+@[a-zA-Z0-9.-]+')
+
+# 站点别名表（alias resolver）：常见站点描述 → 真实 URL。
+# 这是"resolution"的可靠来源——人为维护，零幻觉。
+SITE_ALIASES: dict[str, str] = {
+    "automation exercise": "https://automationexercise.com",
+    "saucedemo": "https://www.saucedemo.com",
+    "example": "https://example.com",
+}
+
+
+def _resolve_by_alias(prompt: str) -> str | None:
+    """别名解析：在用户输入中查找已知站点描述（大小写/空格不敏感）。
+
+    例："测试 automation exercise 网站的登录" → 命中 "automation exercise"。
+    别名表人为维护、行为确定——比让 LLM 猜域名可靠得多。
+    """
+    normalized = prompt.lower().strip()
+    for alias, url in SITE_ALIASES.items():
+        if alias.lower() in normalized:
+            return url
+    return None
+
+
+def _resolve_url_by_regex(prompt: str) -> str | None:
+    """正则提取入口 URL（代码优先，零成本零幻觉）。
+
+    处理流程：
+      1. 剥掉邮箱（防止误抓域名）
+      2. 正则匹配域名（支持 裸域名 / www. / http(s):// 三种写法）
+      3. 补 https:// 前缀（不补 www）
+      4. 校验 host 合法性（必须含点号，防止抓到奇怪字符串）
+
+    返回 None 表示正则未命中 → 交给 LLM fallback。
+    """
+    cleaned = _EMAIL_RE.sub(" ", prompt)
+    match = _URL_RE.search(cleaned)
+    if not match:
+        return None
+
+    value = match.group(0).strip()
+    if not value.startswith(("http://", "https://")):
+        value = "https://" + value
+
+    try:
+        parsed = urlparse(value)
+        if not parsed.netloc or "." not in parsed.netloc:
+            return None
+    except Exception:
+        return None
+    return value
+
+
+EXTRACT_URL_PROMPT = """你是站点识别器。
+判断用户的测试需求中是否提到了一个明确的被测网站名称。
 
 规则：
-1. 如果没有明确提到 URL，返回 {"url": null}
-2. 只输出 JSON，格式：{"url": "https://..."} 或 {"url": null}"""
+1. 只从用户输入中识别站点名称，不要编造或联想域名
+2. 没有明确站点名称时，返回 {"site_name": null}
+3. 只输出 JSON，格式：{"site_name": "automation exercise"} 或 {"site_name": null}"""
 
 
-def _extract_entry_url(user_prompt: str) -> str | None:
-    """阶段 1：LLM 从用户需求中提取入口 URL。
+def _extract_site_name_llm(user_prompt: str) -> str | None:
+    """LLM 只做"站点名称识别"，绝不输出 URL（防止幻觉域名）。
 
-    为什么用 LLM 提取而不是正则？
-      用户可能说"打开 automation exercise 网站"（没写 URL）——
-      正则提取不到，LLM 能根据上下文判断。提取失败返回 None，降级处理。
+    输出的是描述性名称（如 "automation exercise"），
+    由代码查 SITE_ALIASES 得到真实 URL——Resolution 由代码保证。
     """
     try:
         text = _call_llm(user_prompt, system_prompt=EXTRACT_URL_PROMPT)
         data = _extract_json(text)
-        url = data.get("url")
-        return url if isinstance(url, str) and url.strip() else None
+        name = data.get("site_name")
+        return name if isinstance(name, str) and name.strip() else None
     except Exception:
-        return None   # 提取失败 → 降级为无快照生成
+        return None   # 识别失败 → 降级为无快照生成
+
+
+def _resolve_entry_url(user_prompt: str) -> str | None:
+    """入口 URL 解析链（Extraction 自动化，Resolution 不 hallucinate）：
+
+      ① 正则提取 URL/域名（saucedemo.com → https://saucedemo.com）
+      ② 别名表解析（"automation exercise 网站" → 人为维护的 URL）
+      ③ LLM 只识别站点名称（不输出 URL），再查别名表
+      ④ 全部失败 → None（降级无快照生成，绝不猜域名）
+
+    原则：LLM 可以做"识别"，但"从名称到 URL 的映射"永远由代码决定。
+    """
+    # ① 正则提取（零成本、零幻觉）
+    url = _resolve_url_by_regex(user_prompt)
+    if url:
+        return url
+
+    # ② 别名表直接匹配（零成本、零幻觉）
+    url = _resolve_by_alias(user_prompt)
+    if url:
+        return url
+
+    # ③ LLM 识别站点名称 → 代码查别名表（LLM 不创造 URL）
+    site_name = _extract_site_name_llm(user_prompt)
+    if site_name:
+        url = _resolve_by_alias(site_name)
+        if url:
+            return url
+
+    # ④ 无法可靠解析 → 不猜，返回 None 降级
+    return None
 
 
 def _extract_json(text: str) -> dict:
@@ -272,8 +366,8 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     只要 action 不在白名单、缺字段、类型不对，照样拒绝。
     校验失败会抛异常，由 main.py 捕获后返回 400 给前端。
     """
-    # ── 阶段 1：提取入口 URL（AI 从自然语言中找）────────────────────
-    entry_url = _extract_entry_url(user_prompt)
+    # ── 阶段 1：解析入口 URL（正则优先，描述性输入 LLM fallback）───
+    entry_url = _resolve_entry_url(user_prompt)
 
     # ── 阶段 2：bounded exploration（目标驱动的多页面探索）──────────
     explore_result = None
