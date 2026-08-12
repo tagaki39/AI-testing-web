@@ -33,8 +33,8 @@ import urllib.request
 import urllib.error
 
 from dsl import DSLCase, validate_case
-from runner import _parse_target, _KNOWN_ROLES
-from snapshot import capture_page_snapshot
+from explore_flow import explore
+from runner import _parse_target
 
 # ── 配置（环境变量）───────────────────────────────────────────────────────────
 # os.getenv("名字", 默认值)：读环境变量，没设置就用默认值。
@@ -209,7 +209,8 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[str]:
         found, count = _snapshot_check(snapshot, role, name)
         if not found:
             issues.append(f"{t!r}: 页面快照中不存在")
-        elif count > 1 and role:
+        elif count > 1 and role and not step.scope:
+            # 已带 scope 的 target 视为已消歧，不报歧义
             issues.append(f"{t!r}: 页面存在 {count} 个同名 {role}，建议使用 scope 消歧")
 
     return issues
@@ -224,11 +225,28 @@ def _repair_with_llm(user_prompt: str, entry_url: str | None, snapshot: str, iss
         + "\n".join(f"- {i}" for i in issues)
         + "\n\n请基于页面真实结构修正这些 target："
         "存在多个同名元素时，scope 的值必须是页面中真实可见的文本"
-        "（如商品名称，不能是 CSS 类名）；不存在的元素改用快照中真实存在的元素。"
+        "（如商品名称，不能是 CSS 类名）；不存在的元素改用快照中真实存在的元素；"
+        "快照中以 'text: xxx' 形式出现的标题（span/div 无 heading 语义）"
+        "必须用 text=xxx 定位，禁止写 heading=xxx。"
         "输出完整的修正后 DSL JSON（其余步骤保持不变）。只输出 JSON。"
     )
     raw_text = _call_llm(repair_prompt)
     return validate_case(_extract_json(raw_text))
+
+
+# ── 多页面快照文本（探索结果 → Planner 可读上下文）──────────────────────────────
+
+def _pages_to_text(pages: list[dict]) -> str:
+    """把探索到的多页面快照合并成一份可读文本（每页分段标记）。"""
+    sections = []
+    for i, page in enumerate(pages, start=1):
+        title = page.get("title") or ""
+        sections.append(
+            f"[页面 {i}] {page['url']}"
+            + (f"（标题: {title}）" if title else "")
+            + f"\n{page['snapshot']}"
+        )
+    return "\n\n".join(sections)
 
 
 # ── 对外接口 ───────────────────────────────────────────────────────────────────
@@ -236,39 +254,56 @@ def _repair_with_llm(user_prompt: str, entry_url: str | None, snapshot: str, iss
 def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     """对外入口：自然语言需求 → 校验通过的 DSLCase + 生成元信息。
 
-    两阶段流水线（与原项目"先探索页面再生成"一致）：
-      阶段 1: _extract_entry_url() → LLM 从需求中提取入口 URL
-      阶段 2a: capture_page_snapshot() → Playwright 打开页面抓 ARIA 快照
-      阶段 2b: _call_llm() → 快照注入 prompt → 生成 DSL
-      阶段 3: validate_case() → Pydantic 强校验（安全边界）
+    四阶段流水线（bounded exploration 方案）：
+      阶段 1: _extract_entry_url() → LLM 提取入口 URL
+      阶段 2: explore() → bounded 探索：跟随用户目标探索多页面，
+              每个页面抓 ARIA 快照 + 记录操作路径
+      阶段 3: _call_llm() → 多页面结构 + 探索路径注入 prompt → Planner 生成 DSL
+      阶段 4: validate_case() + Preflight 校验（多页面验证，失败自动重生）
 
-    降级策略（快照失败不中断主链路，与原项目保护原则一致）：
+    降级策略（探索失败不中断主链路，与原项目保护原则一致）：
       - URL 提取失败  → 无快照直接生成
-      - 页面打不开     → 无快照直接生成
-      - 快照为空       → 无快照直接生成
+      - 探索失败/空   → 降级为单页快照 / 无快照直接生成
+      - Preflight 重生失败 → 保留原 case
 
-    返回 (case, meta)：meta 记录本次生成是否参考了页面结构，
-    供前端展示"AI 已基于真实页面生成"。
+    返回 (case, meta)：meta 记录探索与校验信息，供前端展示。
 
-    第 3 步是"最后一道防线"：AI 就算输出了合法 JSON，
+    第 4 步是"最后一道防线"：AI 就算输出了合法 JSON，
     只要 action 不在白名单、缺字段、类型不对，照样拒绝。
     校验失败会抛异常，由 main.py 捕获后返回 400 给前端。
     """
     # ── 阶段 1：提取入口 URL（AI 从自然语言中找）────────────────────
     entry_url = _extract_entry_url(user_prompt)
 
-    # ── 阶段 2a：抓页面快照（失败降级为 None）───────────────────────
-    snapshot = capture_page_snapshot(entry_url) if entry_url else None
+    # ── 阶段 2：bounded exploration（目标驱动的多页面探索）──────────
+    explore_result = None
+    pages = []
+    if entry_url:
+        try:
+            explore_result = explore(user_prompt, entry_url, _call_llm)
+            pages = explore_result.get("pages", [])
+        except Exception:
+            explore_result = None   # 探索异常 → 降级无快照生成
 
-    # ── 阶段 2b：组装 prompt → 生成 DSL ─────────────────────────────
-    if snapshot:
-        # 快照注入：把真实页面结构作为上下文给 LLM
-        # 这是"检索增强"的核心——LLM 基于真实元素生成，不盲猜
+    # ── 阶段 3：组装 prompt（多页面结构 + 探索路径）→ Planner 生成 ──
+    multi_snapshot = _pages_to_text(pages) if pages else None
+    if multi_snapshot:
+        # 把探索路径也注入：Planner 能看到"怎么走到每个页面"
+        path_lines = [
+            f"- {h.get('action')} {h.get('target')} {h.get('value') or ''} @ {h.get('url')}"
+            for h in (explore_result or {}).get("history", [])
+        ]
         grounded_prompt = (
             f"目标页面入口: {entry_url}\n\n"
-            f"以下是目标页面的真实结构（ARIA snapshot），"
-            f"请基于其中存在的元素生成 DSL：\n\n{snapshot}\n\n"
-            f"用户测试需求: {user_prompt}"
+            f"探索路径（已按此流程访问过以下页面）:\n"
+            + "\n".join(path_lines)
+            + "\n\n各页面真实结构（ARIA snapshot）：\n\n"
+            + multi_snapshot
+            + "\n\n用户测试需求: " + user_prompt
+            + "\n\n规则："
+            "1. 用户提供的测试数据（如账号密码）用 ${var} 占位，并加入 input_contract 给出默认值；"
+            "2. 快照中以 'text: xxx' 形式出现的标题（span/div 无 heading 语义）"
+            "必须用 text=xxx 定位，禁止写 heading=xxx。"
         )
     else:
         grounded_prompt = user_prompt
@@ -278,18 +313,27 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     case = validate_case(raw_json)   # ← 安全边界：不通过就不执行
 
     meta = {
-        "snapshot_used": bool(snapshot),
+        "snapshot_used": bool(multi_snapshot),
         "entry_url": entry_url,
-        "preflight": None,           # Preflight 校验结果（有快照时才执行）
+        "explore": {
+            "pages_visited": len(pages),
+            "steps_used": (explore_result or {}).get("steps_used", 0),
+            "llm_calls": (explore_result or {}).get("llm_calls", 0),
+            "done": (explore_result or {}).get("done", False),
+        } if explore_result else None,
+        "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）
     }
 
-    # ── 阶段 3：Preflight 校验（有快照才做，失败自动重生一次）────────
-    if snapshot:
-        issues = _preflight_targets(case, snapshot)
+    # ── 阶段 4：Preflight 校验（多页面快照验证，失败自动重生一次）────
+    if multi_snapshot:
+        issues = _preflight_targets(case, multi_snapshot)
         if issues:
             try:
-                case = _repair_with_llm(user_prompt, entry_url, snapshot, issues)
+                case = _repair_with_llm(user_prompt, entry_url, multi_snapshot, issues)
                 meta["preflight"] = {"repaired": True, "issues": issues}
+                # 重生后再验证一次（只记录，不无限重生——预算控制）
+                remaining = _preflight_targets(case, multi_snapshot)
+                meta["preflight"]["remaining_issues"] = remaining
             except Exception:
                 # 重生失败（LLM 又输出非法格式）→ 保留原 case，不中断
                 meta["preflight"] = {"repaired": False, "issues": issues}

@@ -114,6 +114,9 @@ def _parse_target(target: str | dict | None) -> ParsedTarget | None:
         return ParsedTarget(css=t[4:].strip())
     if t.startswith(("test_id=", "testid=")):
         return ParsedTarget(test_id=t.split("=", 1)[1].strip())
+    if t.startswith("text="):
+        # 显式文本定位（"text" 不是语义角色，必须单独识别）
+        return ParsedTarget(text=t[5:].strip())
     if "=" in t:
         # "button=登录" → role="button", name="登录"
         role, _, name = t.partition("=")
