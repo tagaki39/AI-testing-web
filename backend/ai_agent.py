@@ -31,9 +31,12 @@ import os
 import re
 import urllib.request
 import urllib.error
+from dataclasses import dataclass, asdict
 from urllib.parse import urlparse
 
-from dsl import DSLCase, validate_case
+from pydantic import BaseModel, Field
+
+from dsl import DSLCase, Locator, Scope, validate_case
 from explore_flow import explore
 from runner import _parse_target
 
@@ -259,11 +262,36 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
-# ── Preflight 校验（生成后验证 target 能否命中，失败自动重生）──────────────────
-# 这是"AI 生成质量闭环"的核心（原项目同款机制）：
+# ── Preflight 校验（结构化 Issue + patch 修复）─────────────────────────────────
+# 这是"AI 生成质量闭环"的核心：
 #   AI 生成 DSL → 用真实页面快照验证每个 target → 不存在的/歧义的
-#   → 把问题反馈给 LLM 重新生成 → 修正后再次校验
-# 效果：AI 自己发现并修正错误，而不是执行时才失败、人工再改。
+#   → 输出【结构化 Issue】（step_index + 类型）→ LLM 只返回【patch】
+#   → 程序本地应用 patch → 再验证（最多 2 轮）
+#
+# 为什么 patch 而不是整份重生（设计评审建议）：
+#   整份重生时模型会顺手改其他步骤（改 base_url、删步骤、更改变量名）；
+#   patch 只修出问题的步骤，程序保证其余步骤分毫不动。
+
+@dataclass
+class PreflightIssue:
+    """结构化定位问题（机器可理解，供 patch 修复精确定位）。"""
+    step_index: int        # 出问题的步骤（1-based，与执行报告一致）
+    type: str              # "LOCATOR_NOT_FOUND" / "AMBIGUOUS_LOCATOR"
+    target: dict           # 原始 target（结构化）
+    detail: str            # 人类可读说明
+
+
+class RepairItem(BaseModel):
+    """单步修复补丁：替换该步骤的 target / scope。"""
+    step_index: int = Field(ge=1)
+    target: Locator | None = None
+    scope: Scope | None = None
+
+
+class RepairPatch(BaseModel):
+    """修复补丁集：只修出问题的步骤，其余步骤不动。"""
+    repairs: list[RepairItem] = Field(default_factory=list)
+
 
 def _snapshot_check(snapshot: str, role: str | None, name: str) -> tuple[bool, int]:
     """在 ARIA 快照文本中查找 role+name 或纯文本，返回 (是否找到, 出现次数)。
@@ -282,23 +310,32 @@ def _snapshot_check(snapshot: str, role: str | None, name: str) -> tuple[bool, i
     return name.lower() in snapshot.lower(), snapshot.lower().count(name.lower())
 
 
-def _preflight_targets(case: DSLCase, snapshot: str) -> list[str]:
-    """校验 DSL 每个 target 是否能在页面快照中命中，返回问题列表。
+def _target_to_dict(t) -> dict:
+    """把 target（str / Locator 模型 / dict）统一转成 dict。"""
+    if hasattr(t, "model_dump"):
+        return t.model_dump()
+    if isinstance(t, dict):
+        return t
+    return {"text": str(t)}
+
+
+def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
+    """校验 DSL 每个 target 是否能在页面快照中命中，返回结构化问题列表。
 
     三种结果：
       命中 1 次      → 通过
-      不存在          → "快照中不存在"（必须重生修正）
-      命中 2+ 次      → "存在 N 个同名元素，建议用 scope 消歧"（原项目同款约束）
+      不存在          → LOCATOR_NOT_FOUND（必须修复）
+      命中 2+ 次      → AMBIGUOUS_LOCATOR（需 scope 消歧；已带 scope 视为已消歧）
 
-    css=/test_id= 无法用快照文本验证（它们是 DOM 属性不是语义）→ 跳过。
+    css=/test_id= 无法用快照文本验证（DOM 属性不是语义）→ 跳过。
     """
-    issues: list[str] = []
-    for step in case.steps:
+    issues: list[PreflightIssue] = []
+    for index, step in enumerate(case.steps, start=1):
         t = step.target
         if not t:
             continue   # goto / 无 target 断言，无需验证
 
-        parsed = _parse_target(t)   # 复用 runner 的解析（单一实现）
+        parsed = _parse_target(t)   # 复用执行器的解析（单一实现）
         if parsed is None:
             continue
         role, name = parsed.role, parsed.name
@@ -309,30 +346,62 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[str]:
 
         found, count = _snapshot_check(snapshot, role, name)
         if not found:
-            issues.append(f"{t!r}: 页面快照中不存在")
+            issues.append(PreflightIssue(
+                step_index=index,
+                type="LOCATOR_NOT_FOUND",
+                target=_target_to_dict(t),
+                detail=f"步骤 {index}: target 在页面快照中不存在",
+            ))
         elif count > 1 and role and not step.scope:
-            # 已带 scope 的 target 视为已消歧，不报歧义
-            issues.append(f"{t!r}: 页面存在 {count} 个同名 {role}，建议使用 scope 消歧")
+            issues.append(PreflightIssue(
+                step_index=index,
+                type="AMBIGUOUS_LOCATOR",
+                target=_target_to_dict(t),
+                detail=f"步骤 {index}: 页面存在 {count} 个同名 {role}，需 scope 消歧",
+            ))
 
     return issues
 
 
-def _repair_with_llm(user_prompt: str, entry_url: str | None, snapshot: str, issues: list[str]) -> DSLCase:
-    """把 Preflight 发现的问题反馈给 LLM，要求基于真实页面重新生成完整 DSL。"""
+def _repair_patch_with_llm(snapshot: str, issues: list[PreflightIssue]) -> RepairPatch:
+    """把结构化 Issue 反馈给 LLM，返回 patch（只修出问题的步骤）。"""
+    issue_lines = "\n".join(
+        f"- 步骤 {i.step_index} [{i.type}]: {i.detail} target={i.target}"
+        for i in issues
+    )
     repair_prompt = (
-        f"目标页面入口: {entry_url}\n"
         f"页面真实结构（ARIA snapshot）:\n{snapshot}\n\n"
-        f"你上次生成的 DSL 存在以下定位问题（共 {len(issues)} 处）：\n"
-        + "\n".join(f"- {i}" for i in issues)
-        + "\n\n请基于页面真实结构修正这些 target："
-        "存在多个同名元素时，scope 的值必须是页面中真实可见的文本"
-        "（如商品名称，不能是 CSS 类名）；不存在的元素改用快照中真实存在的元素；"
-        "快照中以 'text: xxx' 形式出现的标题（span/div 无 heading 语义）"
-        "必须用 text=xxx 定位，禁止写 heading=xxx。"
-        "输出完整的修正后 DSL JSON（其余步骤保持不变）。只输出 JSON。"
+        f"生成的 DSL 存在以下定位问题（共 {len(issues)} 处）：\n{issue_lines}\n\n"
+        "请为每个问题步骤输出修复 patch。只输出 JSON：\n"
+        '{"repairs": [{"step_index": 5, "target": {"role": "button", "name": "Add to cart"}, '
+        '"scope": {"has_text": "Blue Top"}}]}\n\n'
+        "规则：\n"
+        "1. step_index 必须是问题步骤号（1-based）\n"
+        "2. 同名元素歧义（AMBIGUOUS_LOCATOR）：scope.has_text 必须用页面中真实可见的文本"
+        "（如商品名称，不能是 CSS 类名）\n"
+        "3. 元素不存在（LOCATOR_NOT_FOUND）：改用快照中真实存在的元素；"
+        "快照中以 'text: xxx' 形式出现的标题必须用 {\"text\": \"xxx\"}，禁止 role=heading\n"
+        "4. scope 不需要修复时给 null\n"
+        "5. 只输出 JSON"
     )
     raw_text = _call_llm(repair_prompt)
-    return validate_case(_extract_json(raw_text))
+    return RepairPatch.model_validate(_extract_json(raw_text))
+
+
+def _apply_patch(case: DSLCase, patch: RepairPatch) -> int:
+    """程序本地应用 patch：只替换 patch 中指定的步骤，其余分毫不动。"""
+    applied = 0
+    for rep in patch.repairs:
+        idx = rep.step_index - 1
+        if not (0 <= idx < len(case.steps)):
+            continue
+        step = case.steps[idx]
+        if rep.target is not None:
+            step.target = rep.target
+        if rep.scope is not None:
+            step.scope = rep.scope
+        applied += 1
+    return applied
 
 
 # ── 多页面快照文本（探索结果 → Planner 可读上下文）──────────────────────────────
@@ -425,18 +494,27 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）
     }
 
-    # ── 阶段 4：Preflight 校验（多页面快照验证，失败自动重生一次）────
+    # ── 阶段 4：Preflight 校验（结构化 Issue + patch 修复，最多 2 轮）─
     if multi_snapshot:
         issues = _preflight_targets(case, multi_snapshot)
         if issues:
-            try:
-                case = _repair_with_llm(user_prompt, entry_url, multi_snapshot, issues)
-                meta["preflight"] = {"repaired": True, "issues": issues}
-                # 重生后再验证一次（只记录，不无限重生——预算控制）
+            meta["preflight"] = {
+                "issues": [asdict(i) for i in issues],
+                "repairs_applied": 0,
+                "remaining_issues": None,
+            }
+            # patch 修复循环（最多 2 轮：每轮应用 patch 后重新验证）
+            for _ in range(2):
+                try:
+                    patch = _repair_patch_with_llm(multi_snapshot, issues)
+                    applied = _apply_patch(case, patch)
+                    meta["preflight"]["repairs_applied"] += applied
+                except Exception:
+                    break   # LLM 输出非法 patch → 停止（保留已应用的修复）
                 remaining = _preflight_targets(case, multi_snapshot)
-                meta["preflight"]["remaining_issues"] = remaining
-            except Exception:
-                # 重生失败（LLM 又输出非法格式）→ 保留原 case，不中断
-                meta["preflight"] = {"repaired": False, "issues": issues}
+                meta["preflight"]["remaining_issues"] = [asdict(i) for i in remaining]
+                if not remaining:
+                    break   # 全部修复完成
+                issues = remaining
 
     return case, meta
