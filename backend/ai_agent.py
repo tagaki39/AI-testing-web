@@ -62,10 +62,13 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
   "name": "用例名称",
   "description": "用例描述",
   "base_url": "被测网站入口URL",
-  "input_contract": [{"key": "变量名", "value": "默认值"}],
+  "input_contract": [
+    {"key": "username", "type": "string", "required": true, "secret": false, "default": "standard_user"},
+    {"key": "password", "type": "string", "required": true, "secret": true, "default": null}
+  ],
   "steps": [
     {"action": "goto", "value": "https://xxx.com"},
-    {"action": "fill", "target": {"role": "textbox", "name": "用户名"}, "value": "${变量名}"},
+    {"action": "fill", "target": {"role": "textbox", "name": "用户名"}, "value": "${username}"},
     {"action": "click", "target": {"role": "button", "name": "登录"}},
     {"action": "wait_for", "target": {"role": "heading", "name": "首页"}},
     {"action": "assert_visible", "target": {"text": "购物车"}},
@@ -82,8 +85,10 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
    - CSS 兜底: {"css": ".btn"}
 3. 同名元素消歧用 scope（先定位容器再找目标）：
    {"action": "click", "scope": {"has_text": "Blue Top"}, "target": {"role": "button", "name": "Add to cart"}}
-4. 用户提供的测试数据（如账号密码）用 ${var} 占位，并加入 input_contract 给出默认值
-5. assert_text 用于验证页面/元素包含某段文字；assert_visible 验证元素可见；assert_url 验证当前 URL 包含片段
+4. 所有可变测试输入（账号、密码等）必须用 ${var} 占位，并声明在 input_contract：
+   - 需求中给出的值 → default 填真实值（secret=false）
+   - 密码等敏感信息 → secret=true 且 default=null（执行时本地注入）
+5. assert_text 验证页面/元素包含文字；assert_visible 验证元素可见；assert_url 验证当前 URL 包含片段
 6. 只输出 JSON，不要输出任何解释或代码块标记"""
 
 
@@ -147,6 +152,57 @@ SITE_ALIASES: dict[str, str] = {
     "saucedemo": "https://www.saucedemo.com",
     "example": "https://example.com",
 }
+
+# ── 测试数据提取与脱敏（敏感信息不进 LLM 上下文）──────────────────────────────
+# 核心原则（设计评审）：Secrets remain outside the model context.
+#   LLM 看到：${email} ${password}
+#   Executor 看到：真实值（本地注入）
+
+_EMAIL_IN_GOAL_RE = re.compile(r'[\w.+-]+@[\w.-]+\.[\w.]+')
+# 密码常见写法："密码 xxx" / "password: xxx" / "xxx / yyy"（用户名/密码分隔）
+_PASSWORD_PATTERNS = [
+    re.compile(r'(?:密码|口令)[：:\s]+([^\s，,。;；]+)'),
+    re.compile(r'password[：:\s]+([^\s，,。;；]+)', re.IGNORECASE),
+    re.compile(r'(\S+)\s*/\s*([^\s，,。;；]+)'),   # standard_user / secret_sauce
+]
+
+
+def _extract_and_redact_goal(goal: str) -> tuple[str, dict]:
+    """从用户需求中提取测试数据（邮箱/密码），并从文本中脱敏。
+
+    返回 (脱敏后的 goal, runtime_inputs)。
+    LLM 上下文里只剩 ${email} ${password} 占位符；
+    真实值只在 Executor 本地使用（探索登录、DSL 执行时注入）。
+    """
+    runtime: dict[str, str] = {}
+    redacted = goal
+
+    # ① 邮箱（标准格式，可靠识别）
+    m = _EMAIL_IN_GOAL_RE.search(redacted)
+    if m:
+        runtime["email"] = m.group(0)
+        redacted = redacted.replace(m.group(0), "${email}")
+
+    # ② 密码（多种写法，命中一个即可）
+    # 注意："用户名 / 密码" 格式：group(1)=用户名，group(2)=密码，
+    # 两者都提取注入（探索时 fill 都用 ${var} 占位，Executor 本地填值）；
+    # 其余写法（密码:/password:/口令）只有密码，取 group(1)。
+    m = _PASSWORD_PATTERNS[0].search(redacted) or _PASSWORD_PATTERNS[1].search(redacted)
+    if m:
+        secret = m.group(1)
+    else:
+        m = _PASSWORD_PATTERNS[2].search(redacted)
+        if m:
+            runtime["username"] = m.group(1)
+            redacted = redacted.replace(m.group(1), "${username}")
+            secret = m.group(2)
+        else:
+            secret = None
+    if secret:
+        runtime["password"] = secret
+        redacted = redacted.replace(secret, "${password}")
+
+    return redacted, runtime
 
 
 def _resolve_by_alias(prompt: str) -> str | None:
@@ -262,23 +318,25 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
-# ── Preflight 校验（结构化 Issue + patch 修复）─────────────────────────────────
-# 这是"AI 生成质量闭环"的核心：
-#   AI 生成 DSL → 用真实页面快照验证每个 target → 不存在的/歧义的
-#   → 输出【结构化 Issue】（step_index + 类型）→ LLM 只返回【patch】
-#   → 程序本地应用 patch → 再验证（最多 2 轮）
+# ── Preflight v2：候选提取 + 确定性消歧 + LLM 受限选择 ────────────────────────
+# 核心原则（设计评审）：
+#   "LLM 最适合做语义判断，不应该承担能够由确定性程序完成的结构修复；
+#    模型输出空间越小，Agent 越稳定。"
 #
-# 为什么 patch 而不是整份重生（设计评审建议）：
-#   整份重生时模型会顺手改其他步骤（改 base_url、删步骤、更改变量名）；
-#   patch 只修出问题的步骤，程序保证其余步骤分毫不动。
+# 分层修复（不再是 LLM 自由生成 patch）：
+#   Round 1  确定性代码修复：歧义 → 提取候选 → 需求匹配/首个候选；不存在 → 文本替代
+#   Round 2  LLM 受限选择：只从候选里选 candidate_id，patch 由代码生成
+#   Round 3  fail-safe：剩余问题标记 unresolved，不无限重试
 
 @dataclass
 class PreflightIssue:
-    """结构化定位问题（机器可理解，供 patch 修复精确定位）。"""
+    """结构化定位问题（机器可理解，供修复精确定位）。"""
     step_index: int        # 出问题的步骤（1-based，与执行报告一致）
+    issue_id: str          # 唯一标识（"step6"）
     type: str              # "LOCATOR_NOT_FOUND" / "AMBIGUOUS_LOCATOR"
     target: dict           # 原始 target（结构化）
     detail: str            # 人类可读说明
+    candidates: list[dict] | None = None   # 歧义候选 [{"candidate_id", "scope_text"}]
 
 
 class RepairItem(BaseModel):
@@ -291,6 +349,17 @@ class RepairItem(BaseModel):
 class RepairPatch(BaseModel):
     """修复补丁集：只修出问题的步骤，其余步骤不动。"""
     repairs: list[RepairItem] = Field(default_factory=list)
+
+
+class RepairChoice(BaseModel):
+    """LLM 的选择题答案：只选 candidate_id，不生成任何 locator。"""
+    issue_id: str
+    candidate_id: str
+
+
+class RepairResponse(BaseModel):
+    """LLM 选择题响应（必须覆盖全部 issue，否则判为无效响应）。"""
+    choices: list[RepairChoice] = Field(default_factory=list)
 
 
 def _snapshot_check(snapshot: str, role: str | None, name: str) -> tuple[bool, int]:
@@ -348,6 +417,7 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
         if not found:
             issues.append(PreflightIssue(
                 step_index=index,
+                issue_id=f"step{index}",
                 type="LOCATOR_NOT_FOUND",
                 target=_target_to_dict(t),
                 detail=f"步骤 {index}: target 在页面快照中不存在",
@@ -355,6 +425,7 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
         elif count > 1 and role and not step.scope:
             issues.append(PreflightIssue(
                 step_index=index,
+                issue_id=f"step{index}",
                 type="AMBIGUOUS_LOCATOR",
                 target=_target_to_dict(t),
                 detail=f"步骤 {index}: 页面存在 {count} 个同名 {role}，需 scope 消歧",
@@ -363,29 +434,200 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
     return issues
 
 
-def _repair_patch_with_llm(snapshot: str, issues: list[PreflightIssue]) -> RepairPatch:
-    """把结构化 Issue 反馈给 LLM，返回 patch（只修出问题的步骤）。"""
+# ── 候选提取（歧义 → 真实页面上下文）──────────────────────────────────────────
+
+def _extract_candidate_contexts(
+    urls: list[str], target: dict, login_inputs: dict | None = None,
+) -> list[dict] | None:
+    """打开页面，提取 target 所有匹配元素的上下文文本（消歧候选）。
+
+    核心：候选是【系统观察到的真实实体】——LLM 只能从中选择，
+    没有权限创造 scope 文本。
+
+    ⚠️ 注意：这里直接构建 locator 数 count，不能用 _resolve_locator——
+    它是三分法，count>1 会抛 AmbiguousError（歧义正是我们要提取的）。
+
+    login_inputs：登录后的页面（如商品页）在新会话会被重定向回登录页，
+    用探索时提取的账号密码自动登录后重试。
+    """
+    from playwright.sync_api import sync_playwright
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_default_timeout(10000)
+            try:
+                for url in urls:
+                    try:
+                        page.goto(url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1000)
+                    except Exception:
+                        continue
+                    # 被重定向到登录页（需要登录态）→ 自动登录后重试
+                    if login_inputs and _try_login(page, login_inputs):
+                        try:
+                            page.goto(url, wait_until="domcontentloaded")
+                            page.wait_for_timeout(1000)
+                        except Exception:
+                            pass
+                    locator = _build_locator_for_count(page, target)
+                    if locator is None:
+                        continue
+                    count = locator.count()
+                    if count <= 1:
+                        continue
+                    candidates = []
+                    for i in range(count):
+                        try:
+                            node = locator.nth(i)
+                            # 向上找稳定业务容器（li/article/data-testid），否则向上 2 层
+                            container = node.locator(
+                                "xpath=ancestor::*[self::li or self::article or @data-testid][1]"
+                            )
+                            container_count = container.count()   # count 缓存，避免重复查询
+                            if container_count == 0:
+                                container = node.locator("xpath=../..")
+                                container_count = container.count()
+                            raw = container.inner_text().strip() if container_count > 0 else ""
+                            node_text = node.inner_text().strip()
+                            # 候选上下文：容器文本 + 候选 scope 行（排除按钮自身文本）
+                            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+                            scope_candidates = [
+                                ln for ln in lines if ln != node_text
+                            ][:5]
+                        except Exception:
+                            raw, node_text, scope_candidates = "", "", []
+                        candidates.append({
+                            "candidate_id": f"c{i + 1}",
+                            "context_text": raw[:200],
+                            "scope_candidates": scope_candidates,
+                        })
+                    if candidates:
+                        return candidates
+            finally:
+                browser.close()
+    except Exception:
+        return None
+    return None
+
+
+def _try_login(page, login_inputs: dict) -> bool:
+    """当前页面有登录表单时自动登录（候选提取用）。
+
+    返回是否尝试了登录。表单定位用通用语义（Username/Password/Login），
+    失败静默（不中断候选提取）。
+    """
+    try:
+        username = page.get_by_role("textbox", name="Username")
+        if username.count() == 0:
+            return False
+        username.fill(login_inputs.get("username") or "")
+        page.get_by_role("textbox", name="Password").fill(login_inputs.get("password") or "")
+        page.get_by_role("button", name="Login").click()
+        page.wait_for_timeout(1200)
+        return True
+    except Exception:
+        return False
+
+
+def _build_locator_for_count(page, target: dict):
+    """直接构建定位器（绕过三分法，允许 count>1）——候选提取专用。"""
+    parsed = _parse_target(target)
+    if parsed is None:
+        return None
+    if parsed.test_id:
+        return page.get_by_test_id(parsed.test_id)
+    if parsed.role and parsed.name:
+        return page.get_by_role(parsed.role, name=parsed.name)
+    if parsed.text:
+        return page.get_by_text(parsed.text)
+    if parsed.css:
+        return page.locator(parsed.css)
+    return None
+
+
+def _text_alternative(snapshot: str, name: str) -> Locator | None:
+    """NOT_FOUND 的确定性修复：目标名在快照中存在文本 → 换成文本定位。"""
+    found, _ = _snapshot_check(snapshot, None, name)
+    return Locator(text=name) if found else None
+
+
+# 价格行正则（scope 选择时跳过 "$29.99" 这类噪音）
+_PRICE_RE = re.compile(r"[$€£]?\s*\d+(?:\.\d{1,2})?")
+
+
+def _choose_scope_text(scope_candidates: list[str]) -> str | None:
+    """从候选行中选最终 scope 文本（启发式）：
+    跳过空行/按钮文本（已排除）/纯价格/过短行，返回第一个像"名称"的行。
+    """
+    for line in scope_candidates:
+        line = line.strip()
+        if not line or len(line) < 2:
+            continue
+        if _PRICE_RE.fullmatch(line):
+            continue
+        return line[:60]
+    return None
+
+
+def _resolve_ambiguity(goal: str, issue: PreflightIssue) -> tuple[str, dict | None, str | None]:
+    """需求明确性判断（区分 Locator / Requirement ambiguity）：
+      - goal 命中某候选的 scope 行 → ("auto", 候选, scope)  需求明确，代码直接修
+      - 无命中但有可用 scope 行  → ("first", 候选, scope)   需求歧义，确定性选第一个
+      - 其他                    → ("llm", None, None)      多个候选匹配需求，LLM 选
+    """
+    # 确定性：goal 子串命中某个候选的 scope_candidates 行
+    for cand in (issue.candidates or []):
+        for scope in cand.get("scope_candidates", []):
+            if scope and scope.lower() in goal.lower():
+                return "auto", cand, scope
+
+    # 需求歧义：取第一个候选的第一个"好" scope 行
+    for cand in (issue.candidates or []):
+        scope = _choose_scope_text(cand.get("scope_candidates", []))
+        if scope:
+            return "first", cand, scope
+
+    return "llm", None, None
+
+
+def _scope_patch(issue: PreflightIssue, scope_text: str) -> RepairItem:
+    """由最终 scope 文本生成 patch（代码构造，LLM 不参与）。"""
+    return RepairItem(
+        step_index=issue.step_index,
+        target=Locator(**issue.target),
+        scope=Scope(has_text=scope_text),
+    )
+
+
+def _llm_choose_candidates(goal: str, issues: list[PreflightIssue]) -> list[RepairChoice]:
+    """LLM 只做选择题：从系统观察到的候选中选 candidate_id。
+
+    响应必须覆盖全部 issue（expected == received），否则判为无效响应。
+    """
     issue_lines = "\n".join(
-        f"- 步骤 {i.step_index} [{i.type}]: {i.detail} target={i.target}"
+        f"- issue_id={i.issue_id} 步骤 {i.step_index}: {i.detail}\n"
+        f"  候选: " + " | ".join(
+            f"{c['candidate_id']}={'/'.join(c.get('scope_candidates', [])[:2]) or c.get('context_text', '')[:30]}"
+            for c in (i.candidates or [])
+        )
         for i in issues
     )
-    repair_prompt = (
-        f"页面真实结构（ARIA snapshot）:\n{snapshot}\n\n"
-        f"生成的 DSL 存在以下定位问题（共 {len(issues)} 处）：\n{issue_lines}\n\n"
-        "请为每个问题步骤输出修复 patch。只输出 JSON：\n"
-        '{"repairs": [{"step_index": 5, "target": {"role": "button", "name": "Add to cart"}, '
-        '"scope": {"has_text": "Blue Top"}}]}\n\n'
-        "规则：\n"
-        "1. step_index 必须是问题步骤号（1-based）\n"
-        "2. 同名元素歧义（AMBIGUOUS_LOCATOR）：scope.has_text 必须用页面中真实可见的文本"
-        "（如商品名称，不能是 CSS 类名）\n"
-        "3. 元素不存在（LOCATOR_NOT_FOUND）：改用快照中真实存在的元素；"
-        "快照中以 'text: xxx' 形式出现的标题必须用 {\"text\": \"xxx\"}，禁止 role=heading\n"
-        "4. scope 不需要修复时给 null\n"
-        "5. 只输出 JSON"
+    prompt = (
+        f"用户测试目标（已脱敏）: {goal}\n\n"
+        f"以下每个问题都提供了系统实际观察到的候选。你只能从 candidates 中选择 candidate_id。\n"
+        f"禁止创建新的 target、scope、文本或 locator。\n"
+        f"必须为每个 issue_id 返回且仅返回一个选择。\n\n"
+        f"{issue_lines}\n\n"
+        '只输出 JSON: {"choices": [{"issue_id": "step6", "candidate_id": "c1"}]}'
     )
-    raw_text = _call_llm(repair_prompt)
-    return RepairPatch.model_validate(_extract_json(raw_text))
+    raw_text = _call_llm(prompt, system_prompt=None)
+    resp = RepairResponse.model_validate(_extract_json(raw_text))
+    expected = {i.issue_id for i in issues}
+    received = {c.issue_id for c in resp.choices}
+    if expected != received:
+        raise ValueError(f"修复响应不完整: 期望覆盖 {expected}，实际收到 {received}")
+    return resp.choices
 
 
 def _apply_patch(case: DSLCase, patch: RepairPatch) -> int:
@@ -402,6 +644,91 @@ def _apply_patch(case: DSLCase, patch: RepairPatch) -> int:
             step.scope = rep.scope
         applied += 1
     return applied
+
+
+def _preflight_and_repair(
+    case: DSLCase, multi_snapshot: str, urls: list[str], goal: str,
+    login_inputs: dict | None = None,
+) -> dict:
+    """分层修复主流程（Round1 确定性 → Round2 LLM 受限选择 → Round3 fail-safe）。
+
+    返回统计：repairs_applied / implicit_resolutions / remaining_issues / unresolved
+    """
+    stats = {
+        "repairs_applied": 0,
+        "implicit_resolutions": [],
+        "remaining_issues": None,
+        "unresolved": [],
+    }
+
+    def run_preflight() -> list[PreflightIssue]:
+        return _preflight_targets(case, multi_snapshot)
+
+    issues = run_preflight()
+    if not issues:
+        return stats
+
+    # ── Round 1：确定性代码修复（零 LLM 调用）────────────────────
+    round1_patches: list[RepairItem] = []
+    for issue in issues:
+        if issue.type == "AMBIGUOUS_LOCATOR":
+            # 候选提取：真实页面上下文（系统观察到的实体）
+            issue.candidates = _extract_candidate_contexts(urls, issue.target, login_inputs)
+            if not issue.candidates:
+                continue   # 提取失败 → 留给 Round 2
+            mode, chosen, scope_text = _resolve_ambiguity(goal, issue)
+            if mode in ("auto", "first") and chosen and scope_text:
+                round1_patches.append(_scope_patch(issue, scope_text))
+                if mode == "first":
+                    stats["implicit_resolutions"].append({
+                        "step_index": issue.step_index,
+                        "reason": "用户未指定具体对象，按确定性规则选择第一个候选",
+                        "selected": scope_text,
+                        "policy": "first_candidate",
+                    })
+            # mode == "llm" → 留给 Round 2
+        elif issue.type == "LOCATOR_NOT_FOUND":
+            parsed = _parse_target(issue.target)
+            name = (parsed.name or parsed.text) if parsed else None
+            if name:
+                alt = _text_alternative(multi_snapshot, name)
+                if alt:
+                    round1_patches.append(RepairItem(step_index=issue.step_index, target=alt))
+
+    if round1_patches:
+        stats["repairs_applied"] += _apply_patch(case, RepairPatch(repairs=round1_patches))
+        issues = run_preflight()
+
+    # ── Round 2：LLM 受限选择（只选 candidate_id，patch 代码生成）─
+    if issues:
+        llm_issues = [i for i in issues if i.type == "AMBIGUOUS_LOCATOR" and i.candidates]
+        if llm_issues:
+            try:
+                choices = _llm_choose_candidates(goal, llm_issues)
+                patches: list[RepairItem] = []
+                for ch in choices:
+                    issue = next((i for i in llm_issues if i.issue_id == ch.issue_id), None)
+                    candidate = next(
+                        (c for c in (issue.candidates or []) if c["candidate_id"] == ch.candidate_id),
+                        None,
+                    ) if issue else None
+                    # LLM 只选 candidate_id，最终 scope 文本由代码从候选行中确定
+                    if issue and candidate:
+                        scope_text = _choose_scope_text(candidate.get("scope_candidates", []))
+                        if scope_text:
+                            patches.append(_scope_patch(issue, scope_text))
+                if patches:
+                    stats["repairs_applied"] += _apply_patch(case, RepairPatch(repairs=patches))
+                    issues = run_preflight()
+            except Exception:
+                pass   # LLM 选择失败 → Round 3 fail-safe
+
+    # ── Round 3：fail-safe（剩余问题记录，不无限重试）─────────────
+    stats["remaining_issues"] = [asdict(i) for i in issues] if issues else []
+    stats["unresolved"] = [
+        asdict(i) for i in issues if i.type == "LOCATOR_NOT_FOUND"
+    ] if issues else []
+    return stats
 
 
 # ── 多页面快照文本（探索结果 → Planner 可读上下文）──────────────────────────────
@@ -445,12 +772,15 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     # ── 阶段 1：解析入口 URL（正则优先，描述性输入 LLM fallback）───
     entry_url = _resolve_entry_url(user_prompt)
 
+    # ── 阶段 1.5：测试数据脱敏（敏感信息不进 LLM 上下文）───────────
+    explore_goal, runtime_inputs = _extract_and_redact_goal(user_prompt)
+
     # ── 阶段 2：bounded exploration（目标驱动的多页面探索）──────────
     explore_result = None
     pages = []
     if entry_url:
         try:
-            explore_result = explore(user_prompt, entry_url, _call_llm)
+            explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
             pages = explore_result.get("pages", [])
         except Exception:
             explore_result = None   # 探索异常 → 降级无快照生成
@@ -470,14 +800,16 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             + "\n".join(path_lines)
             + "\n\n各页面真实结构（ARIA snapshot）：\n\n"
             + multi_snapshot
-            + "\n\n用户测试需求: " + user_prompt
+            + "\n\n用户测试需求（已脱敏，密码等敏感信息已替换为 ${var} 占位符）: "
+            + explore_goal
             + "\n\n规则："
-            "1. 用户提供的测试数据（如账号密码）用 ${var} 占位，并加入 input_contract 给出默认值；"
+            "1. 用户提供的测试数据用 ${var} 占位并声明在 input_contract："
+            "需求中给出的值填 default；密码等敏感信息 secret=true 且 default=null；"
             "2. 快照中以 'text: xxx' 形式出现的标题（span/div 无 heading 语义）"
             '必须用 {"text": "xxx"} 定位，禁止用 {"role": "heading"}。'
         )
     else:
-        grounded_prompt = user_prompt
+        grounded_prompt = explore_goal   # 无快照时同样用脱敏后的需求
 
     raw_text = _call_llm(grounded_prompt)
     raw_json = _extract_json(raw_text)
@@ -495,27 +827,11 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）
     }
 
-    # ── 阶段 4：Preflight 校验（结构化 Issue + patch 修复，最多 2 轮）─
+    # ── 阶段 4：Preflight 分层修复（确定性 → LLM 受限选择 → fail-safe）─
     if multi_snapshot:
-        issues = _preflight_targets(case, multi_snapshot)
-        if issues:
-            meta["preflight"] = {
-                "issues": [asdict(i) for i in issues],
-                "repairs_applied": 0,
-                "remaining_issues": None,
-            }
-            # patch 修复循环（最多 2 轮：每轮应用 patch 后重新验证）
-            for _ in range(2):
-                try:
-                    patch = _repair_patch_with_llm(multi_snapshot, issues)
-                    applied = _apply_patch(case, patch)
-                    meta["preflight"]["repairs_applied"] += applied
-                except Exception:
-                    break   # LLM 输出非法 patch → 停止（保留已应用的修复）
-                remaining = _preflight_targets(case, multi_snapshot)
-                meta["preflight"]["remaining_issues"] = [asdict(i) for i in remaining]
-                if not remaining:
-                    break   # 全部修复完成
-                issues = remaining
+        urls = [p["url"] for p in pages]
+        stats = _preflight_and_repair(case, multi_snapshot, urls, explore_goal, runtime_inputs)
+        if stats["repairs_applied"] or stats["remaining_issues"]:
+            meta["preflight"] = stats
 
     return case, meta
