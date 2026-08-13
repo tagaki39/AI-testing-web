@@ -414,16 +414,21 @@ def _target_to_dict(t) -> dict:
     return {"text": str(t)}
 
 
-def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
-    """校验 DSL 每个 target 是否能在页面快照中命中，返回结构化问题列表。
+def _preflight_targets(case: DSLCase, observations: list[dict]) -> list[PreflightIssue]:
+    """Page-aware Preflight：按 step.observation_ref 在对应页面状态内做 0/1/N 验证。
 
-    三种结果：
-      命中 1 次      → 通过
-      不存在          → LOCATOR_NOT_FOUND（必须修复）
-      命中 2+ 次      → AMBIGUOUS_LOCATOR（需 scope 消歧；已带 scope 视为已消歧）
+    验证上下文选择（修复跨页面误判）：
+      有合法 observation_ref → 强验证：在该 observation 的 snapshot 内做
+                               存在性 + 次数（0/1/N 真实有效）
+      无 observation_ref    → 弱验证：跨 observation presence-only
+                               （存在即可，不做全局 count blocking——
+                               避免把跨页面重复误判为同页歧义）
 
     css=/test_id= 无法用快照文本验证（DOM 属性不是语义）→ 跳过。
     """
+    obs_map = {o["id"]: o for o in observations}
+    fallback_snapshot = _pages_to_text(observations)   # 弱验证用
+
     issues: list[PreflightIssue] = []
     for index, step in enumerate(case.steps, start=1):
         t = step.target
@@ -439,6 +444,15 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
         if not name:
             continue   # 纯 css/test_id，无法验证
 
+        # 验证上下文：有 ref → 对应 observation（强）；无 → 合并快照（弱）
+        ref = step.observation_ref
+        if ref and ref in obs_map:
+            snapshot = obs_map[ref]["snapshot"]
+            strong = True
+        else:
+            snapshot = fallback_snapshot
+            strong = False
+
         found, count = _snapshot_check(snapshot, role, name)
         if not found:
             issues.append(PreflightIssue(
@@ -448,11 +462,10 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
                 target=_target_to_dict(t),
                 detail=f"步骤 {index}: target 在页面快照中不存在",
             ))
-        elif count > 1 and role:
-            # scope 三分验证（修复：有 scope ≠ 已消歧）：
-            #   scope 文本不存在 → SCOPE_NOT_FOUND
-            #   scope 文本匹配多个 → SCOPE_AMBIGUOUS
-            #   scope 有效且唯一 → 视为已消歧，通过
+        elif count > 1 and role and strong:
+            # 强验证（有 observation_ref）：该页面状态内真歧义 → scope 检查
+            # 弱验证（无 ref）：target 存在即通过（presence-only，
+            #   不做全局 count blocking——避免跨页面重复误判为歧义）
             scope_text = None
             if step.scope is not None:
                 scope_text = step.scope.model_dump().get("has_text") \
@@ -467,11 +480,6 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
                     detail=f"步骤 {index}: 页面存在 {count} 个同名 {role}，需 scope 消歧",
                 ))
             else:
-                # scope 验证（跨页面计数污染降级为 warning）：
-                #   0 次  → blocking（scope 无效，消歧失败）
-                #   1 次  → pass
-                #   >1 次 → warning（合并快照无法区分"多页面各 1 次"与
-                #             "当前页面多次"——cardinality unknown）
                 scope_found, scope_count = _scope_snapshot_check(snapshot, scope_text)
                 if not scope_found:
                     issues.append(PreflightIssue(
@@ -482,17 +490,20 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
                         detail=f"步骤 {index}: scope 文本在快照中不存在（{scope_text!r}），消歧无效",
                     ))
                 elif scope_count > 1:
+                    # scope 文本计数不可靠（同一文本可出现在卡片/描述多处，
+                    # 但业务容器唯一）——容器级消歧只由运行时联合三分法判断，
+                    # 快照文本无法恢复容器关系 → 一律 warning（不 blocking）
                     issues.append(PreflightIssue(
                         step_index=index,
                         issue_id=f"step{index}",
                         type="SCOPE_CARDINALITY_UNKNOWN",
                         target=_target_to_dict(t),
                         detail=(
-                            f"步骤 {index}: scope 文本在多页面快照中出现 {scope_count} 次，"
-                            "无法据此判断当前页面歧义（由运行时页面级定位兜底）"
+                            f"步骤 {index}: scope 文本在页面快照中出现 {scope_count} 次，"
+                            "文本计数无法判断容器唯一性（由运行时联合三分法兜底）"
                         ),
                     ))
-                # scope 唯一 → 已消歧，通过
+                # scope 存在 → 消歧通过（容器级唯一性交给运行时）
 
     return issues
 
@@ -717,13 +728,15 @@ def _apply_patch(case: DSLCase, patch: RepairPatch) -> int:
 
 
 def _preflight_and_repair(
-    case: DSLCase, multi_snapshot: str, urls: list[str], goal: str,
+    case: DSLCase, observations: list[dict], urls: list[str], goal: str,
     login_inputs: dict | None = None,
 ) -> dict:
     """分层修复主流程（Round1 确定性 → Round2 LLM 受限选择 → Round3 fail-safe）。
 
-    返回统计：repairs_applied / implicit_resolutions / remaining_issues / unresolved
+    返回统计：repairs_applied / implicit_resolutions / blocking_issues / warnings
     """
+    multi_snapshot = _pages_to_text(observations)   # 修复 prompt / 弱验证用
+
     stats = {
         "repairs_applied": 0,
         "implicit_resolutions": [],
@@ -732,7 +745,7 @@ def _preflight_and_repair(
     }
 
     def run_preflight() -> list[PreflightIssue]:
-        return _preflight_targets(case, multi_snapshot)
+        return _preflight_targets(case, observations)
 
     issues = run_preflight()
     if not issues:
@@ -975,13 +988,13 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）
     }
 
-    # ── 阶段 4：Preflight 分层修复（确定性 → LLM 受限选择 → fail-safe）─
-    if multi_snapshot:
+    # ── 阶段 4：Page-aware Preflight（按 observation_ref 验证 + 分层修复）─
+    if pages:
         urls = [p["url"] for p in pages]
         # 只要跑了 Preflight 就始终返回 stats（修复：不再按条件访问
         # 可能不存在的 key——避免 repairs=0 时 KeyError）
         meta["preflight"] = _preflight_and_repair(
-            case, multi_snapshot, urls, explore_goal, runtime_inputs,
+            case, pages, urls, explore_goal, runtime_inputs,
         )
 
     return case, meta
