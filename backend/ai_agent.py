@@ -942,7 +942,10 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             "1. 用户提供的测试数据用 ${var} 占位并声明在 input_contract："
             "需求中给出的值填 default；密码等敏感信息 secret=true 且 default=null；"
             "2. 快照中以 'text: xxx' 形式出现的标题（span/div 无 heading 语义）"
-            '必须用 {"text": "xxx"} 定位，禁止用 {"role": "heading"}。'
+            '必须用 {"text": "xxx"} 定位，禁止用 {"role": "heading"}；'
+            "3. 每个步骤必须设置 observation_ref，且只能从页面分段标记"
+            "（[obs1] [obs2] ...）中选择——禁止创造不存在的 observation_ref；"
+            "该步骤的 target/scope 必须来自该 observation 的页面结构。"
         )
     else:
         grounded_prompt = explore_goal   # 无快照时同样用脱敏后的需求
@@ -951,6 +954,14 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     raw_json = _extract_json(raw_text)
     case = validate_case(raw_json)   # ← 安全边界：不通过就不执行
     case = _normalize_steps(case)    # ← 计划归一化：LLM 波动 → 稳定结构
+
+    # ← grounding 验证：observation_ref 必须来自系统提供的真实 id
+    #（不靠 Prompt——代码校验；非法 ref 清空为 None，降级弱验证）
+    valid_refs = {obs["id"] for obs in pages}
+    if valid_refs:
+        for step in case.steps:
+            if step.observation_ref and step.observation_ref not in valid_refs:
+                step.observation_ref = None
 
     meta = {
         "snapshot_used": bool(multi_snapshot),

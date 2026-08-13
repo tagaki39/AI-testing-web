@@ -105,6 +105,9 @@ class DSLStep(DSLModel):
     scope: str | Scope | None = None
     value: str | None = None       # 输入值 / 选项文本 / 断言文本 / URL 片段
     timeout_ms: int = Field(default=15000, ge=100, le=60000)   # 单步超时（毫秒）
+    observation_ref: str | None = None   # 该步骤基于哪个观察到的页面状态生成
+                                          # （grounding provenance + Preflight 验证上下文；
+                                          #  不参与 Runner 执行）
 
     @model_validator(mode="after")
     def _check_required_fields(self) -> "DSLStep":
