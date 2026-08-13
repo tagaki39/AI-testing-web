@@ -28,11 +28,21 @@ dsl.py — DSL 数据结构定义（整个项目的"规则书"）
 ══════════════════════════════════════════════════════════════════════
 """
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Literal
 
 
-class Locator(BaseModel):
+class DSLModel(BaseModel):
+    """所有 DSL 模型基类：拒绝未知字段（extra=forbid）。
+
+    修复：LLM 输出 {"target": {..., "xpath": "..."}} 时，
+    未知字段不再被静默丢弃——AI 以为 xpath 生效，代码其实丢了，
+    这种"虚假生效"比报错更危险。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+
+class Locator(DSLModel):
     """结构化元素定位（v2：多字段组合，按优先级解析）。
 
     role + name → 语义定位（最稳，官方推荐，不需要埋点）
@@ -51,8 +61,15 @@ class Locator(BaseModel):
     text: str | None = None      # 可见文本
     css: str | None = None       # CSS 选择器
 
+    @model_validator(mode="after")
+    def _require_one_field(self) -> "Locator":
+        """至少一个定位字段（修复：空 Locator 无意义却可通过校验）。"""
+        if not any([self.role, self.name, self.text, self.test_id, self.css]):
+            raise ValueError("Locator 至少需要 role/name/text/test_id/css 之一")
+        return self
 
-class Scope(BaseModel):
+
+class Scope(DSLModel):
     """作用域：先定位"容器"，再在容器内找目标 → 解决同名元素歧义。
 
     典型场景：页面有 6 个 "Add to cart"，先锁定包含 Blue Top 的容器。
@@ -66,7 +83,7 @@ class Scope(BaseModel):
     has_text: str | None = None  # 容器必须包含的文本（消歧的锚点）
 
 
-class DSLStep(BaseModel):
+class DSLStep(DSLModel):
     """一个测试步骤（DSL 的最小单元）。
 
     action 是 Literal 白名单——只允许这 9 种动作：
@@ -87,10 +104,29 @@ class DSLStep(BaseModel):
     target: str | Locator | None = None
     scope: str | Scope | None = None
     value: str | None = None       # 输入值 / 选项文本 / 断言文本 / URL 片段
-    timeout_ms: int = 15000        # 单步超时（毫秒）
+    timeout_ms: int = Field(default=15000, ge=100, le=60000)   # 单步超时（毫秒）
+
+    @model_validator(mode="after")
+    def _check_required_fields(self) -> "DSLStep":
+        """action 级必填校验（修复：类型合法但业务语义非法的 DSL 也能通过）。
+
+        例：click 无 target / goto 无 value / assert_url 无 value——
+        Pydantic 类型校验管不到，这里按 action 语义强制。
+        """
+        if self.action == "goto" and not self.value:
+            raise ValueError("goto 必须提供 value（URL）")
+        if self.action in {"click", "check", "wait_for", "assert_visible"} \
+                and self.target is None:
+            raise ValueError(f"{self.action} 必须提供 target")
+        if self.action in {"fill", "input", "select"} \
+                and (self.target is None or self.value is None):
+            raise ValueError(f"{self.action} 必须提供 target 和 value")
+        if self.action in {"assert_text", "assert_url"} and not self.value:
+            raise ValueError(f"{self.action} 必须提供 value")
+        return self
 
 
-class InputContractItem(BaseModel):
+class InputContractItem(DSLModel):
     """变量契约（v2：结构化 schema）。
 
     关键字段 secret：标记敏感信息（密码/token）——执行器本地注入，
@@ -114,7 +150,7 @@ class InputContractItem(BaseModel):
         return data
 
 
-class DSLCase(BaseModel):
+class DSLCase(DSLModel):
     """一个完整测试用例 = 元信息 + 步骤列表 + 变量契约。
 
     input_contract 是"变量声明"：AI 不知道用户的账号密码，
@@ -125,7 +161,7 @@ class DSLCase(BaseModel):
     description: str | None = None
     base_url: str | None = None           # 入口 URL（goto 相对路径时拼接用）
     steps: list[DSLStep] = Field(min_length=1)   # 至少 1 步，空用例直接拒绝
-    input_contract: list[InputContractItem] = []
+    input_contract: list[InputContractItem] = Field(default_factory=list)  # 明确 default_factory
 
 
 def validate_case(data: dict) -> DSLCase:
