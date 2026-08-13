@@ -210,13 +210,15 @@ function renderReport(report) {
   `;
   // 逐步骤渲染：动作 + 目标 + 值 + 状态徽章 + 错误信息 + 截图
   // .map() 把每个步骤转成 HTML 字符串，.join("") 拼成一段
+  // ⚠️ 所有用户可控字段必须 escapeHtml（r.action/target/value 来自可手动修改的 DSL，
+  //    未转义会形成 XSS——修复：错误信息之外全部转义）
   document.getElementById("steps").innerHTML = report.results.map((r, i) => `
     <div class="step">
       <div class="step-header">
         <span style="color:#999">${i + 1}.</span>
-        <strong>${r.action}</strong>
-        <span style="color:#888">${r.target || ""}</span>
-        <span style="color:#888">${r.value || ""}</span>
+        <strong>${escapeHtml(String(r.action || ""))}</strong>
+        <span style="color:#888">${escapeHtml(typeof r.target === "object" ? JSON.stringify(r.target) : String(r.target || ""))}</span>
+        <span style="color:#888">${escapeHtml(String(r.value || ""))}</span>
         <span class="badge ${r.status}">${r.status === "passed" ? "通过" : "失败"}</span>
       </div>
       ${r.error ? `<div class="step-error">${escapeHtml(r.error)}</div>` : ""}
