@@ -938,10 +938,12 @@ def _normalize_steps(case: DSLCase) -> DSLCase:
 # ── 多页面快照文本（探索结果 → Planner 可读上下文）──────────────────────────────
 
 def _sanitize_for_cache(explore_result: dict, runtime_inputs: dict) -> dict:
-    """缓存前脱敏：history 的 value 还原为 ${var} 占位。
+    """缓存前脱敏：history 的 value 与 observations 快照中的真实凭据
+    都还原为 ${var} 占位。
 
     缓存会持久化到磁盘——Secrets 边界必须保持：
-    真实凭据（密码等）绝不进入缓存文件。
+    用户名/密码绝不进入缓存文件（登录后页面 header 会显示用户名，
+    快照文本必须一并脱敏；对 Preflight 影响极小——target 很少用用户名文本）。
     """
     result = json.loads(json.dumps(explore_result))   # 深拷贝
     for h in result.get("history", []):
@@ -950,6 +952,12 @@ def _sanitize_for_cache(explore_result: dict, runtime_inputs: dict) -> dict:
             for key, real in runtime_inputs.items():
                 if real and real in v:
                     h["value"] = v.replace(real, f"${{{key}}}")
+    for obs in result.get("observations", []):
+        snap = obs.get("snapshot", "")
+        for key, real in runtime_inputs.items():
+            if real:
+                snap = snap.replace(real, f"${{{key}}}")
+        obs["snapshot"] = snap
     return result
 
 

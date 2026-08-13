@@ -10,3 +10,4 @@ test_*.json
 # Python
 __pycache__/
 *.py[cod]
+.cache/
