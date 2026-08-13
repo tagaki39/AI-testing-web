@@ -38,6 +38,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from dsl import DSLCase, Locator, Scope, validate_case
+from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
 from explore_flow import explore
 from runner import _parse_target
 
@@ -513,6 +514,7 @@ def _preflight_targets(case: DSLCase, observations: list[dict]) -> list[Prefligh
 
 def _extract_candidate_contexts(
     urls: list[str], target: dict, login_inputs: dict | None = None,
+    observations: list[dict] | None = None,
 ) -> list[dict] | None:
     """打开页面，提取 target 所有匹配元素的上下文文本（消歧候选）。
 
@@ -524,8 +526,23 @@ def _extract_candidate_contexts(
 
     login_inputs：登录后的页面（如商品页）在新会话会被重定向回登录页，
     用探索时提取的账号密码自动登录后重试。
+
+    observations：性能优化（Speed B2）——先用已探索的页面快照文本筛选
+    "哪些页面可能包含 target"，只访问这些 URL（从 4 个 → 1 个），
+    避免遍历所有页面 + 反复登录。
     """
     from playwright.sync_api import sync_playwright
+
+    # 快照筛选：只访问可能包含 target 的 observation
+    if observations:
+        parsed = _parse_target(target)
+        role, name = (parsed.role, parsed.name or parsed.text) if parsed else (None, None)
+        if role and name:
+            hits = [o["url"] for o in observations
+                    if _snapshot_check(o["snapshot"], role, name)[0]]
+            if hits:
+                urls = hits
+
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -535,14 +552,14 @@ def _extract_candidate_contexts(
                 for url in urls:
                     try:
                         page.goto(url, wait_until="domcontentloaded")
-                        page.wait_for_timeout(1000)
+                        page.wait_for_timeout(500)   # 渲染底线（之前 1000ms）
                     except Exception:
                         continue
                     # 被重定向到登录页（需要登录态）→ 自动登录后重试
                     if login_inputs and _try_login(page, login_inputs):
                         try:
                             page.goto(url, wait_until="domcontentloaded")
-                            page.wait_for_timeout(1000)
+                            page.wait_for_timeout(500)
                         except Exception:
                             pass
                     locator = _build_locator_for_count(page, target)
@@ -590,7 +607,8 @@ def _try_login(page, login_inputs: dict) -> bool:
     """当前页面有登录表单时自动登录（候选提取用）。
 
     返回是否尝试了登录。表单定位用通用语义（Username/Password/Login），
-    失败静默（不中断候选提取）。
+    失败静默（不中断候选提取）。登录后用 wait_for_load_state 精确等待
+    导航完成（修复：固定 1200ms sleep 浪费）。
     """
     try:
         username = page.get_by_role("textbox", name="Username")
@@ -599,7 +617,11 @@ def _try_login(page, login_inputs: dict) -> bool:
         username.fill(login_inputs.get("username") or "")
         page.get_by_role("textbox", name="Password").fill(login_inputs.get("password") or "")
         page.get_by_role("button", name="Login").click()
-        page.wait_for_timeout(1200)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        page.wait_for_timeout(400)   # SPA 内容渲染底线
         return True
     except Exception:
         return False
@@ -749,12 +771,31 @@ def _preflight_and_repair(
         "fallback_steps": [
             i for i, s in enumerate(case.steps, start=1) if not s.observation_ref
         ],
+        # Speed B1：Preflight 细分计时（定位 13.8s 花在哪）
+        "timings": {
+            "initial_check_ms": 0,
+            "candidate_extract_ms": 0,
+            "round2_llm_ms": 0,
+            "recheck_ms": 0,
+        },
     }
 
-    def run_preflight() -> list[PreflightIssue]:
-        return _preflight_targets(case, observations)
+    # Round1 提取过的 candidates 按 issue_id 保留——
+    # run_preflight() 会重建 issue 对象（candidates=None），
+    # 不回填会导致 Round2 过滤条件 i.candidates 为空而进不去（修复）
+    known_candidates: dict[str, list[dict]] = {}
 
+    def run_preflight() -> list[PreflightIssue]:
+        t = perf_counter()
+        result = _preflight_targets(case, observations)
+        for iss in result:
+            if iss.issue_id in known_candidates:
+                iss.candidates = known_candidates[iss.issue_id]
+        return result
+
+    t0 = perf_counter()
     issues = run_preflight()
+    stats["timings"]["initial_check_ms"] = int((perf_counter() - t0) * 1000)
     if not issues:
         return stats
 
@@ -763,8 +804,14 @@ def _preflight_and_repair(
     for issue in issues:
         if issue.type == "AMBIGUOUS_LOCATOR":
             # 候选提取：真实页面上下文（系统观察到的实体）
-            issue.candidates = _extract_candidate_contexts(urls, issue.target, login_inputs)
-            if not issue.candidates:
+            t = perf_counter()
+            issue.candidates = _extract_candidate_contexts(
+                urls, issue.target, login_inputs, observations,
+            )
+            stats["timings"]["candidate_extract_ms"] += int((perf_counter() - t) * 1000)
+            if issue.candidates:
+                known_candidates[issue.issue_id] = issue.candidates
+            else:
                 continue   # 提取失败 → 留给 Round 2
             mode, chosen, scope_text = _resolve_ambiguity(goal, issue)
             if mode in ("auto", "first") and chosen and scope_text:
@@ -787,14 +834,18 @@ def _preflight_and_repair(
 
     if round1_patches:
         stats["repairs_applied"] += _apply_patch(case, RepairPatch(repairs=round1_patches))
+        t = perf_counter()
         issues = run_preflight()
+        stats["timings"]["recheck_ms"] += int((perf_counter() - t) * 1000)
 
     # ── Round 2：LLM 受限选择（只选 candidate_id，patch 代码生成）─
     if issues:
         llm_issues = [i for i in issues if i.type == "AMBIGUOUS_LOCATOR" and i.candidates]
         if llm_issues:
             try:
+                t = perf_counter()
                 choices = _llm_choose_candidates(goal, llm_issues)
+                stats["timings"]["round2_llm_ms"] += int((perf_counter() - t) * 1000)
                 patches: list[RepairItem] = []
                 for ch in choices:
                     issue = next((i for i in llm_issues if i.issue_id == ch.issue_id), None)
@@ -809,7 +860,9 @@ def _preflight_and_repair(
                             patches.append(_scope_patch(issue, scope_text))
                 if patches:
                     stats["repairs_applied"] += _apply_patch(case, RepairPatch(repairs=patches))
+                    t = perf_counter()
                     issues = run_preflight()
+                    stats["timings"]["recheck_ms"] += int((perf_counter() - t) * 1000)
             except Exception:
                 pass   # LLM 选择失败 → Round 3 fail-safe
 
@@ -884,6 +937,22 @@ def _normalize_steps(case: DSLCase) -> DSLCase:
 
 # ── 多页面快照文本（探索结果 → Planner 可读上下文）──────────────────────────────
 
+def _sanitize_for_cache(explore_result: dict, runtime_inputs: dict) -> dict:
+    """缓存前脱敏：history 的 value 还原为 ${var} 占位。
+
+    缓存会持久化到磁盘——Secrets 边界必须保持：
+    真实凭据（密码等）绝不进入缓存文件。
+    """
+    result = json.loads(json.dumps(explore_result))   # 深拷贝
+    for h in result.get("history", []):
+        v = h.get("value")
+        if v and runtime_inputs:
+            for key, real in runtime_inputs.items():
+                if real and real in v:
+                    h["value"] = v.replace(real, f"${{{key}}}")
+    return result
+
+
 def _pages_to_text(pages: list[dict]) -> str:
     """把探索到的 observation 快照合并成 Planner 可读文本（每页分段标记）。
 
@@ -933,16 +1002,26 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     # ── 阶段 1.5：测试数据脱敏（敏感信息不进 LLM 上下文）───────────
     explore_goal, runtime_inputs = _extract_and_redact_goal(user_prompt)
 
-    # ── 阶段 2：bounded exploration（目标驱动的多页面探索）──────────
+    # ── 阶段 2：bounded exploration（缓存命中直接跳过探索回路）──────
     t_explore = perf_counter()
     explore_result = None
     pages = []
+    cache_hit = False
+    auth_profile = "authenticated" if runtime_inputs else "anonymous"
     if entry_url:
-        try:
-            explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
-            pages = explore_result.get("observations", [])   # ← observations 模型
-        except Exception:
-            explore_result = None   # 探索异常 → 降级无快照生成
+        cached = cache_load(entry_url, auth_profile)
+        if cached:
+            explore_result = cached
+            pages = cached.get("observations", [])
+            cache_hit = True
+        else:
+            try:
+                explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
+                pages = explore_result.get("observations", [])   # ← observations 模型
+                # 保存前脱敏：history 的 value 还原为 ${var}（缓存不落盘真实凭据）
+                cache_save(entry_url, auth_profile, _sanitize_for_cache(explore_result, runtime_inputs))
+            except Exception:
+                explore_result = None   # 探索异常 → 降级无快照生成
     explore_ms = int((perf_counter() - t_explore) * 1000)
 
     # ── 阶段 3：组装 prompt（多页面结构 + 探索路径）→ Planner 生成 ──
@@ -992,6 +1071,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     meta = {
         "snapshot_used": bool(multi_snapshot),
         "entry_url": entry_url,
+        "cache_hit": cache_hit,      # Speed v1：探索结果是否命中缓存
         "explore": {
             "pages_visited": len(pages),
             "steps_used": (explore_result or {}).get("steps_used", 0),
