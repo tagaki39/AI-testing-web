@@ -105,8 +105,14 @@ def api_artifact(run_id: str, filename: str):
 
     URL 示例：/api/artifacts/run-1/step-01.png
     前端 <img src="..."> 直接引用这个地址显示截图。
+
+    ⚠️ 路径穿越防护：run_id/filename 可能被传 ../——先 resolve 再校验
+    最终路径必须仍在 ARTIFACTS_DIR 内（修复 #6）。
     """
-    path = ARTIFACTS_DIR / run_id / filename
+    base = ARTIFACTS_DIR.resolve()
+    path = (base / run_id / filename).resolve()
+    if base not in path.parents:
+        raise HTTPException(status_code=404, detail="路径不合法")
     if not path.exists():
         raise HTTPException(status_code=404, detail="截图不存在")
     return FileResponse(path, media_type="image/png")

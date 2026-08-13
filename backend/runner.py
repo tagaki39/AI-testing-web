@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from playwright.sync_api import sync_playwright, expect
 
@@ -479,8 +480,9 @@ def execute_case(case: DSLCase, variables: dict[str, str] | None = None) -> dict
         if key and default is not None:
             variables.setdefault(key, default)
 
-    # 每轮执行独立目录（run-1, run-2, ...）
-    run_id = len(list(ARTIFACTS_DIR.glob("run-*"))) + 1
+    # 每轮执行独立目录（修复 #7：uuid 替代 len(glob)+1——
+    # 并发请求同时进来会算出相同 run_id 写同一目录）
+    run_id = uuid4().hex[:12]
     run_dir = ARTIFACTS_DIR / f"run-{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 

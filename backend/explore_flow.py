@@ -169,7 +169,7 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
   "exploration_complete": false,
   "action": "click | fill | press | back | finish",
   "target_ref": "e1",
-  "value": "fill 要填入的值（用户目标里给出的测试数据，用真实值）"
+  "value": "fill 的 value 必须使用 ${var} 占位符（如 ${username}）；不得输出真实敏感值，真实值由执行器本地注入"
 }}
 
 规则：
