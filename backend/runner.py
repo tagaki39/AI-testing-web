@@ -328,10 +328,14 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
             page.goto(_substitute(step.value, variables) or "", wait_until="domcontentloaded", timeout=step.timeout_ms)
 
         elif step.action == "assert_url":
-            # URL 断言不需要定位：验证当前 URL 包含期望片段（登录跳转最实用）
+            # URL 断言不需要定位：验证 URL 包含期望片段（登录跳转最实用）。
+            # 用 expect().to_have_url 自动重试——点击后页面导航中立即断言
+            # 会 false failure（修复：之前是立即判断 page.url）
             expected = _substitute(step.value, variables) or ""
-            if expected not in page.url:
-                raise AssertionError(f"URL 断言失败，期望包含: {expected}，实际: {page.url}")
+            expect(page).to_have_url(
+                re.compile(re.escape(expected)),
+                timeout=step.timeout_ms,
+            )
 
         elif step.action == "assert_text" and not step.target:
             # 无 target 的断言 → 验证整个页面包含文本

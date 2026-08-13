@@ -118,6 +118,11 @@ def _elements_to_prompt(elements: list[dict]) -> str:
 
 # ── decide：LLM 决策 prompt（ref 引用 + exploration_complete）──────────────────
 
+# 探索专用 system prompt（角色独立——探索是"决策"，不是 DSL 生成）
+EXPLORE_SYSTEM_PROMPT = """你是 Web 页面探索决策 Agent。
+只负责根据当前页面的元素表和用户目标，选择下一步探索动作。
+只从 ref 表引用元素，禁止编造元素或动作。"""
+
 DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来生成测试 DSL——不是完成测试，而是发现页面路径和真实元素。
 
 当前状态：
@@ -198,7 +203,7 @@ def _decide(state: ExploreState, llm_call) -> dict | None:
         history=history_text,
     )
     try:
-        text = llm_call(prompt, system_prompt=None)
+        text = llm_call(prompt, system_prompt=EXPLORE_SYSTEM_PROMPT)
         decision = json.loads(re.search(r"\{.*\}", text, re.DOTALL).group(0))
         state.llm_calls += 1
 

@@ -168,11 +168,17 @@ SITE_ALIASES: dict[str, str] = {
 #   Executor 看到：真实值（本地注入）
 
 _EMAIL_IN_GOAL_RE = re.compile(r'[\w.+-]+@[\w.-]+\.[\w.]+')
-# 密码常见写法："密码 xxx" / "password: xxx" / "xxx / yyy"（用户名/密码分隔）
+# 密码常见写法："密码 xxx" / "password: xxx" / "用户名 / 密码"（分隔）
+# ⚠️ "xxx / yyy" 模式必须要求 / 两边有空格 + 前置标识词——
+# 否则 "https://example.com" 的 // 会被误认为用户名/密码分隔（修复）
 _PASSWORD_PATTERNS = [
     re.compile(r'(?:密码|口令)[：:\s]+([^\s，,。;；]+)'),
     re.compile(r'password[：:\s]+([^\s，,。;；]+)', re.IGNORECASE),
-    re.compile(r'(\S+)\s*/\s*([^\s，,。;；]+)'),   # standard_user / secret_sauce
+    re.compile(
+        r'(?:login\s+with|账号|用户名|using|with)\s*[:：]?\s*'
+        r'([^\s,/]+)\s+/\s+([^\s，,。;；]+)',
+        re.IGNORECASE,
+    ),
 ]
 
 
@@ -609,6 +615,13 @@ def _scope_patch(issue: PreflightIssue, scope_text: str) -> RepairItem:
     )
 
 
+# 修复专用 system prompt（角色独立——修复是"选择题"，不是 DSL 生成）
+REPAIR_SYSTEM_PROMPT = """你是测试定位歧义选择器。
+只负责从系统提供的候选（candidate_id）中选择最符合用户目标的选项。
+禁止创建、修改或推断任何 target、scope、文本、CSS 或 locator。
+必须为每个 issue_id 返回且仅返回一个选择。"""
+
+
 def _llm_choose_candidates(goal: str, issues: list[PreflightIssue]) -> list[RepairChoice]:
     """LLM 只做选择题：从系统观察到的候选中选 candidate_id。
 
@@ -630,7 +643,7 @@ def _llm_choose_candidates(goal: str, issues: list[PreflightIssue]) -> list[Repa
         f"{issue_lines}\n\n"
         '只输出 JSON: {"choices": [{"issue_id": "step6", "candidate_id": "c1"}]}'
     )
-    raw_text = _call_llm(prompt, system_prompt=None)
+    raw_text = _call_llm(prompt, system_prompt=REPAIR_SYSTEM_PROMPT)
     resp = RepairResponse.model_validate(_extract_json(raw_text))
     expected = {i.issue_id for i in issues}
     received = {c.issue_id for c in resp.choices}
@@ -900,8 +913,10 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     # ── 阶段 4：Preflight 分层修复（确定性 → LLM 受限选择 → fail-safe）─
     if multi_snapshot:
         urls = [p["url"] for p in pages]
-        stats = _preflight_and_repair(case, multi_snapshot, urls, explore_goal, runtime_inputs)
-        if stats["repairs_applied"] or stats["remaining_issues"]:
-            meta["preflight"] = stats
+        # 只要跑了 Preflight 就始终返回 stats（修复：不再按条件访问
+        # 可能不存在的 key——避免 repairs=0 时 KeyError）
+        meta["preflight"] = _preflight_and_repair(
+            case, multi_snapshot, urls, explore_goal, runtime_inputs,
+        )
 
     return case, meta
