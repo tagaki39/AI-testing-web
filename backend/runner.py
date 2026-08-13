@@ -298,14 +298,26 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
                 break   # 该容器内已唯一命中，进入下一容器
             if count > 1:
                 continue   # 容器太宽（target 多个）→ 尝试更精确的容器
-            # count == 0：wait_for 语义下，元素可能正在渲染 → 等待出现
-            if allow_lazy:
-                try:
-                    locator.wait_for(state="visible", timeout=timeout_ms)
-                    matches.append((strategy, locator))
-                    break
-                except Exception:
-                    continue   # 超时 → 尝试下一个策略（降级）
+            # count == 0：元素可能正在渲染（SPA 异步）——先等待出现再判定
+            # （修复 #8：click/fill 不再立即判 NotFound，否则比原生 Playwright 更 flaky）
+            try:
+                locator.wait_for(state="attached", timeout=min(timeout_ms, 5000))
+            except Exception:
+                if allow_lazy:
+                    # wait_for/assert_visible：继续等 visible（语义是"等待可见"）
+                    try:
+                        locator.wait_for(state="visible", timeout=timeout_ms)
+                        matches.append((strategy, locator))
+                        break
+                    except Exception:
+                        continue   # 超时 → 尝试下一个策略（降级）
+                continue   # 非 lazy 动作：attached 等待失败 → 下一策略
+            count = locator.count()   # 重新计数（等待后元素可能出现）
+            if count == 1:
+                matches.append((strategy, locator))
+                break
+            if count > 1:
+                continue   # 等待后出现多个 → 容器太宽，尝试更精确的
 
     if len(matches) == 1:
         return matches[0]
