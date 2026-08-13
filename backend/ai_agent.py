@@ -32,6 +32,7 @@ import re
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, asdict
+from time import perf_counter
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
@@ -925,12 +926,15 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     校验失败会抛异常，由 main.py 捕获后返回 400 给前端。
     """
     # ── 阶段 1：解析入口 URL（正则优先，描述性输入 LLM fallback）───
+    t_url = perf_counter()
     entry_url = _resolve_entry_url(user_prompt)
+    url_resolve_ms = int((perf_counter() - t_url) * 1000)
 
     # ── 阶段 1.5：测试数据脱敏（敏感信息不进 LLM 上下文）───────────
     explore_goal, runtime_inputs = _extract_and_redact_goal(user_prompt)
 
     # ── 阶段 2：bounded exploration（目标驱动的多页面探索）──────────
+    t_explore = perf_counter()
     explore_result = None
     pages = []
     if entry_url:
@@ -939,6 +943,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             pages = explore_result.get("observations", [])   # ← observations 模型
         except Exception:
             explore_result = None   # 探索异常 → 降级无快照生成
+    explore_ms = int((perf_counter() - t_explore) * 1000)
 
     # ── 阶段 3：组装 prompt（多页面结构 + 探索路径）→ Planner 生成 ──
     multi_snapshot = _pages_to_text(pages) if pages else None
@@ -969,7 +974,9 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     else:
         grounded_prompt = explore_goal   # 无快照时同样用脱敏后的需求
 
+    t_planner = perf_counter()
     raw_text = _call_llm(grounded_prompt)
+    planner_ms = int((perf_counter() - t_planner) * 1000)   # 只计 Planner 一次调用
     raw_json = _extract_json(raw_text)
     case = validate_case(raw_json)   # ← 安全边界：不通过就不执行
     case = _normalize_steps(case)    # ← 计划归一化：LLM 波动 → 稳定结构
@@ -995,6 +1002,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     }
 
     # ── 阶段 4：Page-aware Preflight（按 observation_ref 验证 + 分层修复）─
+    t_preflight = perf_counter()
     if pages:
         urls = [p["url"] for p in pages]
         # 只要跑了 Preflight 就始终返回 stats（修复：不再按条件访问
@@ -1002,5 +1010,15 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         meta["preflight"] = _preflight_and_repair(
             case, pages, urls, explore_goal, runtime_inputs,
         )
+    preflight_ms = int((perf_counter() - t_preflight) * 1000)
+
+    # Speed v1：生成链路计时（定位耗时构成，决定下一刀砍哪）
+    meta["timings"] = {
+        "url_resolve_ms": url_resolve_ms,
+        "explore_ms": explore_ms,
+        "explore_detail": (explore_result or {}).get("timings"),
+        "planner_ms": planner_ms,
+        "preflight_ms": preflight_ms,
+    }
 
     return case, meta

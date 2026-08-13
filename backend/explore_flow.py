@@ -27,6 +27,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from time import perf_counter
 
 from playwright.sync_api import sync_playwright
 
@@ -65,6 +66,10 @@ class ExploreState:
     step_count: int = 0                # 已执行动作数
     llm_calls: int = 0                 # 已用 LLM 调用数
     done: bool = False                 # 探索是否完成
+    # 计时（Speed v1：定位耗时构成，决定下一刀砍哪）
+    timings: dict = field(default_factory=lambda: {
+        "llm_ms": 0, "browser_action_ms": 0, "fixed_wait_ms": 0, "observation_ms": 0,
+    })
 
 
 # ── element ref 解析（aria_snapshot → 带编号的元素表）───────────────────────────
@@ -228,7 +233,9 @@ def _decide(state: ExploreState, llm_call) -> dict | None:
         history=history_text,
     )
     try:
+        t0 = perf_counter()
         text = llm_call(prompt, system_prompt=EXPLORE_SYSTEM_PROMPT)
+        state.timings["llm_ms"] += int((perf_counter() - t0) * 1000)
         decision = json.loads(re.search(r"\{.*\}", text, re.DOTALL).group(0))
         state.llm_calls += 1
 
@@ -307,8 +314,14 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         page.set_default_timeout(15000)
 
         state = ExploreState(goal=goal, entry_url=entry_url)
+        t0 = perf_counter()
         page.goto(entry_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(1200)
+        state.timings["browser_action_ms"] += int((perf_counter() - t0) * 1000)
+        # 初始渲染等待：domcontentloaded 后 SPA 内容可能异步出现，
+        # 短等一次（之前固定 1200ms——改为按需，先保留 500ms 底线）
+        wait_start = perf_counter()
+        page.wait_for_timeout(500)
+        state.timings["fixed_wait_ms"] += int((perf_counter() - wait_start) * 1000)
         _record_page(state, page)   # 初始 observe：入口页
 
         while (not state.done
@@ -327,8 +340,9 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             element = next((e for e in state.elements if e["ref"] == ref), None) if ref else None
             target = {"role": element["role"], "name": element["name"]} if element and "role" in element \
                 else ({"text": element["text"]} if element else None)
+            t0 = perf_counter()
             try:
-                _act(page, decision, state.elements, runtime_inputs or {})
+                action_done = _act(page, decision, state.elements, runtime_inputs or {})
                 state.history.append({
                     "url": state.current_url,
                     "action": decision["action"],
@@ -337,6 +351,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                     "value": decision.get("value"),
                 })
             except Exception as exc:
+                action_done = None
                 state.history.append({
                     "url": state.current_url,
                     "action": decision.get("action"),
@@ -344,12 +359,27 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                     "target": target,
                     "error": str(exc)[:100],
                 })
+            state.timings["browser_action_ms"] += int((perf_counter() - t0) * 1000)
 
             state.step_count += 1
-            page.wait_for_timeout(800)   # 等页面渲染（SPA 异步）
+            # 按动作类型决定等待（修复：固定 800ms 浪费——fill 基本无需等待，
+            # 点击/导航需要渲染时间）：
+            wait_start = perf_counter()
+            if action_done in {"click", "press", "back"}:
+                page.wait_for_timeout(300)
+            # fill → 不等待
+            state.timings["fixed_wait_ms"] += int((perf_counter() - wait_start) * 1000)
+
+            t0 = perf_counter()
             _record_page(state, page)    # observe 新页面状态
+            state.timings["observation_ms"] += int((perf_counter() - t0) * 1000)
 
         browser.close()
+
+    state.timings["explore_total_ms"] = (
+        state.timings["llm_ms"] + state.timings["browser_action_ms"]
+        + state.timings["fixed_wait_ms"] + state.timings["observation_ms"]
+    )
 
     return {
         "observations": state.observations,
@@ -357,4 +387,5 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         "steps_used": state.step_count,
         "llm_calls": state.llm_calls,
         "done": state.done,
+        "timings": state.timings,
     }
