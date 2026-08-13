@@ -49,6 +49,27 @@ ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "artifacts"
 # re.compile 预编译一次，后面反复用，比每次 re.search 快
 _VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+# ── 业务实体标识（Runner 与 Preflight 共享的判定语义）────────────────
+# 保守 allowlist：只认 product/item 级别明确业务 id，不泛化 data-id
+_BUSINESS_ID_ATTRS = ("data-product-id", "data-item-id")
+
+
+def _business_identity(locator) -> str | None:
+    """返回 locator 的业务实体标识（"data-product-id=1"）或 None。"""
+    try:
+        return locator.evaluate(
+            """el => {
+                for (const a of ['data-product-id', 'data-item-id']) {
+                    const v = el.getAttribute(a);
+                    if (v) return a + '=' + v;
+                }
+                return null;
+            }"""
+        )
+    except Exception:
+        return None
+
+
 # ── goto URL 安全校验（第 6 项：SSRF/内网探测基础防护）───────────────
 # 平台允许用户手改 DSL——上线后 goto 可被用来探测内网/云 metadata。
 # 只允许公网 http/https；localhost/内网 IP/私有网段直接拒绝。
@@ -171,7 +192,11 @@ def _build_locators(container, t: ParsedTarget) -> list[tuple[str, object]]:
     if t.test_id:
         candidates.append(("test_id", container.get_by_test_id(t.test_id)))
     if t.role and t.name:
-        candidates.append(("role", container.get_by_role(t.role, name=t.name)))
+        # exact-first：避免 "Cart" 模糊命中 "View Cart"（修复 Step 9）；
+        # exact 0 个时降级模糊（icon 前缀空格等 accessible name 差异，
+        # 如 "Signup / Login"）。歧义仍由三分法拦截。
+        candidates.append(("role", container.get_by_role(t.role, name=t.name, exact=True)))
+        candidates.append(("role_fuzzy", container.get_by_role(t.role, name=t.name)))
     if t.text:
         candidates.append(("text", container.get_by_text(t.text)))
     if t.css:
@@ -275,6 +300,18 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
     if t is None or (t.role is None and t.text is None and t.test_id is None and t.css is None):
         raise LocatorNotFoundError(f"target 无法解析: {target!r}")
 
+    # fast path（scope 最小化原则）：全页面 target 唯一 → scope 不参与。
+    # "scope can reduce ambiguity, but can never introduce ambiguity into
+    #  an already unique target"——冗余 scope（如 has_text="Login"）不得
+    # 让本来唯一的 locator 变得歧义。
+    if scope is not None:
+        for strategy, locator in _build_locators(page, t):
+            try:
+                if locator.count() == 1:
+                    return strategy, locator
+            except Exception:
+                pass
+
     containers = _resolve_scope_containers(page, scope)
 
     # scope 联合三分法（修复）：收集所有"容器内 target 唯一命中"的候选，
@@ -322,8 +359,43 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
+        # ① 可见性过滤：同一商品 normal+overlay 双 render 时，隐藏的
+        #    Add to cart 不计入（overlay 通常不可见）——distinct actionable
+        visible: list[tuple[str, object]] = []
+        for m in matches:
+            try:
+                if m[1].is_visible():
+                    visible.append(m)
+            except Exception:
+                visible.append(m)   # 无法判断 → 保留
+        candidates = visible if visible else matches
+
+        # ② 同一元素判定：多个容器指向同一个 DOM 元素（容器嵌套冗余）
+        #    → 消歧成功，不是真歧义
+        try:
+            first = candidates[0][1].element_handle(timeout=2000)
+            all_same = all(
+                loc.evaluate("(el, ref) => el === ref", first)
+                for _, loc in candidates[1:]
+            )
+            if all_same:
+                return candidates[0]
+        except Exception:
+            pass
+
+        # ③ 业务实体聚类（严格版）：多个 DOM 若【全部】共享同一个明确业务
+        # 标识（data-product-id / data-item-id），是同一商品的重复表示
+        # （normal+overlay）→ equivalence-class representative selection
+        # （不是 arbitrary first——语义：已证明同一业务实体才选一个）。
+        # 保守 allowlist：不泛化 data-id（语义太弱，可能是 row/component id）。
+        identities = [_business_identity(loc) for _, loc in candidates]
+        if (identities
+                and all(x is not None for x in identities)
+                and len(set(identities)) == 1):
+            return candidates[0]
+
         raise LocatorAmbiguousError(
-            f"scope 下存在多个候选容器，target 在 {len(matches)} 处唯一命中: {target}"
+            f"scope 下存在多个候选容器，target 在 {len(candidates)} 处唯一命中（可见、不同元素、不同业务实体）: {target}"
         )
     hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
     raise LocatorNotFoundError(f"所有定位策略均未命中: {target}{hint}")

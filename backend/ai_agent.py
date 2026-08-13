@@ -58,23 +58,22 @@ MODEL = os.getenv("AI_MODEL", "deepseek-chat")
 # 没有这段约束，AI 会自由发挥，输出各种奇怪格式。
 
 SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
-根据用户描述的自然语言测试需求，输出一个 JSON 对象，格式如下：
+根据用户描述的自然语言测试需求，输出一个 JSON 对象。示例（与最小步骤规则完全一致）：
 
 {
-  "name": "用例名称",
-  "description": "用例描述",
-  "base_url": "被测网站入口URL",
+  "name": "登录并进入商品页",
+  "description": "登录后验证进入商品页",
+  "base_url": "https://xxx.com",
   "input_contract": [
     {"key": "username", "type": "string", "required": true, "secret": false, "default": "standard_user"},
-    {"key": "password", "type": "string", "required": true, "secret": true, "default": null}
+    {"key": "password", "type": "secret", "required": true, "secret": true, "default": null}
   ],
   "steps": [
     {"action": "goto", "value": "https://xxx.com"},
     {"action": "fill", "target": {"role": "textbox", "name": "用户名"}, "value": "${username}"},
+    {"action": "fill", "target": {"role": "textbox", "name": "密码"}, "value": "${password}"},
     {"action": "click", "target": {"role": "button", "name": "登录"}},
-    {"action": "wait_for", "target": {"role": "heading", "name": "首页"}},
-    {"action": "assert_visible", "target": {"text": "购物车"}},
-    {"action": "assert_url", "value": "/inventory.html"}
+    {"action": "assert_url", "value": "/inventory.html", "observation_ref": "obs2"}
   ]
 }
 
@@ -85,22 +84,36 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
    - 文本定位: {"text": "Products"}（快照中 'text: xxx' 的标题必须用 text，禁止 role=heading）
    - 测试 id:  {"test_id": "login-button"}
    - CSS 兜底: {"css": ".btn"}
-3. 同名元素消歧用 scope（先定位容器再找目标）：
-   {"action": "click", "scope": {"has_text": "Blue Top"}, "target": {"role": "button", "name": "Add to cart"}}
-4. 所有可变测试输入（账号、密码等）必须用 ${var} 占位，并声明在 input_contract：
-   - 需求中给出的值 → default 填真实值（secret=false）
-   - 密码等敏感信息 → secret=true 且 default=null（执行时本地注入）
-5. assert_text 验证页面/元素包含文字；assert_visible 验证元素可见；assert_url 验证当前 URL 包含片段
-6. 只输出 JSON，不要输出任何解释或代码块标记
+3. scope 最小化原则（scope 的唯一用途是解决 target 歧义）：
+   - 先判断 target 在对应 observation 中是否唯一；如果唯一，scope 必须为 null
+   - 不得为了表达页面层级、业务归属或"增强精确度"而添加 scope
+   - target 存在多个匹配时，scope.has_text 锚点按优先级选择：
+     1) 用户明确指定的业务实体，如 Blue Top
+     2) 当前 observation 中唯一稳定的业务标识
+     3) 其他稳定文本
+   - 避免价格、数量、状态词和 Login 等高频通用文本作为 scope 锚点
+   - 导航级 target（Cart / Products / Home 等）不得使用商品卡片、商品名称或价格作为 scope
+   - observation 中没有可靠 scope 时不要编造
+4. 变量：
+   - 所有可变测试输入必须使用 ${var}，每个变量必须声明在 input_contract
+   - secret=true → default 必须为 null（执行时本地注入）
+   - 非敏感变量只有上下文明确提供 default 时才能填写；不得猜测真实值
+5. observation_ref（grounding 引用）：
+   - 每个可定位步骤应引用产生该定位证据的 observation id（obs1/obs2/...）
+   - observation_ref 必须来自系统提供的 observation 列表，禁止编造
+   - Runner 不使用 observation_ref 控制页面跳转，它只供验证与诊断使用
+6. assert_text 验证页面/元素包含文字；assert_visible 验证元素可见；assert_url 验证当前 URL 包含片段
 7. 最小测试原则：
-   - 仅生成完成用户目标所需的最少步骤
-   - 步骤结构固定为：导航步骤 → 必要交互步骤 → 【恰好 1 个最终验证步骤】
-   - 禁止额外辅助断言、重复等待、重复验证（如同时生成 wait_for 和 assert 同一元素）
-8. 验证策略（按目标类型从下列规则中选择）：
-   - 登录类 → assert_url 登录后页面片段，或 assert_visible 登录后关键元素
-   - 添加/操作类 → assert_visible 操作结果（如按钮变为 Remove、数量徽章变为 1）
-   - 页面跳转类 → assert_url 目标页面片段
-   - 用户未明确验证内容时，按目标的最终可观察结果生成 1 个最小验证"""
+   - 仅生成完成用户需求所需的最少步骤
+   - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
+   - 单一最终目标默认生成恰好 1 个最终验证
+   - 如果用户明确要求多个独立验证结果，则保留这些明确要求的验证
+8. 验证策略：
+   - 登录/页面跳转 → 优先 assert_url 或目标页面关键元素 assert_visible
+   - 元素出现、按钮状态变化 → assert_visible
+   - 文本、价格、数量变化 → assert_text
+   - 用户未明确验证方式时，选择与最终动作因果关系最直接的可观察结果
+9. 只输出 JSON，不要输出任何解释或代码块标记"""
 
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
@@ -210,8 +223,12 @@ def _extract_and_redact_goal(goal: str) -> tuple[str, dict]:
     else:
         m = _PASSWORD_PATTERNS[2].search(redacted)
         if m:
-            runtime["username"] = m.group(1)
-            redacted = redacted.replace(m.group(1), "${username}")
+            username = m.group(1)
+            if not username.startswith("${"):
+                # 用户名位置可能是已脱敏的 ${email} 占位符（修复：
+                # "login with ${email} / test123" 不再把占位符当真实用户名）
+                runtime["username"] = username
+                redacted = redacted.replace(username, "${username}")
             secret = m.group(2)
         else:
             secret = None
@@ -347,20 +364,33 @@ def _extract_json(text: str) -> dict:
 
 @dataclass
 class PreflightIssue:
-    """结构化定位问题（机器可理解，供修复精确定位）。"""
+    """结构化定位问题（机器可理解，供修复精确定位）。
+
+    类型区分（修复：把"scope 坏了"和"target 歧义"分开）：
+      LOCATOR_NOT_FOUND    target 不存在
+      AMBIGUOUS_LOCATOR    target 多匹配且无有效 scope
+      AMBIGUOUS_SCOPE      scope 锚点选择错误（文本多次/低频实体）
+      SCOPE_CARDINALITY_UNKNOWN  弱验证下 scope 计数不确定（warning）
+    """
     step_index: int        # 出问题的步骤（1-based，与执行报告一致）
     issue_id: str          # 唯一标识（"step6"）
-    type: str              # "LOCATOR_NOT_FOUND" / "AMBIGUOUS_LOCATOR"
+    type: str
     target: dict           # 原始 target（结构化）
     detail: str            # 人类可读说明
-    candidates: list[dict] | None = None   # 歧义候选 [{"candidate_id", "scope_text"}]
+    scope: dict | None = None          # 出问题的 scope（一等公民）
+    candidates: list[dict] | None = None   # 歧义候选 [{"candidate_id", "scope_candidates"}]
 
 
 class RepairItem(BaseModel):
-    """单步修复补丁：替换该步骤的 target / scope。"""
+    """单步修复补丁。
+
+    clear_scope 显式清除 scope（修复：scope=None 的"不修改 vs 清空"歧义——
+    Step 9 导航级元素 scope 多余时应 clear_scope，而不是替换）。
+    """
     step_index: int = Field(ge=1)
     target: Locator | None = None
     scope: Scope | None = None
+    clear_scope: bool = False
 
 
 class RepairPatch(BaseModel):
@@ -416,7 +446,9 @@ def _target_to_dict(t) -> dict:
     return {"text": str(t)}
 
 
-def _preflight_targets(case: DSLCase, observations: list[dict]) -> list[PreflightIssue]:
+def _preflight_targets(
+    case: DSLCase, observations: list[dict], first_pass: bool = True,
+) -> list[PreflightIssue]:
     """Page-aware Preflight：按 step.observation_ref 在对应页面状态内做 0/1/N 验证。
 
     验证上下文选择（修复跨页面误判）：
@@ -483,29 +515,67 @@ def _preflight_targets(case: DSLCase, observations: list[dict]) -> list[Prefligh
                 ))
             else:
                 scope_found, scope_count = _scope_snapshot_check(snapshot, scope_text)
-                if not scope_found:
+                scope_dict = None
+                if step.scope is not None:
+                    scope_dict = step.scope.model_dump() if hasattr(step.scope, "model_dump") \
+                        else (step.scope if isinstance(step.scope, dict) else {"has_text": str(step.scope)})
+                if not scope_found and first_pass:
+                    # 首次检测：scope 文本不存在 → 真问题（blocking，Repair 处理）
                     issues.append(PreflightIssue(
                         step_index=index,
                         issue_id=f"step{index}",
-                        type="AMBIGUOUS_LOCATOR",
+                        type="AMBIGUOUS_SCOPE",
                         target=_target_to_dict(t),
-                        detail=f"步骤 {index}: scope 文本在快照中不存在（{scope_text!r}），消歧无效",
+                        scope=scope_dict,
+                        detail=(
+                            f"步骤 {index}: scope 文本不存在（{scope_text!r}）"
+                            "——Repair 判断：target 唯一则清空 scope，否则换业务实体锚点"
+                        ),
                     ))
-                elif scope_count > 1:
-                    # scope 文本计数不可靠（同一文本可出现在卡片/描述多处，
-                    # 但业务容器唯一）——容器级消歧只由运行时联合三分法判断，
-                    # 快照文本无法恢复容器关系 → 一律 warning（不 blocking）
+                elif not scope_found:
+                    # 修复后 recheck：文本不存在可能是智能裁剪/页面状态差异
+                    # （如商品名 text 行被限量裁剪）→ warning，运行时兜底
                     issues.append(PreflightIssue(
                         step_index=index,
                         issue_id=f"step{index}",
                         type="SCOPE_CARDINALITY_UNKNOWN",
                         target=_target_to_dict(t),
                         detail=(
-                            f"步骤 {index}: scope 文本在页面快照中出现 {scope_count} 次，"
-                            "文本计数无法判断容器唯一性（由运行时联合三分法兜底）"
+                            f"步骤 {index}: scope 文本在快照中不存在（{scope_text!r}）"
+                            "——可能是裁剪/状态差异，由运行时定位兜底"
                         ),
                     ))
-                # scope 存在 → 消歧通过（容器级唯一性交给运行时）
+                elif scope_count > 1:
+                    if strong and first_pass:
+                        # 第一次检测：文本多次 + target 多匹配 = 锚点可能选错
+                        # （如 Rs. 500 多商品同价）→ blocking，触发 Repair
+                        # 判断"target 唯一则清空 / 否则换 goal 业务实体"
+                        issues.append(PreflightIssue(
+                            step_index=index,
+                            issue_id=f"step{index}",
+                            type="AMBIGUOUS_SCOPE",
+                            target=_target_to_dict(t),
+                            scope=scope_dict,
+                            detail=(
+                                f"步骤 {index}: scope 锚点（{scope_text!r}）在对应页面状态出现 "
+                                f"{scope_count} 次——Repair 判断：target 唯一则清空，否则换业务实体"
+                            ),
+                        ))
+                    else:
+                        # 修复后 recheck / 弱验证：文本 count>1 不直接判真歧义
+                        # （同一商品 normal+overlay 双 render 会重复）——
+                        # 容器唯一性由运行时联合三分法（含可见性过滤）判定
+                        issues.append(PreflightIssue(
+                            step_index=index,
+                            issue_id=f"step{index}",
+                            type="SCOPE_CARDINALITY_UNKNOWN",
+                            target=_target_to_dict(t),
+                            detail=(
+                                f"步骤 {index}: scope 文本在快照中出现 {scope_count} 次"
+                                "（可能是同商品双 render），由运行时可见性+联合三分法判定"
+                            ),
+                        ))
+                # scope 唯一 → 消歧通过
 
     return issues
 
@@ -649,8 +719,9 @@ def _text_alternative(snapshot: str, name: str) -> Locator | None:
     return Locator(text=name) if found else None
 
 
-# 价格行正则（scope 选择时跳过 "$29.99" 这类噪音）
-_PRICE_RE = re.compile(r"[$€£]?\s*\d+(?:\.\d{1,2})?")
+# 价格行正则（scope 选择时跳过 "$29.99" "Rs. 500" 这类噪音——
+# 支持 $€£₹ 与 Rs. 前缀，修复 Rs. 价格未被识别导致 goal 误匹配价格）
+_PRICE_RE = re.compile(r"(?:[$€£₹]|Rs\.?)\s*\d+(?:\.\d{1,2})?")
 
 
 def _choose_scope_text(scope_candidates: list[str]) -> str | None:
@@ -669,17 +740,24 @@ def _choose_scope_text(scope_candidates: list[str]) -> str | None:
 
 def _resolve_ambiguity(goal: str, issue: PreflightIssue) -> tuple[str, dict | None, str | None]:
     """需求明确性判断（区分 Locator / Requirement ambiguity）：
-      - goal 命中某候选的 scope 行 → ("auto", 候选, scope)  需求明确，代码直接修
-      - 无命中但有可用 scope 行  → ("first", 候选, scope)   需求歧义，确定性选第一个
-      - 其他                    → ("llm", None, None)      多个候选匹配需求，LLM 选
+      - goal 命中某候选的业务实体行 → ("auto", 候选, scope)  需求明确，代码直接修
+      - 无命中但有可用 scope 行    → ("first", 候选, scope)   需求歧义，确定性选第一个
+      - 其他                      → ("llm", None, None)      多个候选匹配需求，LLM 选
+
+    ⚠️ 业务实体优先：goal 匹配前先跳过价格/短行等噪音——
+    否则用户需求同时提到商品名和价格（"Blue Top ... Rs. 500"）时，
+    候选行顺序靠前的价格会被误选为 scope 锚点（修复实测 bug）。
     """
-    # 确定性：goal 子串命中某个候选的 scope_candidates 行
+    # 确定性：goal 子串命中某个候选的【业务实体】行（跳过价格等噪音）
     for cand in (issue.candidates or []):
         for scope in cand.get("scope_candidates", []):
-            if scope and scope.lower() in goal.lower():
+            scope = scope.strip()
+            if not scope or len(scope) < 2 or _PRICE_RE.fullmatch(scope):
+                continue   # 跳过价格/短行（Rs. 500 等易重复文本）
+            if scope.lower() in goal.lower():
                 return "auto", cand, scope
 
-    # 需求歧义：取第一个候选的第一个"好" scope 行
+    # 需求歧义：取第一个候选的第一个"好" scope 行（同样跳过价格）
     for cand in (issue.candidates or []):
         scope = _choose_scope_text(cand.get("scope_candidates", []))
         if scope:
@@ -689,12 +767,206 @@ def _resolve_ambiguity(goal: str, issue: PreflightIssue) -> tuple[str, dict | No
 
 
 def _scope_patch(issue: PreflightIssue, scope_text: str) -> RepairItem:
-    """由最终 scope 文本生成 patch（代码构造，LLM 不参与）。"""
+    """由最终 scope 文本生成 patch（代码构造，LLM 不参与）。
+
+    Invariant：导航 target 禁止商品/业务 scope——即使修复流程想加，
+    也改为 clear_scope（导航 locator 的消歧走导航语义，不是商品 scope）。
+    """
+    if _is_navigation_target(issue.target):
+        return RepairItem(step_index=issue.step_index, clear_scope=True)
     return RepairItem(
         step_index=issue.step_index,
         target=Locator(**issue.target),
         scope=Scope(has_text=scope_text),
     )
+
+
+def _normalize_invalid_scopes(case: DSLCase) -> DSLCase:
+    """导航 target 的 scope 一律清空（invariant，不依赖 Repair round）。
+
+    无论 Planner 生成还是 Repair 产生——导航元素（Cart/Products/Home）
+    与商品/价格 scope 语义不兼容，是系统级 locator invariant。
+    """
+    changed = False
+    for step in case.steps:
+        if (step.scope is not None and step.target is not None
+                and _is_navigation_target(_target_to_dict(step.target))):
+            step.scope = None
+            changed = True
+    if changed:
+        return validate_case(case.model_dump())
+    return case
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    """保序去重（scope 候选：同一商品 normal+overlay 双 render 会重复）。"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = " ".join(value.split()).strip()
+        key = normalized.casefold()
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
+
+def _goal_match_anchor(goal: str, anchors: list[str]) -> str | None:
+    """从锚点中选"用户明确指定的业务实体"（跳过价格/短行/动作文本）。
+
+    修复：goal 同时含商品名和价格时（"Blue Top ... Rs. 500"），
+    价格行不能因顺序靠前被误选——业务实体优先。
+    """
+    for anchor in anchors:
+        if not anchor or len(anchor) < 2 or _PRICE_RE.fullmatch(anchor):
+            continue
+        if anchor.lower() in goal.lower():
+            return anchor
+    return None
+
+
+# 导航级 target 名（deterministic 规则：商品/价格 scope 一律禁止——
+# 不只靠 Prompt，Repair 层也要执行）
+_NAV_TARGET_NAMES = {
+    "cart", "products", "home", "logout", "login", "signup / login",
+    "signup/login", "test cases", "api testing", "contact us",
+}
+
+
+def _is_navigation_target(target: dict) -> bool:
+    """target 是否属于导航级元素（link 且名称在 allowlist）。"""
+    parsed = _parse_target(target)
+    if parsed is None:
+        return False
+    return (
+        parsed.role == "link"
+        and (parsed.name or "").strip().casefold() in _NAV_TARGET_NAMES
+    )
+
+
+def _build_locator_exact_first(page, target: dict):
+    """构建定位器：先精确匹配（避免 Cart 模糊命中 View Cart），0 个再模糊。"""
+    parsed = _parse_target(target)
+    if parsed is None:
+        return None
+    if parsed.test_id:
+        return page.get_by_test_id(parsed.test_id)
+    if parsed.role and parsed.name:
+        loc = page.get_by_role(parsed.role, name=parsed.name, exact=True)
+        if loc.count() == 0:
+            loc = page.get_by_role(parsed.role, name=parsed.name)
+        return loc
+    if parsed.text:
+        return page.get_by_text(parsed.text, exact=True)
+    if parsed.css:
+        return page.locator(parsed.css)
+    return None
+
+
+def _inspect_scoped_steps(
+    scoped_items: list[tuple[int, dict]],
+    urls: list[str], login_inputs: dict | None,
+    observations: list[dict] | None,
+) -> dict[int, dict]:
+    """一次浏览器会话验证所有 scoped 步骤（性能：不 per-step launch）。
+
+    判断语义与 Runner 联合三分法一致（不是文本 count）：
+      - target 不带 scope 精确 count == 1 → scope 多余 → {"action": "remove_scope"}
+      - 否则提取去重锚点 → {"action": "replace_scope", "anchors": [...]}
+      （goal 业务实体匹配在调用方做）
+
+    返回 {step_index: {"action": ..., "anchors": [...]}}。
+    """
+    from playwright.sync_api import sync_playwright
+
+    pending = dict(scoped_items)
+    result: dict[int, dict] = {}
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_default_timeout(10000)
+            try:
+                # 快照筛选：所有待检查 target 的 URL 并集
+                target_urls: list[str] = []
+                for _, target in scoped_items:
+                    parsed = _parse_target(target)
+                    role, name = (parsed.role, parsed.name or parsed.text) if parsed else (None, None)
+                    if observations and role and name:
+                        hits = [o["url"] for o in observations
+                                if _snapshot_check(o["snapshot"], role, name)[0]]
+                        target_urls.extend(hits)
+                if not target_urls:
+                    target_urls = urls
+                seen_urls: set[str] = set()
+
+                for url in target_urls:
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    try:
+                        page.goto(url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        continue
+                    if login_inputs and _try_login(page, login_inputs):
+                        try:
+                            page.goto(url, wait_until="domcontentloaded")
+                            page.wait_for_timeout(500)
+                        except Exception:
+                            pass
+
+                    for idx, target in list(pending.items()):
+                        if idx in result:
+                            continue
+                        # 导航级 target：商品/价格 scope 一律禁止 → remove_scope
+                        # （deterministic 规则，修复 Step 9 Cart→Blue Top 误修）
+                        if _is_navigation_target(target):
+                            result[idx] = {
+                                "action": "remove_scope",
+                                "anchors": [],
+                                "reason": "navigation_target_cannot_use_product_scope",
+                            }
+                            continue
+                        locator = _build_locator_exact_first(page, target)
+                        if locator is None:
+                            continue
+                        count = locator.count()
+                        if count == 0:
+                            continue   # 该页面无此 target，留给其他页面
+                        if count == 1:
+                            result[idx] = {"action": "remove_scope", "anchors": []}
+                            continue
+                        # target 多匹配：提取去重锚点（replace_scope 候选）
+                        anchors: list[str] = []
+                        for i in range(min(count, 6)):
+                            try:
+                                node = locator.nth(i)
+                                container = node.locator(
+                                    "xpath=ancestor::*[self::li or self::article or @data-testid][1]"
+                                )
+                                cc = container.count()
+                                if cc == 0:
+                                    container = node.locator("xpath=../..")
+                                    cc = container.count()
+                                raw = container.inner_text().strip() if cc > 0 else ""
+                                node_text = node.inner_text().strip()
+                                for line in raw.splitlines():
+                                    line = line.strip()
+                                    if line and line != node_text:
+                                        anchors.append(line)
+                            except Exception:
+                                pass
+                        result[idx] = {
+                            "action": "replace_scope",
+                            "anchors": _dedupe_preserve_order(anchors),
+                        }
+            finally:
+                browser.close()
+    except Exception:
+        pass
+    return result
 
 
 # 修复专用 system prompt（角色独立——修复是"选择题"，不是 DSL 生成）
@@ -735,7 +1007,10 @@ def _llm_choose_candidates(goal: str, issues: list[PreflightIssue]) -> list[Repa
 
 
 def _apply_patch(case: DSLCase, patch: RepairPatch) -> int:
-    """程序本地应用 patch：只替换 patch 中指定的步骤，其余分毫不动。"""
+    """程序本地应用 patch：只替换 patch 中指定的步骤，其余分毫不动。
+
+    clear_scope=True → 显式清除 scope（Step 9 类：导航级元素 scope 多余）。
+    """
     applied = 0
     for rep in patch.repairs:
         idx = rep.step_index - 1
@@ -744,7 +1019,9 @@ def _apply_patch(case: DSLCase, patch: RepairPatch) -> int:
         step = case.steps[idx]
         if rep.target is not None:
             step.target = rep.target
-        if rep.scope is not None:
+        if rep.clear_scope:
+            step.scope = None
+        elif rep.scope is not None:
             step.scope = rep.scope
         applied += 1
     return applied
@@ -778,6 +1055,11 @@ def _preflight_and_repair(
             "round2_llm_ms": 0,
             "recheck_ms": 0,
         },
+        # 修复有效性统计（修复 repairs_applied=6 无效果的误导）：
+        # effective = blocking 数量变化，而不是"写了多少 patch"
+        "issues_before": 0,
+        "issues_after": 0,
+        "effective_repairs": 0,
     }
 
     # Round1 提取过的 candidates 按 issue_id 保留——
@@ -785,9 +1067,13 @@ def _preflight_and_repair(
     # 不回填会导致 Round2 过滤条件 i.candidates 为空而进不去（修复）
     known_candidates: dict[str, list[dict]] = {}
 
+    first_pass = True
+
     def run_preflight() -> list[PreflightIssue]:
+        nonlocal first_pass
         t = perf_counter()
-        result = _preflight_targets(case, observations)
+        result = _preflight_targets(case, observations, first_pass=first_pass)
+        first_pass = False   # 首次之后的 recheck 不再触发"锚点选错" blocking
         for iss in result:
             if iss.issue_id in known_candidates:
                 iss.candidates = known_candidates[iss.issue_id]
@@ -796,6 +1082,7 @@ def _preflight_and_repair(
     t0 = perf_counter()
     issues = run_preflight()
     stats["timings"]["initial_check_ms"] = int((perf_counter() - t0) * 1000)
+    stats["issues_before"] = len(issues)
     if not issues:
         return stats
 
@@ -824,6 +1111,8 @@ def _preflight_and_repair(
                         "policy": "first_candidate",
                     })
             # mode == "llm" → 留给 Round 2
+        # AMBIGUOUS_SCOPE 统一由 Round 1.5（Browser-backed）处理——
+        # 浏览器判定 target 唯一性 + goal 业务实体锚点
         elif issue.type == "LOCATOR_NOT_FOUND":
             parsed = _parse_target(issue.target)
             name = (parsed.name or parsed.text) if parsed else None
@@ -831,6 +1120,41 @@ def _preflight_and_repair(
                 alt = _text_alternative(multi_snapshot, name)
                 if alt:
                     round1_patches.append(RepairItem(step_index=issue.step_index, target=alt))
+
+    # ── Round 1.5：Browser-backed scope 确认（静态快照可能漏）────────
+    # 快照验证通过 ≠ 真实 DOM 唯一（如 Rs. 500 在快照出现 1 次、
+    # 执行时 3 个商品同价）——一次浏览器会话核实所有 scoped 步骤：
+    #   target 不带 scope 唯一 → remove_scope（Step 9 Cart）
+    #   target 多匹配 → 提取锚点，goal 业务实体匹配替换（Step 8 Add to cart）
+    # 修复 handled_steps 粒度：target 修复 ≠ scope 已处理——
+    # 只有"已做过 scope 操作"（replace/clear）的步骤才跳过 Round 1.5
+    scope_handled_steps = {
+        p.step_index for p in round1_patches
+        if p.scope is not None or p.clear_scope
+    }
+    scoped_items = [
+        (index, _target_to_dict(step.target))
+        for index, step in enumerate(case.steps, start=1)
+        if step.scope is not None and index not in scope_handled_steps
+        and step.target is not None
+    ]
+    if scoped_items:
+        inspection = _inspect_scoped_steps(
+            scoped_items, urls, login_inputs, observations,
+        )
+        for index, info in inspection.items():
+            if info["action"] == "remove_scope":
+                round1_patches.append(RepairItem(step_index=index, clear_scope=True))
+            else:
+                scope_text = _goal_match_anchor(goal, info.get("anchors", []))
+                if scope_text:
+                    step = case.steps[index - 1]
+                    current_scope = step.scope.model_dump().get("has_text") \
+                        if hasattr(step.scope, "model_dump") else str(step.scope)
+                    if scope_text != current_scope:
+                        round1_patches.append(RepairItem(
+                            step_index=index, scope=Scope(has_text=scope_text),
+                        ))
 
     if round1_patches:
         stats["repairs_applied"] += _apply_patch(case, RepairPatch(repairs=round1_patches))
@@ -868,11 +1192,14 @@ def _preflight_and_repair(
 
     # ── Round 3：fail-safe（剩余问题分类记录，不无限重试）───────────
     # 语义拆分（避免"还有问题却 6/6 通过"的误导）：
-    #   blocking_issues = 歧义未消（执行必然失败）
+    #   blocking_issues = 歧义/scope 问题未消（执行必然失败）
     #   warnings        = 非阻塞：快照未验证到（可能是操作后状态变化）、
     #                      scope 跨页面计数不确定（cardinality unknown）
+    stats["issues_after"] = len(issues)
+    stats["effective_repairs"] = stats["issues_before"] - stats["issues_after"]
     stats["blocking_issues"] = [
-        asdict(i) for i in issues if i.type == "AMBIGUOUS_LOCATOR"
+        asdict(i) for i in issues
+        if i.type in {"AMBIGUOUS_LOCATOR", "AMBIGUOUS_SCOPE"}
     ]
     stats["warnings"] = [
         asdict(i) for i in issues
@@ -1072,6 +1399,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     raw_json = _extract_json(raw_text)
     case = validate_case(raw_json)   # ← 安全边界：不通过就不执行
     case, removed_assertions = _normalize_steps(case)   # ← 计划归一化 + 记录删除
+    case = _normalize_invalid_scopes(case)   # ← 导航 scope invariant（Planner 后立即清）
 
     # ← grounding 验证：observation_ref 必须来自系统提供的真实 id
     #（不靠 Prompt——代码校验；非法 ref 清空为 None，降级弱验证）
