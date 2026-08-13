@@ -742,6 +742,12 @@ def _preflight_and_repair(
         "implicit_resolutions": [],
         "blocking_issues": None,
         "warnings": None,
+        # 诊断指标：有 observation_ref 的步骤占比（强验证覆盖度）+
+        # 降级为弱验证的步骤（无 ref / 非法 ref）
+        "observation_coverage": f"{sum(1 for s in case.steps if s.observation_ref)}/{len(case.steps)}",
+        "fallback_steps": [
+            i for i, s in enumerate(case.steps, start=1) if not s.observation_ref
+        ],
     }
 
     def run_preflight() -> list[PreflightIssue]:
