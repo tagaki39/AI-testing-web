@@ -23,6 +23,7 @@ explore_flow.py — bounded exploration（有限探索）
 ══════════════════════════════════════════════════════════════════════
 """
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -37,6 +38,8 @@ MAX_LLM_CALLS = 8    # 最多 8 次 LLM 决策调用（登录→商品→购物�
 _MAX_SNAPSHOT_CHARS = 4000   # 每页快照截断长度（保留给 element 解析用）
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
 _MAX_TEXT_ELEMENTS = 20      # 文本节点最多注入 20 个（防上下文膨胀）
+_MAX_OBSERVATIONS = 12       # 总 observation 上限（防膨胀）
+_MAX_OBSERVATIONS_PER_URL = 3   # 同 URL 最多 3 个状态（SPA 状态变化）
 
 # 可交互元素角色（element ref 表只收录这些——LLM 只能操作这些）
 _INTERACTIVE_ROLES = {
@@ -58,7 +61,7 @@ class ExploreState:
     snapshot: str = ""                 # 当前页面快照（原始）
     elements: list[dict] = field(default_factory=list)      # 当前页元素表（ref）
     history: list[dict] = field(default_factory=list)       # 操作历史
-    discovered_pages: list[dict] = field(default_factory=list)  # 多页面快照
+    observations: list[dict] = field(default_factory=list)  # 页面状态观察（含 state_hash）
     step_count: int = 0                # 已执行动作数
     llm_calls: int = 0                 # 已用 LLM 调用数
     done: bool = False                 # 探索是否完成
@@ -163,17 +166,39 @@ def _observe(page) -> str:
 
 
 def _record_page(state: ExploreState, page) -> None:
-    """记录当前页面：快照 + 解析出元素表（URL 变化才新增页面）。"""
+    """记录当前页面状态为 observation（升级：URL + state_hash 去重）。
+
+    Observation = URL + 页面状态 + ARIA 证据——
+    同 URL 不同状态（如 Add to cart 点击后按钮变 Remove）也保存，
+    解决 SPA 状态丢失（此前只按 URL 去重）。
+    """
     url = page.url
     state.current_url = url
     state.snapshot = _observe(page)
     state.elements = _parse_elements(state.snapshot)   # ← ref 表
-    if not any(p["url"] == url for p in state.discovered_pages):
-        state.discovered_pages.append({
-            "url": url,
-            "title": _safe_title(page),
-            "snapshot": state.snapshot,
-        })
+
+    # 状态哈希：snapshot 变化 = 页面状态变化（即使 URL 相同）
+    state_hash = hashlib.sha256(state.snapshot.encode()).hexdigest()[:10]
+    same_url_count = sum(1 for o in state.observations if o["url"] == url)
+
+    already = any(
+        o["url"] == url and o.get("state_hash") == state_hash
+        for o in state.observations
+    )
+    if already:
+        return
+    if len(state.observations) >= _MAX_OBSERVATIONS:
+        return
+    if same_url_count >= _MAX_OBSERVATIONS_PER_URL:
+        return
+
+    state.observations.append({
+        "id": f"obs{len(state.observations) + 1}",
+        "url": url,
+        "title": _safe_title(page),
+        "state_hash": state_hash,
+        "snapshot": state.snapshot,
+    })
 
 
 def _safe_title(page) -> str:
@@ -327,7 +352,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         browser.close()
 
     return {
-        "pages": state.discovered_pages,
+        "observations": state.observations,
         "history": state.history,
         "steps_used": state.step_count,
         "llm_calls": state.llm_calls,

@@ -865,12 +865,17 @@ def _normalize_steps(case: DSLCase) -> DSLCase:
 # ── 多页面快照文本（探索结果 → Planner 可读上下文）──────────────────────────────
 
 def _pages_to_text(pages: list[dict]) -> str:
-    """把探索到的多页面快照合并成一份可读文本（每页分段标记）。"""
+    """把探索到的 observation 快照合并成 Planner 可读文本（每页分段标记）。
+
+    分段标记用 observation id（obs1/obs2/...）——Planner 生成 DSL 时
+    用 observation_ref 引用（Commit 2 接入）。
+    """
     sections = []
-    for i, page in enumerate(pages, start=1):
+    for page in pages:
+        obs_id = page.get("id", f"obs{len(sections) + 1}")
         title = page.get("title") or ""
         sections.append(
-            f"[页面 {i}] {page['url']}"
+            f"[{obs_id}] {page['url']}"
             + (f"（标题: {title}）" if title else "")
             + f"\n{page['snapshot']}"
         )
@@ -912,7 +917,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     if entry_url:
         try:
             explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
-            pages = explore_result.get("pages", [])
+            pages = explore_result.get("observations", [])   # ← observations 模型
         except Exception:
             explore_result = None   # 探索异常 → 降级无快照生成
 
