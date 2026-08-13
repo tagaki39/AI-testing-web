@@ -89,7 +89,16 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
    - 需求中给出的值 → default 填真实值（secret=false）
    - 密码等敏感信息 → secret=true 且 default=null（执行时本地注入）
 5. assert_text 验证页面/元素包含文字；assert_visible 验证元素可见；assert_url 验证当前 URL 包含片段
-6. 只输出 JSON，不要输出任何解释或代码块标记"""
+6. 只输出 JSON，不要输出任何解释或代码块标记
+7. 最小测试原则：
+   - 仅生成完成用户目标所需的最少步骤
+   - 步骤结构固定为：导航步骤 → 必要交互步骤 → 【恰好 1 个最终验证步骤】
+   - 禁止额外辅助断言、重复等待、重复验证（如同时生成 wait_for 和 assert 同一元素）
+8. 验证策略（按目标类型从下列规则中选择）：
+   - 登录类 → assert_url 登录后页面片段，或 assert_visible 登录后关键元素
+   - 添加/操作类 → assert_visible 操作结果（如按钮变为 Remove、数量徽章变为 1）
+   - 页面跳转类 → assert_url 目标页面片段
+   - 用户未明确验证内容时，按目标的最终可观察结果生成 1 个最小验证"""
 
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
@@ -117,7 +126,7 @@ def _call_llm(user_prompt: str, system_prompt: str | None = None) -> str:
             {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.2,   # 低温度 → 输出更稳定，不容易乱编（生成测试要确定性）
+        "temperature": 0,   # 确定性输出（结构化生成；≠ 完全 deterministic，但显著降低波动）
     }
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",            # DeepSeek 的 OpenAI 兼容端点
@@ -657,8 +666,8 @@ def _preflight_and_repair(
     stats = {
         "repairs_applied": 0,
         "implicit_resolutions": [],
-        "remaining_issues": None,
-        "unresolved": [],
+        "blocking_issues": None,
+        "warnings": None,
     }
 
     def run_preflight() -> list[PreflightIssue]:
@@ -723,12 +732,72 @@ def _preflight_and_repair(
             except Exception:
                 pass   # LLM 选择失败 → Round 3 fail-safe
 
-    # ── Round 3：fail-safe（剩余问题记录，不无限重试）─────────────
-    stats["remaining_issues"] = [asdict(i) for i in issues] if issues else []
-    stats["unresolved"] = [
+    # ── Round 3：fail-safe（剩余问题分类记录，不无限重试）───────────
+    # 语义拆分（避免"还有问题却 6/6 通过"的误导）：
+    #   blocking_issues = 歧义未消（执行必然失败）
+    #   warnings        = 快照中未验证到（可能是操作后的状态变化，
+    #                      如点击后按钮变 Remove——执行时由断言自动等待兜底）
+    stats["blocking_issues"] = [
+        asdict(i) for i in issues if i.type == "AMBIGUOUS_LOCATOR"
+    ]
+    stats["warnings"] = [
         asdict(i) for i in issues if i.type == "LOCATOR_NOT_FOUND"
-    ] if issues else []
+    ]
     return stats
+
+
+# ── Plan Normalization（生成后归一化：LLM 输出可以波动，最终 DSL 稳定）─────────
+# 设计原则：LLM 负责语义规划，代码负责计划规范化——
+# 模型非确定性被限制在"不会影响执行语义"的范围内。
+
+_ASSERT_ACTIONS = {"assert_visible", "assert_text", "assert_url"}
+
+
+def _target_key(step) -> str:
+    """步骤 target 的归一化键（用于判断 wait_for 与断言是否同一元素）。"""
+    t = step.target
+    if t is None:
+        return ""
+    if hasattr(t, "model_dump"):
+        d = t.model_dump()
+        return f"{d.get('role') or ''}:{d.get('name') or ''}:{d.get('text') or ''}"
+    if isinstance(t, dict):
+        return f"{t.get('role') or ''}:{t.get('name') or ''}:{t.get('text') or ''}"
+    return str(t)
+
+
+def _normalize_steps(case: DSLCase) -> DSLCase:
+    """生成后归一化（Planner 输出波动 → 最终 DSL 稳定）：
+
+      1. 只保留最后一个断言步骤作为最终验证，删除前面多余的断言
+      2. 删除与最终断言同一元素的冗余 wait_for（重复等待）
+      3. 重新校验（步骤变化后保证仍是合法 DSL）
+    """
+    steps = list(case.steps)
+    if len(steps) <= 1:
+        return case
+
+    assert_indices = [i for i, s in enumerate(steps) if s.action in _ASSERT_ACTIONS]
+    if not assert_indices:
+        return case
+
+    keep = assert_indices[-1]   # 最终验证步骤（保留）
+
+    # 删除前面多余的断言步骤
+    normalized = [s for i, s in enumerate(steps) if s.action not in _ASSERT_ACTIONS or i == keep]
+
+    # 保守删除冗余 wait_for：只删"紧邻最终断言前一个、且同 target"的。
+    # 前提：断言类动作（expect）自带 Playwright 自动等待，显式 wait_for 冗余；
+    # 但中间隔着其他步骤的 wait_for 可能有业务意义（如等待跳转完成），不删。
+    final_step = normalized[-1]
+    final_key = _target_key(final_step)
+    if len(normalized) >= 2:
+        prev = normalized[-2]
+        if prev.action == "wait_for" and _target_key(prev) == final_key:
+            del normalized[-2]
+
+    case.steps = normalized
+    return validate_case(case.model_dump())   # 重新校验（安全边界）
 
 
 # ── 多页面快照文本（探索结果 → Planner 可读上下文）──────────────────────────────
@@ -814,6 +883,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     raw_text = _call_llm(grounded_prompt)
     raw_json = _extract_json(raw_text)
     case = validate_case(raw_json)   # ← 安全边界：不通过就不执行
+    case = _normalize_steps(case)    # ← 计划归一化：LLM 波动 → 稳定结构
 
     meta = {
         "snapshot_used": bool(multi_snapshot),
