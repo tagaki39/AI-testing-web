@@ -35,6 +35,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright, expect
 
@@ -46,6 +47,32 @@ ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "artifacts"
 # 变量占位符的正则：匹配 "${email}" 这种写法
 # re.compile 预编译一次，后面反复用，比每次 re.search 快
 _VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# ── goto URL 安全校验（第 6 项：SSRF/内网探测基础防护）───────────────
+# 平台允许用户手改 DSL——上线后 goto 可被用来探测内网/云 metadata。
+# 只允许公网 http/https；localhost/内网 IP/私有网段直接拒绝。
+_PRIVATE_IP_PREFIXES = (
+    "127.", "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
+    "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+    "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+)
+
+
+def _validate_goto_url(url: str) -> bool:
+    """goto URL 白名单校验：公网 http/https，非内网地址。"""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = (parsed.hostname or "").lower()
+        if host in ("localhost", "0.0.0.0"):
+            return False
+        if host.startswith(_PRIVATE_IP_PREFIXES):
+            return False
+        return True
+    except Exception:
+        return False
+
 
 # 语义定位支持的已知角色（白名单，防止把任意文本当角色解析）
 # 例如 target="登录=xxx" 时，"登录"不在白名单里 → 按纯文本处理而不是按角色
@@ -347,7 +374,11 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
     try:
         if step.action == "goto":
             # goto 不需要定位，直接跳转；相对路径会拼 base_url（简化版直接传完整 URL）
-            page.goto(_substitute(step.value, variables) or "", wait_until="domcontentloaded", timeout=step.timeout_ms)
+            # SSRF 防护：只允许公网 http/https（第 6 项）
+            url = _substitute(step.value, variables) or ""
+            if not _validate_goto_url(url):
+                raise ValueError(f"goto URL 不合法（仅允许公网 http/https）: {url[:60]}")
+            page.goto(url, wait_until="domcontentloaded", timeout=step.timeout_ms)
 
         elif step.action == "assert_url":
             # URL 断言不需要定位：验证 URL 包含期望片段（登录跳转最实用）。

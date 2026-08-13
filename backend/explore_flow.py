@@ -28,6 +28,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from time import perf_counter
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
@@ -51,6 +52,24 @@ _INTERACTIVE_ROLES = {
 # 解析 aria_snapshot YAML 行的正则
 _ELEMENT_RE = re.compile(r'-\s+(\w+)\s+"([^"]*)"')          # - button "Login"
 _TEXT_RE = re.compile(r'-\s+text:\s*(.+)')                  # - text: Products
+
+# ── 探索安全保护（第 6 项：代码层二次拦截，不只靠 Prompt）──────────────
+# press 允许的按键（枚举，防止 LLM 输出"按下回车"/"return" 等让执行器猜）
+_PRESS_KEYS = {"Enter", "Escape", "Tab", "ArrowDown", "ArrowUp"}
+
+# 不可逆/危险操作关键词（点击前拦截：删除/支付/提交订单等）
+_DESTRUCTIVE_PATTERNS = (
+    "delete", "remove", "pay", "purchase", "submit order",
+    "send", "publish", "sign out", "log out", "注销", "删除", "支付",
+)
+
+
+def _within_origin(url: str, entry_url: str) -> bool:
+    """origin 限制：探索不得离开入口站点（跨域导航会触发回退）。"""
+    try:
+        return urlparse(url).netloc == urlparse(entry_url).netloc
+    except Exception:
+        return False
 
 
 @dataclass
@@ -154,9 +173,11 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
 规则：
 1. target_ref 必须来自上面的元素表，不得编造
 2. action 只能从上面 5 种选（wait 已移除，点击后执行器自动等待页面加载）
-3. 每一步只做一个动作
-4. 当已收集到生成测试 DSL 所需的全部页面路径和元素时，exploration_complete=true 并输出 finish
-5. 探索阶段禁止执行删除、支付、提交订单等不可逆操作"""
+3. press 的 value 只能是: Enter, Escape, Tab, ArrowDown, ArrowUp
+4. 每一步只做一个动作
+5. 当已收集到生成测试 DSL 所需的全部页面路径和元素时，exploration_complete=true 并输出 finish
+6. 探索阶段禁止执行删除、支付、提交订单、注销等不可逆操作（执行器会二次拦截）
+7. 不得离开入口站点（跨域导航会被回退）"""
 
 
 # ── observe / record ───────────────────────────────────────────────────────────
@@ -243,6 +264,10 @@ def _decide(state: ExploreState, llm_call) -> dict | None:
         action = decision.get("action")
         if action not in {"click", "fill", "press", "back", "finish"}:
             return None
+        if action == "press":
+            # press 按键枚举（第 6 项：不允许 LLM 自由输出按键）
+            if (decision.get("value") or "") not in _PRESS_KEYS:
+                return None
         if action != "finish":
             ref = decision.get("target_ref")
             if ref is None or not any(e["ref"] == ref for e in state.elements):
@@ -277,6 +302,11 @@ def _act(page, decision: dict, elements: list[dict], runtime_inputs: dict) -> st
     _, locator = _resolve_locator(page, target)
 
     if action == "click":
+        # 危险操作二次拦截（第 6 项：代码层，不只靠 Prompt）——
+        # 目标名称含删除/支付/提交订单等关键词 → 拒绝执行
+        name = element.get("name", "") if element else ""
+        if any(p in name.lower() for p in _DESTRUCTIVE_PATTERNS):
+            raise ValueError(f"危险操作被拦截: {name!r}")
         locator.click()
     elif action == "fill":
         locator.fill(_substitute(value, runtime_inputs) or "")
@@ -373,6 +403,18 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             t0 = perf_counter()
             _record_page(state, page)    # observe 新页面状态
             state.timings["observation_ms"] += int((perf_counter() - t0) * 1000)
+
+            # origin 守卫（第 6 项）：点击跨域链接（文档/GitHub/外部认证）
+            # → 记录并回退，探索不离开被测站点
+            if not _within_origin(state.current_url, state.entry_url):
+                state.history.append({
+                    "url": state.current_url,
+                    "action": "origin_guard",
+                    "error": "跨域导航被拦截，已回退",
+                })
+                page.go_back()
+                page.wait_for_timeout(300)
+                _record_page(state, page)
 
         browser.close()
 
