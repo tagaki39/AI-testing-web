@@ -901,22 +901,27 @@ def _target_key(step) -> str:
     return str(t)
 
 
-def _normalize_steps(case: DSLCase) -> DSLCase:
+def _normalize_steps(case: DSLCase) -> tuple[DSLCase, list[int]]:
     """生成后归一化（Planner 输出波动 → 最终 DSL 稳定）：
 
       1. 只保留最后一个断言步骤作为最终验证，删除前面多余的断言
       2. 删除与最终断言同一元素的冗余 wait_for（重复等待）
       3. 重新校验（步骤变化后保证仍是合法 DSL）
+
+    返回 (case, removed_assertions)：被删除的断言步骤号（1-based）——
+    修复 #20：不静默删，记录供 meta 展示（多目标用例时提示用户检查）。
     """
     steps = list(case.steps)
+    removed: list[int] = []
     if len(steps) <= 1:
-        return case
+        return case, removed
 
     assert_indices = [i for i, s in enumerate(steps) if s.action in _ASSERT_ACTIONS]
     if not assert_indices:
-        return case
+        return case, removed
 
     keep = assert_indices[-1]   # 最终验证步骤（保留）
+    removed = [i + 1 for i in assert_indices[:-1]]   # 被删的断言（1-based）
 
     # 删除前面多余的断言步骤
     normalized = [s for i, s in enumerate(steps) if s.action not in _ASSERT_ACTIONS or i == keep]
@@ -932,7 +937,7 @@ def _normalize_steps(case: DSLCase) -> DSLCase:
             del normalized[-2]
 
     case.steps = normalized
-    return validate_case(case.model_dump())   # 重新校验（安全边界）
+    return validate_case(case.model_dump()), removed   # 重新校验（安全边界）
 
 
 # ── 多页面快照文本（探索结果 → Planner 可读上下文）──────────────────────────────
@@ -1066,7 +1071,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     planner_ms = int((perf_counter() - t_planner) * 1000)   # 只计 Planner 一次调用
     raw_json = _extract_json(raw_text)
     case = validate_case(raw_json)   # ← 安全边界：不通过就不执行
-    case = _normalize_steps(case)    # ← 计划归一化：LLM 波动 → 稳定结构
+    case, removed_assertions = _normalize_steps(case)   # ← 计划归一化 + 记录删除
 
     # ← grounding 验证：observation_ref 必须来自系统提供的真实 id
     #（不靠 Prompt——代码校验；非法 ref 清空为 None，降级弱验证）
@@ -1080,6 +1085,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         "snapshot_used": bool(multi_snapshot),
         "entry_url": entry_url,
         "cache_hit": cache_hit,      # Speed v1：探索结果是否命中缓存
+        "normalize_removed_assertions": removed_assertions or None,   # #20：不静默删
         "explore": {
             "pages_visited": len(pages),
             "steps_used": (explore_result or {}).get("steps_used", 0),

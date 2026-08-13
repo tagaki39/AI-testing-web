@@ -467,15 +467,23 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
 
 # ── 执行入口 ────────────────────────────────────────────────────────────────────
 
-def execute_case(case: DSLCase, variables: dict[str, str] | None = None) -> dict:
+def execute_case(
+    case: DSLCase,
+    variables: dict[str, str] | None = None,
+    continue_on_failure: bool = False,
+) -> dict:
     """执行整个用例，返回报告。
 
     流程：
       1. 合并 input_contract 的默认值到变量表
-      2. 创建本轮执行目录 artifacts/run-N（每轮独立，截图互不覆盖）
+      2. 创建本轮执行独立目录（uuid，修复并发冲突）
       3. 启动 Playwright → 打开 Chromium（headless 无头模式）
       4. 逐步骤执行（核心循环）
       5. 统计通过数 → 返回报告 dict
+
+    continue_on_failure（修复 #18：默认 fail-fast）：
+      False → 某步失败后剩余步骤标记 skipped（级联失败不产生噪音报告）
+      True  → 每步独立成败，继续执行（旧行为）
 
     sync_playwright() 上下文管理器：自动管理浏览器生命周期。
     headless=True：无头模式（不弹窗口），服务器环境必须用这个。
@@ -500,22 +508,34 @@ def execute_case(case: DSLCase, variables: dict[str, str] | None = None) -> dict
 
     results: list[dict] = []
     latest_url = None
+    failed = False
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1280, "height": 720})
         page.set_default_timeout(15000)   # 全局默认超时 15 秒
 
-        # 核心循环：逐步骤执行，每步独立成败
+        # 核心循环：逐步骤执行（fail-fast 默认：失败后剩余步骤 skipped）
         for index, step in enumerate(case.steps, start=1):
+            if failed and not continue_on_failure:
+                results.append({
+                    "step_index": index,
+                    "action": step.action,
+                    "status": "skipped",
+                    "error": "前序步骤失败，已跳过（fail-fast）",
+                    "duration_ms": 0,
+                })
+                continue
             evidence = _execute_step(page, step, variables, run_dir, index)
             results.append(evidence)
+            if evidence["status"] == "failed" and not continue_on_failure:
+                failed = True
             if evidence["url"]:
                 latest_url = evidence["url"]
 
         browser.close()
 
-    # 统计：全过才算通过
+    # 统计：全过才算通过（skipped 不算失败但也不算通过）
     passed = sum(1 for r in results if r["status"] == "passed")
 
     # ── 量化汇总（面试数据来源）─────────────────────────────
