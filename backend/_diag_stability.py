@@ -61,8 +61,16 @@ def semantic_signature(case) -> list[dict]:
 
 
 def action_hash(case) -> str:
-    """核心动作序列指纹（Planner 结构稳定性指标）。"""
-    payload = json.dumps(semantic_signature(case), sort_keys=True, ensure_ascii=False)
+    """核心交互动作序列指纹（Planner 结构稳定性指标）。
+
+    ⚠️ 修复：排除断言类动作——断言稳定性由 verify_hash 单独衡量，
+    否则 action_hash 与 verify_hash 不独立（断言一变两个 hash 都变）。
+    """
+    sig = [
+        s for s in semantic_signature(case)
+        if s["action"] not in {"assert_visible", "assert_text", "assert_url"}
+    ]
+    payload = json.dumps(sig, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()[:8]
 
 
