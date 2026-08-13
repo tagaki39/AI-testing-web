@@ -156,17 +156,24 @@ def _build_locators(container, t: ParsedTarget) -> list[tuple[str, object]]:
 # 先找到包含目标文本的容器，再在容器内查找。
 
 def _text_scope_containers(page, text: str) -> list[object]:
-    """文本作用域：找到包含文本的元素，向上爬最多 3 层父级作为候选容器。
+    """文本作用域：所有匹配文本的元素向上爬最多 3 层父级作为候选容器。
 
-    ⚠️ 依赖 DOM 层级，前端改结构可能失效——所以它只作为"兜底"：
-    结构化 scope 找不到容器时自动降级到这里（原项目同款设计）。
+    ⚠️ 修复：不再 .first 自动选第一个——文本匹配多处时（如"Blue Top"
+    出现在商品列表和购物车推荐），每个匹配都生成候选容器，
+    由 _resolve_locator 的 scope 联合三分法判断哪个容器内 target 唯一。
     """
-    base = page.get_by_text(text).first
-    containers = [base]
-    current = base
-    for _ in range(3):
-        current = current.locator("xpath=..")   # xpath=.. 表示"父元素"
-        containers.append(current)
+    anchors = page.get_by_text(text)
+    count = anchors.count()
+    if count == 0:
+        return []
+    containers: list[object] = []
+    for i in range(min(count, 5)):   # 限制候选数，防容器膨胀
+        base = anchors.nth(i)
+        containers.append(base)
+        current = base
+        for _ in range(3):
+            current = current.locator("xpath=..")   # xpath=.. 表示"父元素"
+            containers.append(current)
     return containers
 
 
@@ -242,6 +249,15 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
 
     containers = _resolve_scope_containers(page, scope)
 
+    # scope 联合三分法（修复）：收集所有"容器内 target 唯一命中"的候选，
+    # 最后统一判断——而不是遇到第一个唯一就返回。
+    #   容器内 target 0 个   → 该容器无效（继续找）
+    #   容器内 target 多个   → 容器太宽（继续找更精确的容器，不报歧义）
+    #   全部容器遍历后：
+    #     matches == 0 → NotFound
+    #     matches == 1 → 使用
+    #     matches > 1  → Ambiguous（多个独立容器各自唯一命中——真 scope 歧义）
+    matches: list[tuple[str, object]] = []
     for container in containers:
         for strategy, locator in _build_locators(container, t):
             try:
@@ -250,21 +266,27 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
                 raise LocatorNotFoundError(f"定位失败 ({strategy}): {exc}") from exc
 
             if count == 1:
-                return strategy, locator
+                matches.append((strategy, locator))
+                break   # 该容器内已唯一命中，进入下一容器
             if count > 1:
-                hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
-                raise LocatorAmbiguousError(
-                    f"{strategy} 定位器匹配到 {count} 个元素: {target}{hint}"
-                )
+                continue   # 容器太宽（target 多个）→ 尝试更精确的容器
             # count == 0：wait_for 语义下，元素可能正在渲染 → 等待出现
             if allow_lazy:
                 try:
                     locator.wait_for(state="visible", timeout=timeout_ms)
-                    return strategy, locator
+                    matches.append((strategy, locator))
+                    break
                 except Exception:
                     continue   # 超时 → 尝试下一个策略（降级）
 
-    raise LocatorNotFoundError(f"所有定位策略均未命中: {target}")
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise LocatorAmbiguousError(
+            f"scope 下存在多个候选容器，target 在 {len(matches)} 处唯一命中: {target}"
+        )
+    hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
+    raise LocatorNotFoundError(f"所有定位策略均未命中: {target}{hint}")
 
 
 # ── 变量替换 ────────────────────────────────────────────────────────────────────

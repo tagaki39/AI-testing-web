@@ -394,6 +394,17 @@ def _snapshot_check(snapshot: str, role: str | None, name: str) -> tuple[bool, i
     return name.lower() in snapshot.lower(), snapshot.lower().count(name.lower())
 
 
+def _scope_snapshot_check(snapshot: str, scope_text: str | None) -> tuple[bool, int]:
+    """scope 的三分验证：has_text 文本在快照中出现 0 / 1 / N 次。
+
+    修复：有 scope ≠ 已消歧——scope 值可能是"不存在的商品"（0 次）
+    或匹配多个容器（N 次），Preflight 必须和 Runner 的三分法一致。
+    """
+    if not scope_text:
+        return True, 1   # 无 scope → 视为消歧通过（交由 target 检查）
+    return _snapshot_check(snapshot, None, scope_text)
+
+
 def _target_to_dict(t) -> dict:
     """把 target（str / Locator 模型 / dict）统一转成 dict。"""
     if hasattr(t, "model_dump"):
@@ -437,14 +448,51 @@ def _preflight_targets(case: DSLCase, snapshot: str) -> list[PreflightIssue]:
                 target=_target_to_dict(t),
                 detail=f"步骤 {index}: target 在页面快照中不存在",
             ))
-        elif count > 1 and role and not step.scope:
-            issues.append(PreflightIssue(
-                step_index=index,
-                issue_id=f"step{index}",
-                type="AMBIGUOUS_LOCATOR",
-                target=_target_to_dict(t),
-                detail=f"步骤 {index}: 页面存在 {count} 个同名 {role}，需 scope 消歧",
-            ))
+        elif count > 1 and role:
+            # scope 三分验证（修复：有 scope ≠ 已消歧）：
+            #   scope 文本不存在 → SCOPE_NOT_FOUND
+            #   scope 文本匹配多个 → SCOPE_AMBIGUOUS
+            #   scope 有效且唯一 → 视为已消歧，通过
+            scope_text = None
+            if step.scope is not None:
+                scope_text = step.scope.model_dump().get("has_text") \
+                    if hasattr(step.scope, "model_dump") \
+                    else (step.scope.get("has_text") if isinstance(step.scope, dict) else str(step.scope))
+            if not scope_text:
+                issues.append(PreflightIssue(
+                    step_index=index,
+                    issue_id=f"step{index}",
+                    type="AMBIGUOUS_LOCATOR",
+                    target=_target_to_dict(t),
+                    detail=f"步骤 {index}: 页面存在 {count} 个同名 {role}，需 scope 消歧",
+                ))
+            else:
+                # scope 验证（跨页面计数污染降级为 warning）：
+                #   0 次  → blocking（scope 无效，消歧失败）
+                #   1 次  → pass
+                #   >1 次 → warning（合并快照无法区分"多页面各 1 次"与
+                #             "当前页面多次"——cardinality unknown）
+                scope_found, scope_count = _scope_snapshot_check(snapshot, scope_text)
+                if not scope_found:
+                    issues.append(PreflightIssue(
+                        step_index=index,
+                        issue_id=f"step{index}",
+                        type="AMBIGUOUS_LOCATOR",
+                        target=_target_to_dict(t),
+                        detail=f"步骤 {index}: scope 文本在快照中不存在（{scope_text!r}），消歧无效",
+                    ))
+                elif scope_count > 1:
+                    issues.append(PreflightIssue(
+                        step_index=index,
+                        issue_id=f"step{index}",
+                        type="SCOPE_CARDINALITY_UNKNOWN",
+                        target=_target_to_dict(t),
+                        detail=(
+                            f"步骤 {index}: scope 文本在多页面快照中出现 {scope_count} 次，"
+                            "无法据此判断当前页面歧义（由运行时页面级定位兜底）"
+                        ),
+                    ))
+                # scope 唯一 → 已消歧，通过
 
     return issues
 
@@ -748,13 +796,14 @@ def _preflight_and_repair(
     # ── Round 3：fail-safe（剩余问题分类记录，不无限重试）───────────
     # 语义拆分（避免"还有问题却 6/6 通过"的误导）：
     #   blocking_issues = 歧义未消（执行必然失败）
-    #   warnings        = 快照中未验证到（可能是操作后的状态变化，
-    #                      如点击后按钮变 Remove——执行时由断言自动等待兜底）
+    #   warnings        = 非阻塞：快照未验证到（可能是操作后状态变化）、
+    #                      scope 跨页面计数不确定（cardinality unknown）
     stats["blocking_issues"] = [
         asdict(i) for i in issues if i.type == "AMBIGUOUS_LOCATOR"
     ]
     stats["warnings"] = [
-        asdict(i) for i in issues if i.type == "LOCATOR_NOT_FOUND"
+        asdict(i) for i in issues
+        if i.type in {"LOCATOR_NOT_FOUND", "SCOPE_CARDINALITY_UNKNOWN"}
     ]
     return stats
 
