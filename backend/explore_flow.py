@@ -37,9 +37,11 @@ from runner import _resolve_locator, _substitute
 # ── 预算（bounded：探索必须有限）───────────────────────────────────────────────
 MAX_STEPS = 8        # 最多执行 8 个动作
 MAX_LLM_CALLS = 8    # 最多 8 次 LLM 决策调用（登录→商品→购物车流程约需 7-8 步）
-_MAX_SNAPSHOT_CHARS = 4000   # 每页快照截断长度（保留给 element 解析用）
+_MAX_SNAPSHOT_CHARS = 6000   # 裁剪后快照的最终兜底上限（重组后仍超限才截断）
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
 _MAX_TEXT_ELEMENTS = 20      # 文本节点最多注入 20 个（防上下文膨胀）
+_MAX_TEXT_LINES = 25         # 智能裁剪：text 行限量
+_MAX_OTHER_LINES = 40        # 智能裁剪：非交互语义行（heading/banner 等容器）限量
 _MAX_OBSERVATIONS = 12       # 总 observation 上限（防膨胀）
 _MAX_OBSERVATIONS_PER_URL = 3   # 同 URL 最多 3 个状态（SPA 状态变化）
 
@@ -183,12 +185,49 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
 # ── observe / record ───────────────────────────────────────────────────────────
 
 def _observe(page) -> str:
-    """抓取当前页面 ARIA 快照（截断，控制 token）。"""
+    """抓取当前页面 ARIA 快照并智能裁剪（第 7 项：不再粗暴截断）。
+
+    修复：简单 [:4000] 截断会丢后半段元素（重要按钮在截断外时
+    Preflight 误判"不存在"）。结构化裁剪按优先级保留：
+      1. 可交互元素行（button/link/textbox...）——全部保留，永不丢
+      2. heading 等语义行——限量
+      3. text 行——限量
+      4. 其他（容器/装饰）——限量
+    层级缩进保留（只过滤不重排）；重组后仍超限才最终截断。
+    """
     try:
-        snapshot = page.locator("body").aria_snapshot()
-        return (snapshot or "")[:_MAX_SNAPSHOT_CHARS]
+        snapshot = page.locator("body").aria_snapshot() or ""
     except Exception:
         return ""
+    return _smart_truncate(snapshot)
+
+
+def _smart_truncate(snapshot: str) -> str:
+    """结构化裁剪：按元素优先级过滤行（见 _observe 说明）。"""
+    lines = snapshot.splitlines()
+    kept: list[str] = []
+    text_count = 0
+    other_count = 0
+    for line in lines:
+        stripped = line.strip()
+        m = _ELEMENT_RE.match(stripped)
+        if m:
+            kept.append(line)          # 可交互元素：全保留
+            continue
+        m = _TEXT_RE.match(stripped)
+        if m:
+            if text_count < _MAX_TEXT_LINES:
+                kept.append(line)
+                text_count += 1
+            continue
+        if stripped.startswith("-"):
+            if other_count < _MAX_OTHER_LINES:   # 容器/heading 等语义行：限量
+                kept.append(line)
+                other_count += 1
+            continue
+        kept.append(line)              # 缩进/空行
+    result = "\n".join(kept)
+    return result[:_MAX_SNAPSHOT_CHARS] if len(result) > _MAX_SNAPSHOT_CHARS else result
 
 
 def _record_page(state: ExploreState, page) -> None:
