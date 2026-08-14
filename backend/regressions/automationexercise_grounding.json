@@ -1,0 +1,17 @@
+{
+  "id": "automationexercise_grounding",
+  "scenario": "AutomationExercise list → detail 状态错位",
+  "prompt": "Open automationexercise.com, login with test123@example.com / test123, go to Products page, filter Polo brand, add Blue Top product to cart, then view cart and verify it contains Blue Top with price Rs. 500",
+  "current_behavior": {
+    "pattern": "list state → View Product → detail state → 下一步仍引用 list state 的 Add to cart（详情页是 button 不是 link）",
+    "failure": "Step 9 LocatorNotFoundError（detail 状态无 list 状态的 link Add to cart）——实测 8/12"
+  },
+  "expected_v2": {
+    "validator": "STATE_GROUNDING_MISMATCH：detail state 后 target_ref 必须来自 detail observation",
+    "alternative": "或 Planner 不进入 detail，直接使用 list state 的 Add to cart ref（列表页加购）",
+    "auto_fix_required": false
+  },
+  "metrics": {
+    "false_resolution": "必须为零"
+  }
+}

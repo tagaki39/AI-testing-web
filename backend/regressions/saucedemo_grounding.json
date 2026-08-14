@@ -1,0 +1,16 @@
+{
+  "id": "saucedemo_grounding",
+  "scenario": "SauceDemo inventory → detail 状态错位",
+  "prompt": "Open saucedemo.com, login with standard_user / secret_sauce, click the first product add to cart button, then verify the cart page shows the product",
+  "current_behavior": {
+    "pattern": "inventory state → 点击商品名 → detail state → 下一步仍引用 inventory state 的 add-to-cart ref",
+    "failure": "目标 ref 属于 S0，执行时处于 S1（detail）——同一 pattern 曾导致 add-to-cart 定位失败/错误"
+  },
+  "expected_v2": {
+    "validator": "STATE_GROUNDING_MISMATCH：target_ref.observation_id != current_observation_id 时执行前拒绝",
+    "auto_fix_required": false
+  },
+  "metrics": {
+    "false_resolution": "必须为零（不得因 fuzzy 或 business dedup 误命中等错误成功）"
+  }
+}
