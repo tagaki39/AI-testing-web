@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from dsl import DSLCase, Locator, Scope, validate_case
 from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
 from explore_flow import explore
-from runner import _parse_target
+from runner import _decorated_name_pattern, _is_navigation_name, _parse_target
 
 # ── 配置（环境变量）───────────────────────────────────────────────────────────
 # os.getenv("名字", 默认值)：读环境变量，没设置就用默认值。
@@ -102,7 +102,11 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
    - 每个可定位步骤应引用产生该定位证据的 observation id（obs1/obs2/...）
    - observation_ref 必须来自系统提供的 observation 列表，禁止编造
    - Runner 不使用 observation_ref 控制页面跳转，它只供验证与诊断使用
-6. assert_text 验证页面/元素包含文字；assert_visible 验证元素可见；assert_url 验证当前 URL 包含片段
+6. 断言动作字段约束（机械规则）：
+   - assert_text: value 必填（要验证的文本）；target 可选（有 target 验证该元素文本，无 target 验证页面文本）；
+     禁止把待验证文本只放在 target.text 而省略 value
+   - assert_visible: target 必填；如果只是"某段文字/元素出现"，使用 assert_visible，而不是无 value 的 assert_text
+   - assert_url: value 必填（URL 片段）
 7. 最小测试原则：
    - 仅生成完成用户需求所需的最少步骤
    - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
@@ -352,6 +356,85 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
+# ── Planner Schema Recovery（P0：Pydantic 失败 → constrained retry ×1）─────────
+# 修复：Planner 输出不符合 DSL schema 时（如 assert_text 缺 value），
+# 整体 400 终止——应把"原输出 + 精简错误"反馈给专用 recovery LLM，
+# 只修 schema，不重新规划（不增删重排步骤）。
+
+PLANNER_RECOVERY_SYSTEM_PROMPT = """你是 Web 测试 DSL 的 schema 修复器。
+
+你会收到：
+1. 上一次 Planner 生成的 JSON
+2. Pydantic 校验错误
+
+只修复这些 schema 错误。
+
+规则：
+- 不新增无关步骤
+- 不改变已有步骤顺序
+- 不改变 locator、scope、业务对象，除非校验错误直接要求
+- 不重新规划测试流程
+- 只输出修复后的完整 JSON"""
+
+
+def _summarize_validation_error(exc) -> str:
+    """把 Pydantic ValidationError 提炼成模型可读的错误行（不是 traceback）。"""
+    if hasattr(exc, "errors"):
+        lines = []
+        for e in exc.errors():
+            loc = ".".join(str(x) for x in e.get("loc", []))
+            msg = e.get("msg", "")
+            lines.append(f"- {loc}: {msg}")
+        return "\n".join(lines) or str(exc)[:500]
+    return str(exc)[:500]
+
+
+def _generate_planner_case(grounded_prompt: str) -> tuple[DSLCase, dict]:
+    """Planner 生成 + 校验；schema 失败 constrained recovery ×1。
+
+    返回 (case, planner_meta)，meta 记录：
+      planner_attempts / schema_recovery_used / schema_recovery_success
+      initial_validation_errors / planner_recovery_ms
+
+    只对"生成结果不合法"（JSON 解析 / Pydantic ValidationError）做 recovery；
+    LLM API 异常（超时/网络）不在此吞掉，让上层 fail safely。
+    """
+    from pydantic import ValidationError
+
+    meta = {
+        "planner_attempts": 1,
+        "schema_recovery_used": False,
+        "schema_recovery_success": False,
+        "initial_validation_errors": None,
+        "planner_recovery_ms": 0,
+    }
+
+    def parse_and_validate(text: str) -> DSLCase:
+        return validate_case(_extract_json(text))
+
+    raw_text = _call_llm(grounded_prompt)
+    try:
+        return parse_and_validate(raw_text), meta
+    except (ValueError, ValidationError) as exc:
+        meta["schema_recovery_used"] = True
+        meta["planner_attempts"] = 2
+        meta["initial_validation_errors"] = _summarize_validation_error(exc)
+
+        recovery_prompt = (
+            "上一次 Planner 输出：\n"
+            f"{raw_text}\n\n"
+            "Schema 校验错误：\n"
+            f"{meta['initial_validation_errors']}"
+        )
+        t = perf_counter()
+        repaired_text = _call_llm(recovery_prompt, system_prompt=PLANNER_RECOVERY_SYSTEM_PROMPT)
+        meta["planner_recovery_ms"] = int((perf_counter() - t) * 1000)
+
+        case = parse_and_validate(repaired_text)   # 仍失败 → 抛异常（fail safely）
+        meta["schema_recovery_success"] = True
+        return case, meta
+
+
 # ── Preflight v2：候选提取 + 确定性消歧 + LLM 受限选择 ────────────────────────
 # 核心原则（设计评审）：
 #   "LLM 最适合做语义判断，不应该承担能够由确定性程序完成的结构修复；
@@ -412,16 +495,33 @@ class RepairResponse(BaseModel):
 def _snapshot_check(snapshot: str, role: str | None, name: str) -> tuple[bool, int]:
     """在 ARIA 快照文本中查找 role+name 或纯文本，返回 (是否找到, 出现次数)。
 
+    匹配语义与 Runner 对齐（修复 Preflight/Runner 漂移）：
+      exact → decorated-exact（FontAwesome 图标前缀）→ 非导航才 fuzzy。
+      导航短名（Cart 等）禁止 fuzzy substring——否则 "Cart" 会把
+      "Add to cart"/"View Cart" 计入，制造 false AMBIGUOUS。
+
     快照格式（aria_snapshot 输出）：
       - button "Add to cart"        ← role+name 格式
       - text: Your Cart             ← 纯文本格式
-    匹配用"包含"而非"精确"：accessible name 可能有前缀空格/大小写差异。
     """
     if role:
-        # 匹配 role "xxx" 形式，取引号内的 name 列表
         pattern = re.compile(rf'\b{re.escape(role)}\s+"([^"]*)"')
-        matched = [m for m in pattern.findall(snapshot) if name.lower() in m.lower()]
-        return bool(matched), len(matched)
+        quotes = pattern.findall(snapshot)
+        if not quotes:
+            return False, 0
+        # exact
+        exact = [q for q in quotes if q.strip() == name]
+        if exact:
+            return True, len(exact)
+        # decorated-exact（图标前缀：" Cart"）
+        decorated = [q for q in quotes if _decorated_name_pattern(name).fullmatch(q.strip())]
+        if decorated:
+            return True, len(decorated)
+        # 非导航才 fuzzy substring
+        if not _is_navigation_name(role, name):
+            fuzzy = [q for q in quotes if name.lower() in q.lower()]
+            return bool(fuzzy), len(fuzzy)
+        return False, 0
     # 纯文本：直接在快照里找
     return name.lower() in snapshot.lower(), snapshot.lower().count(name.lower())
 
@@ -826,27 +926,21 @@ def _goal_match_anchor(goal: str, anchors: list[str]) -> str | None:
     return None
 
 
-# 导航级 target 名（deterministic 规则：商品/价格 scope 一律禁止——
-# 不只靠 Prompt，Repair 层也要执行）
-_NAV_TARGET_NAMES = {
-    "cart", "products", "home", "logout", "login", "signup / login",
-    "signup/login", "test cases", "api testing", "contact us",
-}
-
-
 def _is_navigation_target(target: dict) -> bool:
-    """target 是否属于导航级元素（link 且名称在 allowlist）。"""
+    """target 是否属于导航级元素（link 且名称在 allowlist）。
+    判定语义与 Runner 共享（_is_navigation_name）。"""
     parsed = _parse_target(target)
     if parsed is None:
         return False
-    return (
-        parsed.role == "link"
-        and (parsed.name or "").strip().casefold() in _NAV_TARGET_NAMES
-    )
+    return _is_navigation_name(parsed.role, parsed.name)
 
 
 def _build_locator_exact_first(page, target: dict):
-    """构建定位器：先精确匹配（避免 Cart 模糊命中 View Cart），0 个再模糊。"""
+    """构建定位器（与 Runner 共享语义）：exact → decorated-exact → fuzzy（导航名禁止 fuzzy）。
+
+    修复：FontAwesome 图标字符进 accessible name（" Cart"）——
+    exact 失败后尝试 decorated-exact，而不是直接跳脏 fuzzy。
+    """
     parsed = _parse_target(target)
     if parsed is None:
         return None
@@ -855,6 +949,10 @@ def _build_locator_exact_first(page, target: dict):
     if parsed.role and parsed.name:
         loc = page.get_by_role(parsed.role, name=parsed.name, exact=True)
         if loc.count() == 0:
+            loc = page.get_by_role(
+                parsed.role, name=_decorated_name_pattern(parsed.name),
+            )
+        if loc.count() == 0 and not _is_navigation_name(parsed.role, parsed.name):
             loc = page.get_by_role(parsed.role, name=parsed.name)
         return loc
     if parsed.text:
@@ -1247,21 +1345,29 @@ def _normalize_steps(case: DSLCase) -> tuple[DSLCase, list[int]]:
     if not assert_indices:
         return case, removed
 
-    keep = assert_indices[-1]   # 最终验证步骤（保留）
-    removed = [i + 1 for i in assert_indices[:-1]]   # 被删的断言（1-based）
+    # 修复语义冲突（"只保留最后断言" vs "用户明确要求多个验证"）：
+    # 只删除【完全重复】的断言（同 action+target+value）——
+    # 不同语义的显式验证必须保留（稳定性不能以删除用户验证为代价）。
+    seen: set[tuple] = set()
+    normalized: list[DSLStep] = []
+    for i, s in enumerate(steps, start=1):
+        if s.action in _ASSERT_ACTIONS:
+            key = (s.action, _target_key(s), s.value)
+            if key in seen:
+                removed.append(i)
+                continue
+            seen.add(key)
+        normalized.append(s)
 
-    # 删除前面多余的断言步骤
-    normalized = [s for i, s in enumerate(steps) if s.action not in _ASSERT_ACTIONS or i == keep]
-
-    # 保守删除冗余 wait_for：只删"紧邻最终断言前一个、且同 target"的。
-    # 前提：断言类动作（expect）自带 Playwright 自动等待，显式 wait_for 冗余；
-    # 但中间隔着其他步骤的 wait_for 可能有业务意义（如等待跳转完成），不删。
-    final_step = normalized[-1]
-    final_key = _target_key(final_step)
-    if len(normalized) >= 2:
-        prev = normalized[-2]
-        if prev.action == "wait_for" and _target_key(prev) == final_key:
-            del normalized[-2]
+    # 保守删除冗余 wait_for：只删"紧邻最后一个断言前、且同 target"的。
+    # 前提：断言类动作（expect）自带 Playwright 自动等待；
+    # 隔着其他步骤的 wait_for 可能有业务意义（如等待跳转完成），不删。
+    if normalized and normalized[-1].action in _ASSERT_ACTIONS:
+        final_key = _target_key(normalized[-1])
+        if len(normalized) >= 2:
+            prev = normalized[-2]
+            if prev.action == "wait_for" and _target_key(prev) == final_key:
+                del normalized[-2]
 
     case.steps = normalized
     return validate_case(case.model_dump()), removed   # 重新校验（安全边界）
@@ -1394,10 +1500,8 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         grounded_prompt = explore_goal   # 无快照时同样用脱敏后的需求
 
     t_planner = perf_counter()
-    raw_text = _call_llm(grounded_prompt)
-    planner_ms = int((perf_counter() - t_planner) * 1000)   # 只计 Planner 一次调用
-    raw_json = _extract_json(raw_text)
-    case = validate_case(raw_json)   # ← 安全边界：不通过就不执行
+    case, planner_meta = _generate_planner_case(grounded_prompt)   # ← Schema Recovery ×1
+    planner_ms = int((perf_counter() - t_planner) * 1000)
     case, removed_assertions = _normalize_steps(case)   # ← 计划归一化 + 记录删除
     case = _normalize_invalid_scopes(case)   # ← 导航 scope invariant（Planner 后立即清）
 
@@ -1414,6 +1518,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         "entry_url": entry_url,
         "cache_hit": cache_hit,      # Speed v1：探索结果是否命中缓存
         "normalize_removed_assertions": removed_assertions or None,   # #20：不静默删
+        "planner": planner_meta,     # Schema Recovery 统计（attempts/recovery）
         "explore": {
             "pages_visited": len(pages),
             "steps_used": (explore_result or {}).get("steps_used", 0),

@@ -49,6 +49,47 @@ ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "artifacts"
 # re.compile 预编译一次，后面反复用，比每次 re.search 快
 _VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+# ── 导航 target 名（locator 语义共享：导航名禁止 fuzzy substring）────
+_NAV_TARGET_NAMES = {
+    "cart", "products", "home", "logout", "login", "signup / login",
+    "signup/login", "test cases", "api testing", "contact us",
+}
+
+
+def _is_navigation_name(role: str | None, name: str | None) -> bool:
+    """导航级元素判断（Runner 与 ai_agent 共享）。"""
+    return (
+        role == "link"
+        and (name or "").strip().casefold() in _NAV_TARGET_NAMES
+    )
+
+
+# ── accessible name 修饰容忍（Runner 与 Preflight 共享）───────────────
+# FontAwesome 私有区字符（U+E000-U+F8FF）会成为 accessible name 的一部分
+#（如 " Cart"）——decorated-exact 容忍图标前缀 + 空白。
+# 用 ASCII-safe 转义写字符范围（避免源码含字面 PUA 字符 → GBK 编码问题）。
+_DECORATED_PREFIX = r"[\uE000-\uF8FF\s]*"
+
+
+def _decorated_name_pattern(name: str):
+    """构建可匹配"图标前缀 + 名称"的正则（Playwright selector 安全）。
+
+    Playwright selector 正则约束（实测）：
+      - 裸 "/" 是定界符 → 必须转义 "\\/"（token 内的斜杠）
+      - "\\s" 只在字符类内安全（类外 "\\s+" 报 InvalidSelectorError）
+      - "\\uE000" 等 Unicode 转义安全
+    因此：token 级 re.escape + "/" 手动转义 + 空白用字符类 "[ \\s]*"。
+    "Signup / Login" → ^[\\uE000-\\uF8FF\\s]*Signup[ \\s]*\\/[ \\s]*Login$
+    """
+    parts = []
+    for part in name.strip().split():
+        escaped = re.escape(part)
+        escaped = escaped.replace("/", "\\/")   # Playwright 正则定界符转义
+        parts.append(escaped)
+    literal = r"[ \s]*".join(parts)
+    return re.compile(rf"^{_DECORATED_PREFIX}{literal}$")
+
+
 # ── 业务实体标识（Runner 与 Preflight 共享的判定语义）────────────────
 # 保守 allowlist：只认 product/item 级别明确业务 id，不泛化 data-id
 _BUSINESS_ID_ATTRS = ("data-product-id", "data-item-id")
@@ -192,11 +233,18 @@ def _build_locators(container, t: ParsedTarget) -> list[tuple[str, object]]:
     if t.test_id:
         candidates.append(("test_id", container.get_by_test_id(t.test_id)))
     if t.role and t.name:
-        # exact-first：避免 "Cart" 模糊命中 "View Cart"（修复 Step 9）；
-        # exact 0 个时降级模糊（icon 前缀空格等 accessible name 差异，
-        # 如 "Signup / Login"）。歧义仍由三分法拦截。
+        # exact-first：避免 "Cart" 模糊命中 "View Cart"（修复 Step 9）
         candidates.append(("role", container.get_by_role(t.role, name=t.name, exact=True)))
-        candidates.append(("role_fuzzy", container.get_by_role(t.role, name=t.name)))
+        # decorated-exact：容忍 FontAwesome 私有区图标前缀（如 " Cart"），
+        # 排除 "View Cart"/"Add to cart"
+        candidates.append(("role_decorated", container.get_by_role(
+            t.role, name=_decorated_name_pattern(t.name),
+        )))
+        # 导航级短名（Cart/Home/Products/Login）禁止 fuzzy substring——
+        # 否则 "Cart" 会命中 "Add to cart"，再被 business dedup 误聚合成
+        # "错误点击却看似成功"（比明确失败更危险）
+        if not _is_navigation_name(t.role, t.name):
+            candidates.append(("role_fuzzy", container.get_by_role(t.role, name=t.name)))
     if t.text:
         candidates.append(("text", container.get_by_text(t.text)))
     if t.css:
@@ -323,12 +371,16 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
     #     matches == 1 → 使用
     #     matches > 1  → Ambiguous（多个独立容器各自唯一命中——真 scope 歧义）
     matches: list[tuple[str, object]] = []
+    strategy_errors: list[str] = []
     for container in containers:
         for strategy, locator in _build_locators(container, t):
             try:
                 count = locator.count()
             except Exception as exc:
-                raise LocatorNotFoundError(f"定位失败 ({strategy}): {exc}") from exc
+                # strategy-local failure：单个策略内部异常（如 selector 语法）
+                # 不炸整条 fallback 链——记录错误，继续下一个策略
+                strategy_errors.append(f"{strategy}: {type(exc).__name__}: {str(exc)[:120]}")
+                continue
 
             if count == 1:
                 matches.append((strategy, locator))
@@ -398,7 +450,8 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
             f"scope 下存在多个候选容器，target 在 {len(candidates)} 处唯一命中（可见、不同元素、不同业务实体）: {target}"
         )
     hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
-    raise LocatorNotFoundError(f"所有定位策略均未命中: {target}{hint}")
+    error_detail = f"；strategy_errors={strategy_errors}" if strategy_errors else ""
+    raise LocatorNotFoundError(f"所有定位策略均未命中: {target}{hint}{error_detail}")
 
 
 # ── 变量替换 ────────────────────────────────────────────────────────────────────
