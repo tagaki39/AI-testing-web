@@ -1,0 +1,1263 @@
+整体架构已经比较清楚：**LLM 做规划、Playwright 确定性执行、Pydantic 做 DSL 边界、Preflight 做定位修复、element ref 限制探索幻觉**，这些方向都值得保留。
+
+不过现在确实还有一些问题，其中有几个我建议**在继续加 RAG / SSE / VLM 之前先修掉**。
+
+## P0：我会立刻修的 5 个问题
+
+| 问题                                        | 严重度 | 影响                  |
+| ----------------------------------------- | --: | ------------------- |
+| `remaining_issues` key 已不存在但仍被访问          |  🔴 | 可能直接 `KeyError`     |
+| `system_prompt=None` 实际用了 `SYSTEM_PROMPT` |  🔴 | Explore/Repair 角色串了 |
+| Preflight 用所有页面快照混在一起验证                   |  🔴 | 可能在错误页面“验证通过”       |
+| Artifact 接口缺少路径边界校验                       |  🔴 | 部署后有路径穿越风险          |
+| 前端 `innerHTML` 未完整 escape                 |  🔴 | 可产生 XSS             |
+
+### 1. `remaining_issues` 是一个明确 bug
+
+你现在 `_preflight_and_repair()` 返回：
+
+```python
+{
+    "repairs_applied": 0,
+    "implicit_resolutions": [],
+    "blocking_issues": None,
+    "warnings": None,
+}
+```
+
+已经把原来的 `remaining_issues` 拆成了 `blocking_issues` 和 `warnings`。
+
+但 `generate_dsl()` 还在：
+
+```python
+if stats["repairs_applied"] or stats["remaining_issues"]:
+```
+
+
+
+如果：
+
+```text
+repairs_applied == 0
+```
+
+左边为 False，就会访问不存在的：
+
+```text
+stats["remaining_issues"]
+```
+
+然后 `KeyError`。
+
+直接改成：
+
+```python
+if (
+    stats["repairs_applied"]
+    or stats["blocking_issues"]
+    or stats["warnings"]
+    or stats["implicit_resolutions"]
+):
+    meta["preflight"] = stats
+```
+
+不过我更推荐：
+
+```python
+meta["preflight"] = stats
+```
+
+**只要跑过 Preflight 就始终返回 stats。**
+
+这样诊断数据最完整，不需要猜：
+
+```text
+meta.preflight is None
+```
+
+到底是“没问题”还是“根本没执行”。
+
+---
+
+## 2. 这是一个隐藏得比较深的 Prompt bug
+
+你的：
+
+```python
+def _call_llm(
+    user_prompt: str,
+    system_prompt: str | None = None
+):
+```
+
+里面写的是：
+
+```python
+{"role": "system",
+ "content": system_prompt or SYSTEM_PROMPT}
+```
+
+
+
+这意味着：
+
+```python
+_call_llm(prompt, system_prompt=None)
+```
+
+**并不是“没有 system prompt”。**
+
+实际等于：
+
+```python
+_call_llm(
+    prompt,
+    system_prompt=SYSTEM_PROMPT
+)
+```
+
+而你 Repair 正在这样调用：
+
+```python
+raw_text = _call_llm(
+    prompt,
+    system_prompt=None,
+)
+```
+
+
+
+Explore 也一样。
+
+所以实际上：
+
+```text
+DSL Generator SYSTEM_PROMPT
+          ↓
+    Explore Decide
+
+DSL Generator SYSTEM_PROMPT
+          ↓
+    Repair Candidate Choose
+```
+
+角色是串的。
+
+这可能也是你之前一些 LLM 输出莫名波动的来源之一。
+
+建议直接拆：
+
+```python
+PLANNER_SYSTEM_PROMPT = """..."""
+
+EXPLORE_SYSTEM_PROMPT = """
+你是 Web Exploration Decision Agent。
+只负责根据 observation 选择下一步探索动作。
+"""
+
+REPAIR_SYSTEM_PROMPT = """
+你是 Locator Candidate Selector。
+只能从系统提供的 candidate_id 中选择。
+"""
+```
+
+调用：
+
+```python
+_call_llm(
+    prompt,
+    system_prompt=EXPLORE_SYSTEM_PROMPT,
+)
+```
+
+不要再用 `None` 表示“特殊模式”。
+
+---
+
+# 3. Preflight 目前最大的架构问题：跨页面误判
+
+你现在：
+
+```python
+multi_snapshot = _pages_to_text(pages)
+```
+
+然后：
+
+```python
+_preflight_and_repair(
+    case,
+    multi_snapshot,
+    ...
+)
+```
+
+最终 `_snapshot_check()` 是直接对这一整个字符串搜索。 
+
+比如：
+
+```text
+页面1 /login
+button "Login"
+
+页面2 /inventory
+button "Add to cart"
+```
+
+假设 DSL 在 `/inventory` 阶段错误生成：
+
+```json
+{
+  "target": {
+    "role": "button",
+    "name": "Login"
+  }
+}
+```
+
+Preflight 搜：
+
+```text
+整个 multi_snapshot
+```
+
+会发现：
+
+```text
+Login 存在
+```
+
+于是：
+
+```text
+PASS
+```
+
+但它存在于**另一个页面**。
+
+所以当前 Preflight 更准确应该叫：
+
+> 全探索证据存在性检查
+
+还不是严格意义上的 step-level preflight。
+
+### Demo 下一版建议
+
+至少保存：
+
+```python
+{
+    "page_id": "p2",
+    "url": "...",
+    "snapshot": "...",
+}
+```
+
+然后 Planner/探索路径关联：
+
+```text
+step → page_id
+```
+
+Preflight：
+
+```python
+check(
+    target,
+    snapshot_of_expected_page
+)
+```
+
+不用现在立刻做完整状态机，但这是我认为你后面**结构化 Observation 最值得解决的问题之一**。
+
+---
+
+# 4. 有 scope ≠ 已成功消歧
+
+现在：
+
+```python
+elif count > 1 and role and not step.scope:
+    AMBIGUOUS_LOCATOR
+```
+
+
+
+意味着只要：
+
+```python
+step.scope is not None
+```
+
+Preflight 就认为这个歧义已经解决。
+
+但模型完全可能给：
+
+```json
+{
+  "scope": {
+    "has_text": "不存在的商品"
+  }
+}
+```
+
+或者：
+
+```text
+scope 匹配 3 个容器
+```
+
+目前 Preflight 都不会报。
+
+所以最终应该验证：
+
+```text
+scope match count
+       ↓
+0 → SCOPE_NOT_FOUND
+1 → 继续检查 target
+2+ → SCOPE_AMBIGUOUS
+
+scope 内 target
+       ↓
+0 → LOCATOR_NOT_FOUND
+1 → PASS
+2+ → AMBIGUOUS_LOCATOR
+```
+
+你的 Preflight 才真正和 Runner 的“三分法”一致。
+
+---
+
+# 5. 前端存在一个实际 XSS 点
+
+你虽然写了：
+
+```javascript
+escapeHtml(r.error)
+```
+
+这个很好。
+
+但是：
+
+```javascript
+innerHTML = `
+...
+<strong>${r.action}</strong>
+<span>${r.target || ""}</span>
+<span>${r.value || ""}</span>
+...
+`
+```
+
+这里的：
+
+```text
+r.action
+r.target
+r.value
+```
+
+没有 escape。
+
+而 DSL 编辑框允许用户手动修改。
+
+比如：
+
+```json
+{
+  "value": "<img src=x onerror=alert(1)>"
+}
+```
+
+执行报告把它原样返回，再塞进 `innerHTML`，就可能执行。
+
+最简单：
+
+```javascript
+escapeHtml(String(r.action || ""))
+escapeHtml(
+    typeof r.target === "object"
+        ? JSON.stringify(r.target)
+        : String(r.target || "")
+)
+escapeHtml(String(r.value || ""))
+```
+
+更好的方式是不要拼 `innerHTML`，用：
+
+```javascript
+element.textContent = ...
+```
+
+---
+
+# P1：接下来很值得优化的地方
+
+### 6. Artifact 文件接口需要防路径穿越
+
+现在：
+
+```python
+path = ARTIFACTS_DIR / run_id / filename
+return FileResponse(path)
+```
+
+
+
+如果以后服务暴露出去，不应该直接信任：
+
+```text
+run_id
+filename
+```
+
+至少：
+
+```python
+base = ARTIFACTS_DIR.resolve()
+path = (base / run_id / filename).resolve()
+
+if base not in path.parents:
+    raise HTTPException(404)
+```
+
+同时限制：
+
+```text
+run_id
+filename
+```
+
+格式。
+
+---
+
+## 7. `run-N` 会有并发冲突
+
+现在：
+
+```python
+run_id = len(list(
+    ARTIFACTS_DIR.glob("run-*")
+)) + 1
+```
+
+
+
+两个请求同时进来：
+
+```text
+Request A → 当前 10 个
+Request B → 当前 10 个
+
+A → run-11
+B → run-11
+```
+
+建议直接：
+
+```python
+from uuid import uuid4
+
+run_id = uuid4().hex[:12]
+```
+
+例如：
+
+```text
+run-a81f2219c890
+```
+
+---
+
+# 8. Locator 的 `count()` 会牺牲 Playwright 自动等待能力
+
+目前：
+
+```python
+count = locator.count()
+
+if count == 1:
+    return locator
+```
+
+
+
+对 SPA：
+
+```text
+当前 0 个
+↓
+100ms 后按钮出现
+```
+
+你会立即判：
+
+```text
+LocatorNotFound
+```
+
+但 `click()` 本来会自动等待。
+
+所以这句注释：
+
+> click/input 要求元素已经存在
+
+其实会让你的执行器比原生 Playwright **更容易 flaky**。
+
+Demo 可以改成：
+
+```python
+try:
+    locator.first.wait_for(
+        state="attached",
+        timeout=timeout_ms,
+    )
+except Exception:
+    continue
+
+count = locator.count()
+
+if count == 1:
+    return strategy, locator
+
+if count > 1:
+    raise LocatorAmbiguousError(...)
+```
+
+这里 `.first` 只是：
+
+> 等待至少有一个候选出现
+
+**不是最终选择第一个元素。**
+
+最终仍然通过 count 保证唯一性。
+
+---
+
+# 9. `assert_url` 应该使用自动重试断言
+
+你现在：
+
+```python
+if expected not in page.url:
+    raise AssertionError(...)
+```
+
+是立即判断。
+
+例如：
+
+```text
+click Login
+↓
+页面开始导航
+↓
+立刻 assert_url
+↓
+URL 尚未变化
+↓
+false failure
+```
+
+建议：
+
+```python
+expect(page).to_have_url(
+    re.compile(re.escape(expected)),
+    timeout=step.timeout_ms,
+)
+```
+
+这对你现在 Planner 经常在：
+
+```text
+assert_visible
+vs
+assert_url
+```
+
+之间波动尤其重要。
+
+---
+
+# 10. `_text_scope_containers().first` 和你“三分法”原则冲突
+
+现在：
+
+```python
+base = page.get_by_text(text).first
+```
+
+
+
+你的项目一直强调：
+
+> 歧义绝不自动选第一个。
+
+但 scope 恰好在这里自动选了第一个。
+
+如果：
+
+```text
+Blue Top
+```
+
+出现两处：
+
+```text
+商品列表
+购物车推荐
+```
+
+可能直接选错业务容器。
+
+建议：
+
+```text
+scope anchor 0 → NOT_FOUND
+scope anchor 1 → 使用
+scope anchor N → 对每个 anchor 建 candidate container，
+                 再检查哪个 container 内 target 唯一
+```
+
+这和你的 Candidate Resolver 思路完全一致。
+
+---
+
+# 11. `discovered_pages` 只按 URL 去重，会丢 SPA 状态
+
+这里：
+
+```python
+if not any(
+    p["url"] == url
+    for p in state.discovered_pages
+):
+    append(...)
+```
+
+
+
+对于 SauceDemo：
+
+```text
+/inventory.html
+↓
+Add to cart
+↓
+/inventory.html
+```
+
+URL 没变，但：
+
+```text
+Add to cart
+→ Remove
+```
+
+Snapshot 已经发生重要变化。
+
+你却不会保存第二个状态。
+
+这会直接影响：
+
+> Planner 是否能知道点击后的验证证据。
+
+建议升级为：
+
+```text
+Observation ≠ Page URL
+```
+
+而是：
+
+```python
+{
+    "url": url,
+    "snapshot_hash": hash(snapshot),
+    "snapshot": snapshot,
+}
+```
+
+URL 相同、snapshot 变化，也保存。
+
+控制数量：
+
+```text
+MAX_OBSERVATIONS = 10
+MAX_STATES_PER_URL = 3
+```
+
+这项我会放在你“结构化 Observation”改造里。
+
+---
+
+# 12. Explore 的历史 ref 会失去语义
+
+当前历史传 LLM：
+
+```text
+click e3
+fill e2
+```
+
+
+
+问题是：
+
+```text
+页面1 e3 = Login
+页面2 e3 = Add to cart
+```
+
+ref 每次 observation 都重新编号。
+
+所以历史里的 `e3` 没有什么长期意义。
+
+建议输出：
+
+```text
+obs1:e3 → button "Login"
+obs2:e3 → button "Add to cart"
+```
+
+最简单甚至不用 obs_id：
+
+```text
+click button "Login"
+fill textbox "Username"
+```
+
+history 给 LLM 看语义比 ref 更有意义。
+
+---
+
+# 13. DECIDE_PROMPT 有一句已经过期
+
+现在 Prompt 还写：
+
+```text
+value:
+fill 要填入的值（用户目标里给出的测试数据，用真实值）
+```
+
+
+
+但是你的设计现在已经是：
+
+```text
+LLM → ${password}
+Executor → secret_sauce
+```
+
+所以应该立刻改：
+
+```text
+fill 的 value 必须使用 ${var} 占位符；
+不得要求、猜测或输出真实敏感值。
+真实值由 Executor 从 runtime_inputs 注入。
+```
+
+这是文档和实现一致性问题。
+
+---
+
+# 14. 你的凭据正则会误伤 URL
+
+这里：
+
+```python
+re.compile(
+    r'(\S+)\s*/\s*([^\s，,。;；]+)'
+)
+```
+
+
+
+可以把：
+
+```text
+https://example.com
+```
+
+中的 `/` 解释成：
+
+```text
+username / password
+```
+
+某些输入下会把 URL 部分错误脱敏。后面的代码确实直接拿这个 pattern 做 fallback。
+
+建议至少要求 `/` 两边有空格：
+
+```python
+re.compile(
+    r'([^\s/]+)\s+/\s+([^\s，,。;；]+)'
+)
+```
+
+更稳：
+
+```python
+re.compile(
+    r'(?:login\s+with|账号|用户名)'
+    r'\s*[:：]?\s*'
+    r'([^\s,/]+)'
+    r'\s+/\s+'
+    r'([^\s,，。;；]+)',
+    re.IGNORECASE,
+)
+```
+
+并补一个回归测试：
+
+```text
+https://example.com
+```
+
+绝对不能产生：
+
+```text
+username/password
+```
+
+---
+
+# 15. DSL 的 Pydantic 校验还不算真正“安全边界”
+
+目前 DSLStep 主要只是：
+
+```python
+action: Literal[...]
+target: ...
+scope: ...
+value: ...
+timeout_ms: int
+```
+
+
+
+所以这些都能通过：
+
+```json
+{
+  "action": "click",
+  "target": null
+}
+```
+
+```json
+{
+  "action": "goto",
+  "value": null
+}
+```
+
+```json
+{
+  "action": "assert_url"
+}
+```
+
+```json
+{
+  "action": "fill",
+  "target": {"role": null}
+}
+```
+
+Pydantic 类型合法，但**业务语义非法**。
+
+建议加 `model_validator`：
+
+```python
+if action == "goto":
+    require(value)
+
+elif action in {
+    "click",
+    "check",
+    "wait_for",
+    "assert_visible",
+}:
+    require(target)
+
+elif action in {"fill", "select"}:
+    require(target, value)
+
+elif action == "assert_text":
+    require(value)
+
+elif action == "assert_url":
+    require(value)
+```
+
+同时：
+
+```python
+timeout_ms: int = Field(
+    default=15000,
+    ge=100,
+    le=60000,
+)
+```
+
+Locator 也应该保证：
+
+```text
+至少存在：
+role+name / text / test_id / css
+```
+
+---
+
+# 16. 建议所有 Pydantic Model `extra="forbid"`
+
+现在 LLM 输出：
+
+```json
+{
+  "target": {
+    "role": "button",
+    "name": "Login",
+    "xpath": "xxxx"
+  }
+}
+```
+
+Pydantic 默认可能直接把未知字段忽略。
+
+这会产生一种危险情况：
+
+> LLM 觉得 xpath 生效了，代码其实把它悄悄丢了。
+
+建议：
+
+```python
+from pydantic import ConfigDict
+
+class Locator(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid"
+    )
+```
+
+Scope、DSLStep、DSLCase 等同理。
+
+---
+
+# 17. 默认 list / dict 建议全部改 `default_factory`
+
+目前：
+
+```python
+input_values: dict = {}
+```
+
+
+
+以及：
+
+```python
+input_contract: list[InputContractItem] = []
+```
+
+
+
+Pydantic 通常会处理模型默认值复制，但工程习惯仍建议明确：
+
+```python
+input_values: dict[str, str] = Field(
+    default_factory=dict
+)
+
+input_contract: list[InputContractItem] = Field(
+    default_factory=list
+)
+```
+
+更清楚，也不会给代码评审留下 mutable default 的疑问。
+
+---
+
+# 18. Executor 建议默认 fail-fast
+
+现在：
+
+> 一步失败仍然继续所有后续步骤。
+
+
+
+例如：
+
+```text
+Step2 登录失败
+Step3 进入商品页失败
+Step4 Add cart 失败
+Step5 assert 失败
+```
+
+最终报告：
+
+```text
+4 个失败
+```
+
+实际上根因只有：
+
+```text
+登录失败
+```
+
+后面的失败是 cascading failure。
+
+建议：
+
+```python
+execute_case(
+    ...,
+    continue_on_failure=False,
+)
+```
+
+默认：
+
+```text
+前一步失败
+↓
+剩余步骤 = skipped
+```
+
+报告：
+
+```text
+Step2 failed
+Step3 skipped: previous step failed
+Step4 skipped
+```
+
+调试质量会明显提升。
+
+---
+
+# 19. 你的诊断脚本还有一个指标 bug
+
+这个挺值得修。
+
+`semantic_signature()` 会把**所有 step**都加入：
+
+```python
+sig.append({
+    "action": ...,
+    ...
+})
+```
+
+然后：
+
+```python
+action_hash()
+```
+
+直接 hash 整个 `semantic_signature`。
+
+因此：
+
+```text
+最后 assert 不一样
+```
+
+也会导致：
+
+```text
+action_hash 不一样
+```
+
+但你又单独做了：
+
+```text
+verify_hash
+```
+
+所以两个指标现在不是独立的。
+
+你之前：
+
+```text
+Run3
+action_hash 不同
+verify_hash 不同
+```
+
+很可能**核心 interaction actions 其实完全一样**，只是最终 verification 不一样。
+
+应该：
+
+```python
+def action_signature(case):
+    return [
+        normalize(s)
+        for s in case["steps"]
+        if s["action"] not in {
+            "assert_visible",
+            "assert_text",
+            "assert_url",
+        }
+    ]
+```
+
+这样才真正得到：
+
+```text
+core_action_stability
+```
+
+我甚至怀疑你目前：
+
+```text
+3/4 core action stability
+```
+
+修完后可能直接变：
+
+```text
+4/4
+```
+
+---
+
+# 20. Normalizer 要小心“为了稳定而改变测试语义”
+
+现在：
+
+```python
+只保留最后一个断言
+```
+
+
+
+对于简单 Demo：
+
+```text
+login → add cart
+```
+
+没问题。
+
+但是用户如果说：
+
+```text
+登录后验证 Products，
+加入购物车后验证 Cart badge，
+进入 Cart 后验证商品名称
+```
+
+你会把前两个 assertion 都删掉。
+
+这就不再是：
+
+> normalization
+
+而是在：
+
+> 修改用户测试语义。
+
+所以建议把这个策略明确限定：
+
+```text
+single-goal demo
+→ exactly one final verification
+
+multi-goal case
+→ 每个 goal 允许一个 verification
+```
+
+暂时不想做 goal decomposition 的话，也至少记录：
+
+```python
+removed_assertions
+```
+
+不要静默删。
+
+---
+
+# 安全方面还有一个上线前必须处理的点
+
+你的后端允许 DSL：
+
+```python
+page.goto(step.value)
+```
+
+
+
+用户又能手工修改 DSL。
+
+如果未来把服务放服务器上，这实际上可以让浏览器尝试访问：
+
+```text
+127.0.0.1
+localhost
+内网 IP
+云 metadata endpoint
+```
+
+也就是 Web Testing 平台常见的 **SSRF / 内网探测边界问题**。
+
+本地 Demo 暂时问题不大，但上线必须：
+
+```text
+只允许 http/https
++
+限制目标 origin
++
+阻止 private/link-local IP
++
+必要时项目级域名 allowlist
+```
+
+而且探索里的“禁止危险操作”目前只是 Prompt：
+
+```text
+禁止删除、支付、提交订单
+```
+
+
+
+真正的安全边界还应该在 Executor 再挡一次。
+
+---
+
+# 我建议你下一步的修改顺序
+
+1. **修 `remaining_issues` KeyError。**
+2. **修 `_call_llm(system_prompt=None)` 角色串线。**
+3. **修 diagnostics 的 `action_hash`。**
+4. **改 `assert_url` 为自动等待。**
+5. **修 credential `/` 正则。**
+6. **强化 DSL Pydantic action-level validation。**
+7. **scope 本身也执行 0/1/N 三分验证。**
+8. **Observation 从 URL 唯一升级为 URL + state snapshot。**
+9. **再做 page-aware Preflight。**
+10. **最后处理 XSS、artifact path、SSRF 等部署边界。**
+
+其中 **1～5 都是小改动，但收益非常高**。
+
+从目前代码状态看，我反而不建议你继续往里塞新功能。你现在最有价值的是把已有这条链：
+
+```text
+Observe
+→ Explore
+→ Plan
+→ Normalize
+→ Preflight
+→ Repair
+→ Execute
+→ Diagnose
+```
+
+做得真正严谨。

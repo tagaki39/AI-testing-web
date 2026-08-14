@@ -1,0 +1,1366 @@
+整体设计已经比普通 Demo 成熟不少，尤其是“探索 → grounded 生成 → Preflight → repair”的闭环是对的。
+
+但现在这 5 个 prompt 里有一个共性问题：
+
+> **你在用 Prompt 约束模型，但还没有把“哪些事情必须由代码保证”彻底分开。**
+
+这会导致某些场景下模型仍然能“合法地胡说”。
+
+我按严重程度来讲。
+
+## 一、最大的结构性问题：Prompt 规则和 DSL 能力不一致
+
+你在 `repair_prompt` 里说：
+
+```text
+存在多个同名元素时，scope 的值必须是页面中真实可见的文本
+```
+
+但你的 `SYSTEM_PROMPT` 示例 DSL 里根本没有 `scope` 字段：
+
+```json
+{
+  "action": "click",
+  "target": "button=登录"
+}
+```
+
+这意味着模型在初次生成时不知道 scope 是合法字段，只有 repair 阶段才知道。
+
+这是一个明显的 schema 漂移问题。
+
+### 解决方案
+
+把 DSL schema 在 System Prompt 里一次定义完整。
+
+例如：
+
+```json
+{
+  "action": "click",
+  "target": {
+    "strategy": "role",
+    "role": "button",
+    "name": "Add to cart"
+  },
+  "scope": {
+    "strategy": "text",
+    "text": "Blue Top"
+  }
+}
+```
+
+或者你坚持字符串 DSL，也至少：
+
+```json
+{
+  "action": "click",
+  "target": "button=Add to cart",
+  "scope": "text=Blue Top"
+}
+```
+
+否则 repair 会不断创造 System Prompt 没定义的字段。
+
+---
+
+# 二、`EXTRACT_URL_PROMPT`：不值得用 LLM
+
+你现在的理由是：
+
+> `saucedemo.com` 无协议，正则提取不到，LLM 能补全。
+
+这里不太成立。
+
+这其实完全可以代码解决，而且更稳定。
+
+例如：
+
+```python
+import re
+from urllib.parse import urlparse
+
+DOMAIN_RE = re.compile(
+    r'(?:(?:https?://)?(?:www\.)?)'
+    r'([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)'
+    r'(?:/[^\s]*)?'
+)
+```
+
+然后：
+
+```python
+def normalize_url(raw: str) -> str | None:
+    match = DOMAIN_RE.search(raw)
+    if not match:
+        return None
+
+    value = match.group(0)
+
+    if not value.startswith(("http://", "https://")):
+        value = "https://" + value
+
+    return value
+```
+
+### 当前方案的问题
+
+LLM 可能：
+
+* 自动补 `www.`，但真实站点没有；
+* 自动补 `https://`，但开发环境其实是 `http://localhost`;
+* 从需求里选错 URL；
+* 把文档链接当被测入口；
+* 产生一个用户根本没提供的域名。
+
+### 推荐
+
+URL 提取改成：
+
+```text
+代码优先
+↓
+解析失败
+↓
+再考虑 LLM fallback
+```
+
+而不是每次都调用 LLM。
+
+这还能省一次模型调用。
+
+---
+
+# 三、`DECIDE_PROMPT` 最大问题：让 LLM 自己判断 goal_met 太主观
+
+现在：
+
+```text
+当页面已具备完成用户目标所需的信息时，
+goal_met=true
+```
+
+问题是：
+
+> “具备完成目标所需的信息”和“目标真的完成”不是同一件事。
+
+例如目标：
+
+```text
+登录后验证库存页面能正常显示
+```
+
+Agent 到了 login 页面，看到了用户名、密码、登录按钮。
+
+它可能认为：
+
+> 已具备完成测试所需的信息。
+
+然后 `finish`。
+
+但实际上登录还没执行。
+
+再例如：
+
+```text
+加入购物车并验证商品存在
+```
+
+看到 Add to cart 按钮并不意味着目标已经完成。
+
+### 更好的做法
+
+把：
+
+```json
+"goal_met": true
+```
+
+改成两个概念：
+
+```json
+{
+  "exploration_complete": false,
+  "reason": "...",
+  "action": "..."
+}
+```
+
+探索阶段判断的应该是：
+
+> **是否已经收集到足够信息来生成测试 DSL。**
+
+而不是：
+
+> 用户目标是否已经达成。
+
+这是非常重要的区别。
+
+你的 explore_flow 本质上不是正式测试 Runner，而是：
+
+```text
+发现页面路径和元素
+```
+
+所以命名建议：
+
+```text
+goal_met
+```
+
+改成：
+
+```text
+enough_evidence
+```
+
+或：
+
+```text
+exploration_complete
+```
+
+更准确。
+
+---
+
+# 四、`DECIDE_PROMPT` 的 target schema 还是太松
+
+现在：
+
+```json
+"target": {"role": "button", "name": "..."} 
+或 
+{"text": "..."}
+```
+
+问题是模型还可以生成：
+
+```json
+{
+  "role": "heading",
+  "name": "Home"
+}
+```
+
+即使 snapshot 没有这个 heading。
+
+虽然你写了：
+
+```text
+target 必须基于当前页面快照中真实存在的元素
+```
+
+但这是自然语言约束，不是强约束。
+
+### 更好的设计：元素引用 ID
+
+探索器应该把页面结构转换为：
+
+```json
+[
+  {
+    "ref": "e1",
+    "role": "button",
+    "name": "Sign in"
+  },
+  {
+    "ref": "e2",
+    "role": "textbox",
+    "name": "Username"
+  },
+  {
+    "ref": "e3",
+    "type": "text",
+    "text": "Products"
+  }
+]
+```
+
+然后 LLM 只输出：
+
+```json
+{
+  "action": "click",
+  "target_ref": "e1"
+}
+```
+
+这样模型根本没有机会创造：
+
+```text
+heading=Home
+```
+
+你的 Prompt 从：
+
+> “请不要幻觉”
+
+升级为：
+
+> “你没有权限创造元素。”
+
+这是可靠性提升最大的改造之一。
+
+---
+
+# 五、探索阶段直接把密码放进 LLM 上下文，有风险
+
+你写：
+
+> 探索用真实值，探索需要真实登录才能前进。
+
+逻辑上没错。
+
+但现在：
+
+```text
+用户目标: {goal}
+```
+
+可能直接包含：
+
+```text
+账号 admin@example.com
+密码 MyPassword123
+```
+
+然后整个用户 prompt 被发给模型。
+
+实际上 Agent 只需要知道：
+
+```text
+这里需要填 password
+```
+
+真正的密码完全可以由 Executor 在本地注入。
+
+### 推荐架构
+
+LLM 输出：
+
+```json
+{
+  "action": "fill",
+  "target_ref": "e3",
+  "value_ref": "password"
+}
+```
+
+执行器：
+
+```python
+real_value = runtime_inputs["password"]
+```
+
+这样：
+
+```text
+LLM看到：
+${password}
+
+Playwright看到：
+真实密码
+```
+
+而不是：
+
+```text
+LLM也看到真实密码
+```
+
+即使是 Demo，这个设计在面试里都更好讲：
+
+> Secrets remain outside the model context.
+
+---
+
+# 六、`wait` 动作设计不明确
+
+`DECIDE_PROMPT` 中：
+
+```text
+wait
+```
+
+但没有定义：
+
+> wait 什么？
+
+模型可能输出：
+
+```json
+{
+  "action": "wait",
+  "value": "5秒"
+}
+```
+
+或者：
+
+```json
+{
+  "action": "wait",
+  "target": null
+}
+```
+
+这会导致执行器语义模糊。
+
+### 不推荐固定 sleep
+
+例如：
+
+```python
+await page.wait_for_timeout(5000)
+```
+
+这不是好的测试设计。
+
+### 建议改成
+
+探索动作：
+
+```text
+wait_for_load
+```
+
+或者直接让 Executor 在：
+
+```text
+click
+fill
+press
+```
+
+后自动做稳定性等待。
+
+比如：
+
+```python
+await page.wait_for_load_state("domcontentloaded")
+```
+
+必要时重新获取 snapshot。
+
+因此第一版甚至可以直接删除 `wait`。
+
+你的动作集：
+
+```text
+click
+fill
+press
+back
+finish
+```
+
+已经够 Demo。
+
+---
+
+# 七、`press` 也缺少 key schema
+
+现在：
+
+```json
+{
+  "action": "press",
+  "value": "..."
+}
+```
+
+应该明确允许值：
+
+```text
+Enter
+Escape
+Tab
+ArrowDown
+ArrowUp
+```
+
+否则模型可能输出：
+
+```text
+按下回车
+```
+
+或者：
+
+```text
+return
+```
+
+Executor 还得猜。
+
+建议：
+
+```json
+{
+  "action": "press",
+  "key": "Enter"
+}
+```
+
+并用枚举校验。
+
+---
+
+# 八、SYSTEM_PROMPT 最大的问题：DSL 太字符串化
+
+目前：
+
+```text
+button=登录
+textbox=用户名
+heading=首页
+```
+
+短期简单，但后面会成为技术债。
+
+因为你马上就需要：
+
+```text
+exact
+scope
+testid
+css
+nth
+has_text
+role
+name
+```
+
+然后字符串会变成：
+
+```text
+button=Add to cart inside=Blue Top exact=true
+```
+
+接着你就开始自己发明一门解析语言。
+
+没必要。
+
+### 建议现在就改成结构化 target
+
+例如：
+
+```json
+{
+  "action": "click",
+  "target": {
+    "strategy": "role",
+    "role": "button",
+    "name": "Login",
+    "exact": true
+  }
+}
+```
+
+文本：
+
+```json
+{
+  "strategy": "text",
+  "text": "Products",
+  "exact": true
+}
+```
+
+test id：
+
+```json
+{
+  "strategy": "test_id",
+  "value": "login-button"
+}
+```
+
+scope：
+
+```json
+{
+  "scope": {
+    "strategy": "text",
+    "text": "Blue Top"
+  },
+  "target": {
+    "strategy": "role",
+    "role": "button",
+    "name": "Add to cart"
+  }
+}
+```
+
+这会让：
+
+* Pydantic 校验
+* Preflight
+* Repair
+* Executor
+* 日志
+
+全部简单很多。
+
+---
+
+# 九、SYSTEM_PROMPT 的变量规则和 grounded_prompt 冲突
+
+SYSTEM 说：
+
+```text
+用户没提供的登录信息，用 input_contract 定义变量
+```
+
+grounded 说：
+
+```text
+用户提供的测试数据用 ${var} 占位，并加入 input_contract
+```
+
+这两个语义不是一回事。
+
+一个说：
+
+> 没提供的才变量化。
+
+另一个说：
+
+> 提供了的也变量化。
+
+模型会有冲突。
+
+### 建议统一
+
+最好明确：
+
+> **所有可变测试输入都参数化。**
+
+例如：
+
+```text
+用户提供了：
+username=test@example.com
+
+→ input_contract default=test@example.com
+
+用户没提供：
+password
+
+→ input_contract required=true，无 default
+```
+
+这才是一套一致规则。
+
+---
+
+# 十、input_contract 当前 schema 太弱
+
+现在：
+
+```json
+[
+  {
+    "key": "变量名",
+    "value": "默认值"
+  }
+]
+```
+
+建议至少：
+
+```json
+{
+  "key": "password",
+  "type": "string",
+  "required": true,
+  "secret": true,
+  "default": null
+}
+```
+
+这样未来支持：
+
+```text
+number
+boolean
+file
+secret
+enum
+```
+
+都方便。
+
+例如：
+
+```json
+{
+  "key": "username",
+  "type": "string",
+  "required": true,
+  "secret": false,
+  "default": "standard_user"
+}
+```
+
+---
+
+# 十一、grounded_prompt 的探索路径描述不够强
+
+当前：
+
+```text
+探索路径（已按此流程访问过以下页面）:
+- click ...
+- fill ...
+```
+
+LLM 可能把探索路径照抄进测试。
+
+但 explore 阶段有些动作其实只是为了调查页面，不一定应该成为正式测试步骤。
+
+例如：
+
+```text
+点击菜单
+返回
+点击另一个菜单
+返回
+```
+
+这些是探索动作，不应该全部进入最终 DSL。
+
+### 需要加一句
+
+```text
+探索路径仅作为页面导航和元素发现证据。
+不要机械复制全部探索动作；
+只保留完成用户测试目标所必要的最短、稳定步骤。
+```
+
+这是非常值得加的一条。
+
+---
+
+# 十二、grounded_prompt 最大隐患：4000 字符 snapshot 截断
+
+你前面说 snapshot 截断到 4000 字符。
+
+这是一个很容易出现隐性 bug 的地方。
+
+比如重要按钮位于 snapshot 后半段：
+
+```text
+前 4000 chars:
+导航
+商品
+商品
+商品
+...
+
+第 4500:
+button "Checkout"
+```
+
+LLM 永远看不到 Checkout。
+
+然后你会误以为：
+
+> 模型 hallucination。
+
+实际上是 context 被截掉了。
+
+### 更好的做法
+
+不要简单：
+
+```python
+snapshot[:4000]
+```
+
+应该：
+
+```text
+结构化裁剪
+```
+
+优先保留：
+
+1. 当前可交互元素
+2. headings / landmarks
+3. 与 goal 关键词匹配的节点
+4. form controls
+5. links/buttons
+6. 少量上下文文本
+
+例如：
+
+```text
+完整 snapshot
+↓
+Parser
+↓
+Interaction summary
+↓
+LLM
+```
+
+像：
+
+```json
+{
+  "url": "...",
+  "title": "...",
+  "interactive": [
+    {"ref":"e1","role":"button","name":"Login"},
+    {"ref":"e2","role":"textbox","name":"Username"}
+  ],
+  "landmarks": [...],
+  "relevant_text": [...]
+}
+```
+
+这比直接截字符串稳定非常多。
+
+---
+
+# 十三、你关于 `text: xxx` 的规则还是太针对案例
+
+现在：
+
+```text
+快照中以 'text: xxx' 形式出现的标题
+必须用 text=xxx
+```
+
+这属于：
+
+> SauceDemo bug patch。
+
+不应该成为通用设计核心。
+
+更通用的规则是：
+
+```text
+Locator 必须严格依据 snapshot 中实际观察到的语义。
+不得根据视觉样式或文本含义自行推断 ARIA role。
+
+仅当 snapshot 明确存在 role=heading 时，
+才允许生成 heading 定位；
+普通文本必须使用 text 定位。
+```
+
+同理可以防：
+
+```text
+文本 → button
+文本 → link
+div → checkbox
+```
+
+建议把这一原则放到 SYSTEM_PROMPT，而不是只放 grounded/repair。
+
+因为这是整个项目的核心 invariant。
+
+---
+
+# 十四、Preflight 的逻辑应该比 Repair Prompt 更重要
+
+你现在的 repair 很依赖：
+
+```text
+LLM 修正错误
+```
+
+实际上最关键的应该是 Preflight 本身能够输出**机器可理解的问题类型**。
+
+不要只生成：
+
+```text
+'button=Add to cart': 页面存在6个同名button
+```
+
+最好生成：
+
+```json
+{
+  "step": 4,
+  "type": "AMBIGUOUS_LOCATOR",
+  "target": {
+    "role": "button",
+    "name": "Add to cart"
+  },
+  "match_count": 6,
+  "candidate_scopes": [
+    "Blue Top",
+    "Red Shirt",
+    "Green Jacket"
+  ]
+}
+```
+
+或者：
+
+```json
+{
+  "type": "ROLE_NOT_FOUND",
+  "requested": {
+    "role": "heading",
+    "name": "Products"
+  },
+  "alternatives": [
+    {
+      "strategy": "text",
+      "text": "Products"
+    }
+  ]
+}
+```
+
+然后 repair_prompt 只是：
+
+> 在给定候选里选择。
+
+而不是：
+
+> 再让 LLM 自己想。
+
+---
+
+# 十五、“完整重生”其实比局部修补风险更大
+
+你当前：
+
+> 输出完整的修正后 DSL，其余步骤保持不变。
+
+这是一个常见问题。
+
+模型可能：
+
+* 修了 step 3；
+* 顺手改了 step 1；
+* 删除 step 5；
+* 更改变量名；
+* 改 base_url；
+* 改测试逻辑。
+
+即使提示：
+
+```text
+其余步骤保持不变
+```
+
+也不能保证。
+
+### 更安全的方式
+
+让 Repair 只返回 patch：
+
+```json
+{
+  "repairs": [
+    {
+      "step_index": 3,
+      "target": {
+        "strategy": "role",
+        "role": "button",
+        "name": "Add to cart"
+      },
+      "scope": {
+        "strategy": "text",
+        "text": "Blue Top"
+      }
+    }
+  ]
+}
+```
+
+程序本地应用：
+
+```python
+dsl.steps[3].target = patch.target
+dsl.steps[3].scope = patch.scope
+```
+
+这会比整份重生稳定很多。
+
+这是我非常推荐你改的一点。
+
+---
+
+# 十六、Preflight 最好不要只验证“存在/歧义”
+
+至少还应该检查：
+
+```text
+0 matches
+>1 matches
+元素是否可见
+action 与元素类型是否合理
+变量是否已声明
+goto URL 是否允许
+scope 是否唯一
+assert 是否有可验证目标
+```
+
+例如：
+
+```text
+input → button
+```
+
+即使定位器唯一，也明显错误。
+
+可以定义：
+
+```text
+INPUT:
+允许 textbox / searchbox / combobox
+
+CLICK:
+允许 button / link / checkbox / generic clickable
+
+WAIT_FOR:
+允许任何可定位元素
+```
+
+---
+
+# 十七、assert_text 太弱
+
+目前：
+
+```json
+{
+  "action": "assert_text",
+  "value": "要验证的文字"
+}
+```
+
+这意味着：
+
+> 页面任何地方出现这个文字都算通过。
+
+很容易产生误判。
+
+例如：
+
+```text
+登录失败页面：
+"Welcome" 出现在 footer
+```
+
+assert 还是通过。
+
+建议支持：
+
+```json
+{
+  "action": "assert_text",
+  "target": {
+    "strategy": "test_id",
+    "value": "page-title"
+  },
+  "value": "Products"
+}
+```
+
+或者至少新增：
+
+```text
+assert_visible
+assert_url
+assert_text
+```
+
+尤其：
+
+```text
+assert_url
+```
+
+成本很低，测试登录流程非常实用。
+
+---
+
+# 十八、缺少“禁止副作用”的探索规则
+
+Explore Agent 会点击页面。
+
+这其实有安全问题。
+
+比如页面有：
+
+```text
+Delete account
+Pay now
+Submit order
+Remove project
+```
+
+Agent 如果只是为了探索，不能随便点。
+
+你现在只写：
+
+```text
+target 必须真实存在
+```
+
+没有限制 destructive actions。
+
+### 强烈建议 DECIDE_PROMPT 加：
+
+```text
+探索阶段禁止执行明显具有不可逆副作用的操作，
+包括删除、支付、提交订单、发布、发送、注销账户等。
+
+除非用户测试目标明确要求该动作。
+```
+
+再进一步由代码维护高风险关键词：
+
+```python
+DESTRUCTIVE_PATTERNS = [
+    "delete",
+    "remove",
+    "pay",
+    "purchase",
+    "submit order",
+    "send",
+    "publish",
+]
+```
+
+让 Executor 二次检查。
+
+---
+
+# 十九、缺少“不要离开被测域名”
+
+Explore 可能点击：
+
+```text
+Documentation
+GitHub
+Privacy Policy
+Google Login
+```
+
+然后跑到外站。
+
+建议加：
+
+```text
+除非用户目标明确需要跨域认证，
+探索不得离开 entry_url 的 origin。
+```
+
+Executor 再做：
+
+```python
+allowed_origin = urlparse(entry_url).netloc
+```
+
+点击后发现跨域就回退。
+
+---
+
+# 二十、Prompt hierarchy 还可以更清晰
+
+现在 SYSTEM_PROMPT 很短，而关键规则分散在：
+
+```text
+SYSTEM
+grounded
+repair
+```
+
+长期会产生漂移。
+
+推荐划分：
+
+### SYSTEM
+
+放永远不变的规则：
+
+```text
+DSL schema
+action whitelist
+locator semantics
+禁止 hallucination
+变量化规则
+安全约束
+```
+
+### USER / grounded
+
+只放本次任务：
+
+```text
+用户目标
+entry_url
+snapshot
+exploration path
+runtime inputs
+```
+
+### repair
+
+只放：
+
+```text
+原 DSL
+validation issues
+candidate fixes
+```
+
+不要在 repair 里重复很多 SYSTEM 规则。
+
+否则后面你改了一份，忘了另外两份。
+
+---
+
+# 我会把你的 5 Prompt 架构改成这样
+
+```text
+① URL Resolver
+优先代码，不调用 LLM
+
+② Explore Decision Prompt
+目标：
+收集足够 evidence，而不是完成正式测试
+
+输入：
+goal
+current_url
+element refs
+history
+
+输出：
+action + target_ref
+
+③ DSL SYSTEM Prompt
+唯一权威 DSL schema
++ grounding rules
++ security rules
++ variable rules
+
+④ DSL Generation Context
+只注入：
+goal
+pages
+element refs
+exploration evidence
+
+⑤ Repair Prompt
+输入：
+原 DSL
+结构化 validation issues
+candidate fixes
+
+输出：
+patches only
+```
+
+最终链路：
+
+```text
+用户需求
+   ↓
+URL parser
+   ↓
+Explore
+Observe → Decide → Act
+   ↓
+Evidence Set
+   ↓
+Planner
+   ↓
+DSL
+   ↓
+Schema Validation
+   ↓
+Preflight
+   ↓
+Repair Patch
+   ↓
+Preflight
+   ↓
+Runner
+```
+
+## 如果按优先级改，我建议先改这 8 项
+
+| 优先级 | 修改                                  |    价值 |
+| --- | ----------------------------------- | ----: |
+| P0  | target 改结构化 schema                  | ⭐⭐⭐⭐⭐ |
+| P0  | Repair 改 patch，而不是整份重生              | ⭐⭐⭐⭐⭐ |
+| P0  | Explore 使用 element ref              | ⭐⭐⭐⭐⭐ |
+| P0  | `goal_met` 改 `exploration_complete` | ⭐⭐⭐⭐⭐ |
+| P1  | 用户数据/密码不要进入 LLM                     |  ⭐⭐⭐⭐ |
+| P1  | scope 加入正式 DSL schema               |  ⭐⭐⭐⭐ |
+| P1  | snapshot 不再按字符粗暴截断                  |  ⭐⭐⭐⭐ |
+| P1  | 加跨域/破坏性操作保护                         |  ⭐⭐⭐⭐ |
+
+你现在的 Prompt 已经不是“写得不好”，而是到了下一阶段：**应该减少 Prompt 承担的职责，把可靠性转移到 schema、validator、element refs 和执行器。**
+
+这是把 Demo 从“Prompt engineering 项目”升级成真正“Agent engineering 项目”的关键一步。
+
+用这个 7 Commit 版本
+顺序	Commit	主要内容
+1	refactor: replace LLM URL extraction with deterministic parser	URL 解析下沉代码
+2	refactor: introduce structured test DSL	Locator、scope、assert_visible、assert_url
+3	feat: add structured preflight and targeted repair	Issue Schema、candidate、patch repair
+4	feat: ground explorer actions with element refs	ref、observation_id、exploration_complete、origin 限制
+5	feat: isolate runtime inputs and secrets	InputContract、value_ref、敏感信息不进 LLM
+6	feat: harden executor semantics and exploration safety	press enum、移除模糊 wait、副作用保护
+7	refactor: build structured page observations	ARIA 解析、智能裁剪、relevant elements
+
+然后再单独来一个不计入功能改造的收尾：
+
+git commit -m "test: cover agent grounding and repair workflow"
+
+和：
+
+git commit -m "docs: document agent exploration architecture"
+最关键的依赖关系
+
+整个顺序实际是在构建：
+
+          DSL Schema
+              ↓
+      ┌───────┴────────┐
+      ↓                ↓
+  Preflight         Executor
+      ↓
+    Repair
+
+              ↑
+
+          Explorer
+              ↑
+     Structured Observation
+
+其中唯一一个值得讨论的是：
+
+Structured Observation
+
+到底在 Explorer 前还是后。
+
+实现层面，Explorer Element Ref 肯定需要一点 observation parsing。
+
+所以 Commit 4 可以先做一个最小版本：
+
+ARIA
+→ 提取 element ref
+
+Commit 7 再优化成：
+
+ARIA
+→ semantic parser
+→ relevance filtering
+→ token budgeting
+→ structured observation
+
+这样就不会有循环依赖。

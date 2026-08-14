@@ -1,0 +1,1001 @@
+整体思路**大约 70% 准确**，作为个人 Demo 的功能取舍也基本合理，但里面有几处技术判断和代码写法需要修正。最大的问题是：**低估了部分功能成本，同时把一些“看起来能运行”的方案说成了“稳定方案”。**
+
+## 总体结论
+
+建议保留这个优先级框架，但调整为：
+
+```text
+第一阶段：页面感知 + 稳定执行
+A11y/ARIA 页面快照
+→ 结构化 DSL
+→ 唯一定位与作用域消歧
+→ 定位失败诊断
+→ Trace 证据
+
+第二阶段：形成完整 Demo
+运行时变量
+→ SSE 日志
+→ 人工修正
+→ 测试报告
+
+第三阶段：可选增强
+自动修复
+→ storage_state 登录态
+→ VLM 视觉兜底
+```
+
+更合理的实施顺序是：
+
+```text
+③ 页面探索
+→ ② 作用域消歧
+→ ① 定位降级
+→ ⑦ Trace
+→ ⑤ 运行时变量
+→ ⑥ SSE
+→ ④ 人工修正
+```
+
+因为没有可靠的页面结构，所谓“定位降级”只是在多个错误定位器之间切换。
+
+---
+
+# ① 定位降级链：方向正确，示例代码不够安全
+
+原描述：
+
+```python
+if loc.count() > 0:
+    return loc
+```
+
+这个判断存在三个问题。
+
+## 问题一：`count() > 0` 不代表可以操作
+
+它只能说明当前匹配到元素，不代表元素：
+
+* 唯一
+* 可见
+* 可点击
+* 未被遮挡
+* 已启用
+* 适合当前动作
+
+例如一个按钮匹配到 6 个：
+
+```python
+page.get_by_text("提交").count() == 6
+```
+
+此时返回定位器，后续执行 `click()` 仍然会因为 Playwright 的 strict mode 失败。Playwright 官方也不推荐随意使用 `.first`、`.last` 或 `.nth` 绕过严格性检查，因为页面变化后可能点击错误元素。([Playwright][1])
+
+## 问题二：定位器本身是惰性的
+
+创建：
+
+```python
+loc = page.get_by_role(...)
+```
+
+并不等于已经找到元素。Playwright 会在执行动作时重新解析定位器，因此 `count()` 和后面的 `click()` 之间，页面可能已经重新渲染。([Playwright][1])
+
+## 问题三：CSS 不能直接使用任意 `target`
+
+这段代码：
+
+```python
+page.locator(f"css={target}")
+```
+
+只有当 `target` 本身就是合法 CSS 时才成立。
+
+如果 DSL 的 target 是：
+
+```text
+button=Login
+```
+
+它不是 CSS 选择器。
+
+## 更可靠的简化版
+
+```python
+from dataclasses import dataclass
+from playwright.async_api import Locator, Page
+
+
+class LocatorNotFoundError(Exception):
+    pass
+
+
+class LocatorAmbiguousError(Exception):
+    pass
+
+
+@dataclass
+class Target:
+    role: str | None = None
+    name: str | None = None
+    text: str | None = None
+    test_id: str | None = None
+    css: str | None = None
+
+
+async def resolve_locator(page: Page, target: Target) -> Locator:
+    candidates: list[tuple[str, Locator]] = []
+
+    if target.test_id:
+        candidates.append(
+            ("test_id", page.get_by_test_id(target.test_id))
+        )
+
+    if target.role and target.name:
+        candidates.append(
+            (
+                "role",
+                page.get_by_role(
+                    target.role,
+                    name=target.name,
+                    exact=True,
+                ),
+            )
+        )
+
+    if target.text:
+        candidates.append(
+            (
+                "text",
+                page.get_by_text(
+                    target.text,
+                    exact=True,
+                ),
+            )
+        )
+
+    if target.css:
+        candidates.append(
+            ("css", page.locator(target.css))
+        )
+
+    ambiguous: list[str] = []
+
+    for strategy, locator in candidates:
+        count = await locator.count()
+
+        if count == 1:
+            return locator
+
+        if count > 1:
+            ambiguous.append(f"{strategy}: {count} matches")
+
+    if ambiguous:
+        raise LocatorAmbiguousError("; ".join(ambiguous))
+
+    raise LocatorNotFoundError(str(target))
+```
+
+这里应该明确区分：
+
+```text
+0 个：未找到
+1 个：可继续
+2 个以上：歧义，不能自动选第一个
+```
+
+因此，①不是 10 行能够真正做好的功能。简易版约 30～60 行，包含异常分类、日志和作用域后大约 100 行。
+
+---
+
+# ② 作用域消歧：价值很高，但方案 B 不可靠
+
+这一项非常值得做。
+
+但这段：
+
+```python
+scope = page.get_by_text("Blue Top").first
+container = scope.locator("xpath=../..")
+```
+
+不够稳，因为：
+
+* `.first` 可能选错商品；
+* `../..` 依赖 DOM 层级；
+* 页面稍微改一层结构就失效；
+* “Blue Top”可能同时出现在标题、图片 alt、推荐区和购物车。
+
+更好的方式是让 DSL 明确表达容器与目标：
+
+```json
+{
+  "action": "click",
+  "scope": {
+    "role": "listitem",
+    "has_text": "Blue Top"
+  },
+  "target": {
+    "role": "button",
+    "name": "Add to cart"
+  }
+}
+```
+
+执行：
+
+```python
+container = page.get_by_role("listitem").filter(
+    has_text="Blue Top"
+)
+
+button = container.get_by_role(
+    "button",
+    name="Add to cart",
+    exact=True,
+)
+```
+
+或者页面存在稳定测试属性时：
+
+```python
+product = page.get_by_test_id("product-card").filter(
+    has_text="Blue Top"
+)
+```
+
+Playwright 支持 locator chaining 和过滤，优于向上爬固定两层 DOM。
+
+## “让 AI 生成唯一文本”不是更优方案
+
+这句话：
+
+```text
+button=Add to cart
+→ button=Add to cart (Blue Top)
+```
+
+只有自然语言上更完整，但不一定符合页面真实可访问名称。
+
+按钮真实 accessible name 仍然可能只是：
+
+```text
+Add to cart
+```
+
+Playwright 不会自动理解括号里的 `Blue Top` 是作用域。
+
+所以：
+
+> 作用域应进入 DSL，而不是只写进 prompt 文本。
+
+---
+
+# ③ A11y 树探索：方向对，但 API 描述已经不准确
+
+“不要把整个 DOM 丢给 LLM”是非常正确的。
+
+但这句话需要修改：
+
+```python
+page.accessibility.snapshot()
+```
+
+当前 Playwright 更推荐使用 **ARIA snapshot**，例如在 Python 中调用 locator 的 ARIA snapshot，它会返回适合表达可访问结构的 YAML；当前 API还支持面向 AI 消费优化的模式。([Playwright][2])
+
+例如：
+
+```python
+snapshot = await page.locator("body").aria_snapshot(
+    timeout=10_000
+)
+```
+
+当前 Playwright 的 MCP、CLI 和 Agent 相关能力，也主要围绕结构化 accessibility snapshot，而不是必须依赖视觉模型。([Playwright][3])
+
+## 手工 `querySelectorAll` 不是更好的 A11y 方案
+
+原代码：
+
+```javascript
+document.querySelectorAll("button, a, input, h1,h2,h3")
+```
+
+会漏掉很多内容，例如：
+
+* `textarea`
+* `select`
+* `option`
+* `[contenteditable]`
+* 自定义组件
+* `role="button"`
+* `role="dialog"`
+* checkbox、radio
+* iframe 内元素
+* shadow DOM 中的交互元素
+* accessible name 来自 `aria-label` 的元素
+
+并且：
+
+```javascript
+el.innerText || el.getAttribute("placeholder")
+```
+
+无法完整表达真实 accessible name。
+
+因此 Demo 最好使用：
+
+```text
+ARIA snapshot 为主
+关键可交互元素抽取为辅
+必要时截图为证据
+```
+
+## 这一项不是 80 行才可以做
+
+基础获取确实只要几行，但真正喂给 LLM 前通常需要：
+
+* 裁剪无关节点
+* 限制深度
+* 限制长度
+* 标记当前 URL
+* 标记对话框
+* 标记 iframe
+* 去除重复文本
+* 为元素建立引用 ID
+
+一个可用简化版大约 80～150 行比较合理。
+
+---
+
+# ④ 人工修正闭环：JSON 可用于 Demo，但不是“学习”
+
+用 JSON 保存修正映射，作为本地 Demo 是合理的：
+
+```json
+{
+  "login.submit": {
+    "test_id": "login-button"
+  }
+}
+```
+
+但原来的写法：
+
+```json
+{
+  "button=Login": "css=[data-qa=login-button]"
+}
+```
+
+过于简单，因为同一个 `button=Login` 在不同网站、不同页面可能代表完全不同的元素。
+
+建议至少增加作用域：
+
+```json
+{
+  "https://example.com/login::login.submit": {
+    "strategy": "test_id",
+    "value": "login-button",
+    "updated_at": "2026-08-04T13:00:00+08:00"
+  }
+}
+```
+
+再进一步：
+
+```json
+{
+  "project_id": "demo-shop",
+  "page_pattern": "/login",
+  "target_key": "login.submit",
+  "locator": {
+    "test_id": "login-button"
+  }
+}
+```
+
+此外，这不是模型“学习”，更准确的说法是：
+
+> 持久化定位器覆盖规则，后续优先复用人工确认结果。
+
+对于简历或面试，避免说“Agent 学习了”，除非确实进行了训练、在线学习或反馈优化。
+
+---
+
+# ⑤ `capture_text`：价值有，但“拿 token”这个例子不准确
+
+`capture_text` 很适合：
+
+```text
+读取订单号
+读取商品价格
+读取用户名
+读取生成任务 ID
+读取页面提示
+```
+
+例如：
+
+```json
+{
+  "action": "capture_text",
+  "target": {
+    "test_id": "order-number"
+  },
+  "save_as": "order_number"
+}
+```
+
+后续：
+
+```json
+{
+  "action": "assert_text",
+  "target": {
+    "test_id": "order-summary"
+  },
+  "expected": "${order_number}"
+}
+```
+
+但“登录后拿到 token”通常不应该通过 `inner_text()` 完成。
+
+token 更可能来自：
+
+* cookie
+* localStorage
+* sessionStorage
+* 登录接口响应
+* response header
+
+所以 DSL 最好区分：
+
+```text
+capture_text
+capture_attribute
+capture_url
+capture_storage
+capture_cookie
+capture_response_json
+```
+
+对于 Demo，第一版只做两个即可：
+
+```text
+capture_text
+capture_attribute
+```
+
+运行时变量替换也不要直接全局字符串替换，建议只替换明确格式：
+
+```python
+import re
+
+
+VARIABLE_PATTERN = re.compile(r"\$\{([a-zA-Z_][a-zA-Z0-9_.-]*)\}")
+
+
+def interpolate(value: str, context: dict[str, object]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+
+        if key not in context:
+            raise KeyError(f"Missing runtime variable: {key}")
+
+        return str(context[key])
+
+    return VARIABLE_PATTERN.sub(replace, value)
+```
+
+---
+
+# ⑥ SSE：判断正确，但示例不是完整实现
+
+“测试执行日志主要是服务端推客户端，SSE 比 WebSocket 简单”这个判断合理。浏览器原生支持 EventSource，FastAPI 当前也已有正式 SSE 支持。([FastAPI][4])
+
+但示例存在几个问题：
+
+```python
+@app.post("/api/execute-stream")
+async def execute_stream(req):
+    def gen():
+        yield ...
+```
+
+### 问题一：浏览器原生 `EventSource` 通常使用 GET
+
+虽然当前 FastAPI 的 SSE 响应可以配合 POST，但浏览器原生 `EventSource` 构造器不能直接自定义 POST body。需要：
+
+* 先 POST 创建任务；
+* 再 GET 订阅任务事件；
+
+这是最清晰的架构。
+
+```text
+POST /api/runs
+→ 返回 run_id
+
+GET /api/runs/{run_id}/events
+→ SSE 推送日志
+```
+
+### 问题二：生成器应考虑异步与断连
+
+推荐：
+
+```python
+from collections.abc import AsyncIterator
+from fastapi import FastAPI
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+
+app = FastAPI()
+
+
+async def run_events(run_id: str) -> AsyncIterator[ServerSentEvent]:
+    yield ServerSentEvent(
+        event="run_started",
+        data={"run_id": run_id},
+    )
+
+    yield ServerSentEvent(
+        event="step_completed",
+        data={
+            "step": 1,
+            "status": "passed",
+        },
+    )
+
+
+@app.get("/api/runs/{run_id}/events")
+async def stream_run(run_id: str) -> EventSourceResponse:
+    return EventSourceResponse(run_events(run_id))
+```
+
+如果版本较旧，也可用 `StreamingResponse`，但要自己处理事件格式、心跳和断开。
+
+## SSE 成本不止 30 行
+
+后端输出 30 行左右没问题，但完整 Demo 还包括：
+
+* 前端 EventSource
+* 自动重连
+* 任务结束关闭
+* 错误事件
+* run_id
+* 事件序号
+* 后端队列或事件总线
+
+整体通常 80～150 行。
+
+---
+
+# ⑦ Trace 证据：非常值得做，但描述稍有夸大
+
+Playwright Trace 的确能记录：
+
+* 页面操作
+* DOM 快照
+* 截图
+* 网络活动
+* 日志
+* 源代码
+* 控制台与错误信息
+
+Trace Viewer 可以逐步查看动作前后页面状态、网络、错误和控制台。([Playwright][5])
+
+但是：
+
+```python
+context.tracing.start(...)
+```
+
+不会自动记录 Playwright Test 的所有断言语义；官方说明 context tracing 会捕获浏览器操作和网络活动，但不记录类似 `expect` 的测试断言。([Playwright][6])
+
+因此最好同时记录自己的步骤结果：
+
+```json
+{
+  "step_index": 3,
+  "action": "assert_visible",
+  "status": "failed",
+  "error": "Expected element was not visible",
+  "trace_path": "artifacts/run-001/trace.zip",
+  "screenshot_path": "artifacts/run-001/step-003.png"
+}
+```
+
+建议代码：
+
+```python
+await context.tracing.start(
+    screenshots=True,
+    snapshots=True,
+    sources=True,
+)
+
+try:
+    await execute_steps(...)
+finally:
+    await context.tracing.stop(
+        path=f"artifacts/{run_id}/trace.zip"
+    )
+```
+
+这一项应提前到第 4 位，因为它非常便宜，却能显著提升 Demo 的可解释性。
+
+---
+
+# ⑧ VLM 视觉定位：不做首版是对的
+
+这个判断基本准确。
+
+对标准 Web 页面，优先顺序应该是：
+
+```text
+test id
+→ role + accessible name
+→ label
+→ text
+→ scope + child locator
+→ CSS
+→ 人工修正
+→ 视觉定位
+```
+
+Playwright 当前的 Agent/MCP 方案默认也主要依赖 accessibility snapshots；视觉模式用于处理那些没有暴露在 accessibility tree 中、必须依赖坐标或截图的元素。([Playwright][7])
+
+不过“语义定位覆盖 90%+ 场景”没有统一依据，建议不要写成确定比例。
+
+更稳妥的说法是：
+
+> 对语义结构良好的业务系统，A11y/ARIA 定位通常能覆盖大多数核心交互；Canvas、远程桌面、复杂图表和无语义自定义控件仍可能需要视觉兜底。
+
+---
+
+# ⑨ 认证/权限：需要区分两种认证
+
+这里混淆了：
+
+## 平台自身认证
+
+即你的 Demo 是否需要：
+
+* 注册
+* 登录
+* 用户权限
+* 项目隔离
+
+本地 Demo 可以不做。
+
+## 被测网站登录态
+
+这是自动化测试必须考虑的问题。
+
+用 `storage_state` 保存 Cookie 和 localStorage 非常适合 Demo：
+
+```python
+await context.storage_state(
+    path="auth/admin.json"
+)
+```
+
+后续：
+
+```python
+context = await browser.new_context(
+    storage_state="auth/admin.json"
+)
+```
+
+但需要注意：
+
+* 某些 token 会过期；
+* sessionStorage 默认不在普通 storage state 中；
+* 不要提交真实凭据；
+* `auth/*.json` 应加入 `.gitignore`；
+* 不同测试最好隔离状态。
+
+所以应该写成：
+
+> 不做 Demo 平台的用户权限系统，但要做被测站点登录态复用。
+
+---
+
+# 优先级象限建议重排
+
+你原来的“价值 × 成本”有些位置需要调整。
+
+```text
+                    高价值
+                      │
+    ┌─────────────────┼─────────────────┐
+    │  A11y/ARIA 探索   │  人工修正闭环    │
+    │  作用域消歧       │  自动修复与重规划 │
+    │  唯一定位器解析   │                 │
+    │  Trace 证据       │                 │
+    ├─────────────────┼─────────────────┤
+    │  运行时变量       │  VLM 视觉定位    │
+    │  SSE 执行日志     │  完整认证权限     │
+    │  storage_state   │  多租户与审计     │
+    └─────────────────┴─────────────────┘
+       低成本                              高成本
+```
+
+其中 `capture_text` 不一定属于最高价值，它取决于演示场景。如果你的 Demo 测试电商、订单或 AIGC 长任务，它价值很高；如果只演示登录和表单提交，它优先级可以稍后。
+
+---
+
+# 更适合你的 Demo 范围
+
+建议把第一版控制在以下闭环：
+
+```text
+1. 输入目标 URL
+2. 输入自然语言测试目标
+3. Playwright 打开页面
+4. 获取 ARIA snapshot
+5. LLM 输出结构化 DSL
+6. 用户查看并确认步骤
+7. 执行 DSL
+8. 实时显示步骤状态
+9. 失败时截图并保留 Trace
+10. 展示最终报告
+```
+
+DSL 第一版只支持 8 个动作：
+
+```text
+goto
+click
+fill
+select
+check
+wait_for
+assert_visible
+assert_text
+```
+
+第二版再加：
+
+```text
+capture_text
+capture_attribute
+upload_file
+press
+hover
+```
+
+第一版不要做：
+
+```text
+VLM
+复杂自动修复
+完整权限
+多租户
+分布式浏览器集群
+模型微调
+数据库修正学习
+```
+
+## 时间估算也需要调整
+
+原描述：
+
+```text
+①→②→③ 半天搞定
+④→⑤ 周末做
+```
+
+如果只是拼出最小代码，可能做到；但如果要求稳定可演示，更合理的是：
+
+| 功能        |  可运行版本 |  较稳定版本 |
+| --------- | -----: | -----: |
+| ARIA 页面探索 |  1～2小时 | 0.5～1天 |
+| 定位器与消歧    |  2～4小时 |   1～2天 |
+| DSL 执行器   | 0.5～1天 |   2～3天 |
+| Trace 和截图 |    1小时 |   0.5天 |
+| 运行时变量     |  2～4小时 |     1天 |
+| SSE 前后端   |   0.5天 |   1～2天 |
+| JSON 修正闭环 |   0.5天 |   1～2天 |
+| 前端界面与报告   |   1～2天 |   3～5天 |
+
+一个真正能用于演示的 Demo，预计 **5～10天**更合理；若已有 FastAPI、React 和 Playwright 基础，可以压缩到 3～5天。
+
+最终评价是：
+
+> 这份描述的产品取舍基本正确，但技术细节存在过度简化。最需要修改的是 `count() > 0`、`.first + xpath=../..`、`page.accessibility.snapshot()`、“AI 生成唯一文本即可消歧”、`capture_text 获取 token` 和 SSE 的 POST 示例。修正这些后，就可以作为 Demo 开发方案使用。
+
+[1]: https://playwright.dev/python/docs/locators?utm_source=chatgpt.com "Locators | Playwright Python"
+[2]: https://playwright.dev/python/docs/aria-snapshots?utm_source=chatgpt.com "Snapshot testing | Playwright Python"
+[3]: https://playwright.dev/mcp/snapshots?utm_source=chatgpt.com "Snapshots | Playwright"
+[4]: https://fastapi.tiangolo.com/zh/tutorial/server-sent-events/?utm_source=chatgpt.com "服务器发送事件（SSE） - FastAPI"
+[5]: https://playwright.dev/python/docs/trace-viewer-intro?utm_source=chatgpt.com "Trace viewer | Playwright Python"
+[6]: https://playwright.dev/python/docs/api/class-tracing?utm_source=chatgpt.com "Tracing | Playwright Python"
+[7]: https://playwright.dev/mcp/vision-mode?utm_source=chatgpt.com "Vision Mode | Playwright"
+
+
+优化方案：Demo v2（评审修正版）
+一、目标形态
+
+输入 URL + 自然语言测试目标
+    → Playwright 打开页面 → aria_snapshot 获取页面结构
+    → LLM 基于真实页面结构生成结构化 DSL
+    → 用户确认
+    → Playwright 执行（三分法定位 + 作用域消歧 + 运行时变量 + Trace 证据）
+    → 实时进度（SSE）+ 失败截图 + 修正闭环
+核心变化：AI 不再"盲猜页面"——先感知、后生成、再执行。这正是评审说的"没有可靠页面结构，定位降级只是在多个错误定位器之间切换"。
+
+二、架构总览
+
+frontend/index.html
+    │  POST /api/explore  {url}
+    ▼
+[page_explorer]  Playwright 打开 → aria_snapshot → 裁剪后的页面结构
+    │  POST /api/generate {prompt, page_structure}
+    ▼
+[ai_agent]  DeepSeek → 结构化 DSL（带 scope/locator 字段）
+    │  POST /api/execute {case, input_values}
+    ▼
+[runner]  三分法定位 → 作用域链式 → 执行 → 每步:
+    │     截图 + Trace 记录 + 步骤结果
+    ├─ 失败 → [corrections] JSON 修正库查/存
+    ▼
+GET /api/runs/{id}/events  (SSE 实时进度)
+    ▼
+前端报告: 步骤状态 + 截图 + trace 下载 + 修正建议
+三、模块设计（每个文件的改动）
+1. dsl.py — ✅ 你已改好（v2）
+采纳：Locator（role/name/test_id/text/css 多字段组合）、Scope（role/has_text/test_id）、10 种动作。
+
+补充一点：input_contract 建议从 list[dict] 收紧为 Pydantic 模型：
+
+
+class InputVar(BaseModel):
+    key: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+    value: str | None = None
+    description: str | None = None
+（理由：${key} 插值依赖 key 格式，非法 key 在入库前拦截，而不是执行时才发现。）
+
+2. page_explorer.py — 新增（评审③）
+
+输入: URL
+1. Playwright 打开页面（headless）
+2. snapshot = page.locator("body").aria_snapshot()   ← 当前推荐 API
+3. 裁剪: 限制深度/长度、去重复、标记当前 URL、iframe 标注
+4. 附加: 关键可交互元素抽取（test_id / role 列表，作为辅助）
+5. 输出: 结构化页面描述文本（给 LLM 的 context）
+关键约束：输出控制在你设定的大小内（比如 3000 字符），防止 prompt 爆炸。裁剪规则写死、可配置。
+
+可扩展：explore_flow（多步骤探索，如"登录后"的页面状态）作为第二版。
+
+3. ai_agent.py — 重构 prompt + 输出契约
+
+输入: 自然语言需求 + 页面结构快照 + DSL 语法说明
+输出: 结构化 JSON（Locator/Scope 字段，不是字符串）
+Prompt 约束（关键）：
+
+action 白名单：10 种
+target 必须从页面快照里选择可访问名称（禁止编造不存在的元素）——这是评审的核心观点
+歧义时（同名多个）必须生成 scope
+变量：${key} 只能出现在 value/expected，且必须在 input_contract 定义
+输出后校验链：validate_case() → 失败自动带错误信息重试 1 次（简单 repair loop，不引入复杂重规划）。
+
+4. runner.py — 核心重构（评审①②⑤）
+
+定位器解析（三分法）:
+  for strategy in [test_id → role+name → text → css]:
+      count = locator.count()
+      0 → 继续下一策略
+      1 → 返回
+      >1 → 记录歧义，继续下一策略
+  全部未唯一命中 → LocatorAmbiguousError（附每个策略的匹配数）
+
+作用域（scope）:
+  if step.scope:
+      container = 按 scope.role/test_id 定位，filter(has_text=scope.has_text)
+      target = container.get_by_role(...)   # 链式，不爬 xpath=../..
+  注意: scope 本身也要过三分法（has_text 可能匹配多个 → 歧义）
+
+运行时变量:
+  context = {}   # capture_* 写入
+  ${key} 插值: 缺失 key → 抛 KeyError（不再静默保留原样）
+  input_contract → context 预填
+
+证据:
+  每步: 截图 + 步骤结果（含 locator trace: 命中策略/匹配数）
+  Trace: context.tracing.start(screenshots, snapshots, sources)
+         finally: stop(path=f"artifacts/run-{id}/trace.zip")
+  storage_state 支持: 可选配置，保存/复用被测网站登录态
+动作语义（10 种）：
+
+action	语义
+goto	跳转（支持相对路径拼 base_url）
+click	点击
+fill	输入（替代 input）
+select	下拉选择（value 为选项文本）
+check	复选框
+wait_for	等待可见
+assert_visible	断言可见
+assert_text	断言文本（有 locator 用 to_contain_text，无则 body）
+capture_text	取 innerText → context[save_as]
+capture_attribute	取属性 → context[save_as]
+5. corrections.py — 新增（评审④，JSON 版）
+
+{
+  "version": 1,
+  "fixes": [
+    {
+      "page_pattern": "/login",
+      "target_key": "login.submit",
+      "locator": {"test_id": "login-button"},
+      "created_at": "..."
+    }
+  ]
+}
+匹配维度：page_pattern（URL 子串）+ target_key（由 locator 序列化生成，如 role:button:name:Login）
+查：执行失败时，按当前 URL + target_key 查修正，命中 → 用修正的 locator 重试一次
+存：前端提供"提交修正"入口（失败步骤 → 用户填正确 test_id/选择器 → 追加到 JSON）
+不叫"学习"，叫持久化覆盖规则（评审强调的措辞）
+6. main.py — API 重组
+
+POST /api/explore          {url} → 页面结构快照
+POST /api/generate         {prompt, page_structure} → DSL
+POST /api/execute          {case, input_values} → 创建 run，返回 run_id
+GET  /api/runs/{id}/events → SSE 实时进度        ← 评审方案（GET 订阅）
+POST /api/corrections      {run_id, step_index, locator} → 存修正
+GET  /api/runs/{id}/report → 最终报告（含 trace 下载链接）
+SSE 采用评审推荐的：POST 创建 run（同步起线程执行）→ 前端 EventSource GET 订阅事件流。避免了 fetch+ReadableStream 的手动解析，前端代码更少。事件类型：step_started / step_completed / correction_needed / run_finished / run_error。
+
+7. frontend/index.html — 流程化四步
+
+① 输入 URL → "探索页面" → 显示页面概览（标题/元素数/快照预览）
+② 输入自然语言目标 → "AI 生成 DSL" → 编辑器展示（可手动改）
+③ "执行" → EventSource 实时进度条 + 逐步状态
+④ 报告区: 每步 状态/截图/trace 下载；失败步骤 → 修正输入框
+四、数据流闭环（完整演示路径）
+
+用户: https://automationexercise.com + "登录后筛选 Polo 品牌加入购物车"
+  │ POST /api/explore
+  ▼
+快照: {"url":..., "aria_snapshot": "navigation: 首页/商品/购物车... button: 登录"}
+  │ POST /api/generate
+  ▼
+LLM 输出: {steps:[
+    {action:"goto", value:"https://automationexercise.com/login"},
+    {action:"fill", locator:{role:"textbox", name:"Email Address"}, value:"${email}"},
+    {action:"click", locator:{role:"button", name:"Login"}},
+    {action:"click", locator:{role:"link", name:"Add to cart"},
+     scope:{role:"listitem", has_text:"Blue Top"}},     ← 作用域消歧
+    ...
+  ]}
+  │ 用户确认 → POST /api/execute → run_id
+  ▼
+Playwright: 三分法定位 → 执行 → capture_text 记录价格 → 断言比对 → Trace
+  │ SSE 实时推送
+  ▼
+报告: 12/12 ✅ + 每步截图 + trace.zip + 失败时修正入口
+五、分阶段实施计划（含时间）
+阶段	内容	时间（较稳定）	验收标准
+P1 执行内核	runner 重构（三分法 + scope + 10 动作 + 变量）	2-3 天	手写 DSL 全跑通 Automation Exercise 登录+筛选
+P2 页面感知	page_explorer（aria_snapshot + 裁剪）	0.5-1 天	快照能在 3 秒内返回且长度可控
+P3 AI 闭环	ai_agent 重构（快照进 prompt + 校验重试）	1-2 天	自然语言生成 DSL 且 target 全部来自真实页面
+P4 证据与修正	Trace + corrections JSON 闭环	1-2 天	失败步骤可提交修正并复现命中
+P5 实时与 UI	SSE + 前端四步流程	1-2 天	完整闭环可演示
+P6 登录态	storage_state 复用（可选）	0.5 天	复用登录 cookie 跳过登录步骤
+总计：约 7-11 天（比评审的 5-10 天略宽，含调试缓冲）。
+
+六、明确不做（第一版）
+不做	理由
+VLM 视觉定位	成本高、延迟大；A11y + 修正覆盖核心场景
+复杂自动修复/重规划	只做"校验失败重试 1 次"，不引入 Agent 循环
+平台认证/多用户	demo 无需；仅保留被测网站登录态复用
+数据库	JSON 文件足够；README 里注明"生产版用 DB"
+定时调度/集群	超范围
+七、面试讲解要点（升级后）
+感知-生成-执行闭环：AI 基于真实页面结构生成 DSL，而不是盲猜——这是和"直接把 prompt 丢给 LLM"的本质区别
+三分法定位：0/1/多 明确分类，歧义不猜——"宁可不点，不可点错"
+作用域进 DSL：scope 字段 + locator chaining，不依赖 DOM 层级
+安全边界：Pydantic 强校验 + action 白名单 + ${key} 格式约束
+证据链：截图 + Trace + 步骤结果三件套，Trace 与断言结果互补
+修正闭环：持久化覆盖规则（诚实措辞：不是"学习"，是"复用人工确认"）
+方案就绪。你说执行的时候，我按 P1 → P6 顺序开始，第一步是重构 runner.py（三分法 + scope + 变量）。

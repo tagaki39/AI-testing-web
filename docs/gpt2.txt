@@ -1,0 +1,818 @@
+顺着你现在已经走到的位置，我建议你**不要继续优化当前 Locator v1，也不要立刻一次性实现完整“五层 fallback”**。
+
+你现在最好的方向是：
+
+> **把项目从“复杂 Locator Engine”重构成“Grounding Engine + Resolution Engine”两层架构。**
+
+而且要分阶段迁移，不推倒重来。
+
+你当前代码其实已经证明了为什么要这么改：`runner._resolve_locator()` 现在同时负责 scope、等待、候选遍历、visibility、DOM identity、business identity 等多种职责，复杂度已经明显集中在一个 resolver 里。 同时 `ai_agent.py` 还维护 Browser-backed scope inspection、Repair、navigation invariant 等另一套定位相关逻辑。
+
+所以现在不是“再修 Locator”，而是**重新划职责边界**。
+
+---
+
+## 第一阶段：先止血，不重构
+
+你现在那个 5 分钟问题先修掉。
+
+只做：
+
+```text
+Resolver global timeout budget
+```
+
+因为现在 `count()==0` 后，会在多个 `container × strategy` 上反复等待，导致一次 step 90~110 秒。当前代码确实是在候选循环中逐个 `wait_for()`。
+
+第一阶段验收：
+
+```text
+任何 locator resolution ≤ 5s
+普通 step 不再出现 60/90/110s
+失败也必须 bounded
+```
+
+**这一步完成后冻结 Locator v1。**
+
+不要顺手再修：
+
+```text
+更多 scope heuristic
+更多 icon
+更多 business ID
+更多 parent crawling
+```
+
+---
+
+# 第二阶段：建立 Grounding Engine
+
+这是接下来最值得做的架构变化。
+
+目标：
+
+> **Planner 不再生成 locator。Planner 只选择系统实际观察到的 element ref。**
+
+现在 Planner 还是输出：
+
+```json
+{
+  "target": {
+    "role": "link",
+    "name": "Add to cart"
+  },
+  "scope": {
+    "has_text": "Blue Top"
+  }
+}
+```
+
+这意味着模型还在参与构造定位器。
+
+以后改成：
+
+```json
+{
+  "action": "click",
+  "target_ref": "obs7:e42"
+}
+```
+
+### Observation 新结构
+
+第一版不一定非要马上 CDP。
+
+你甚至可以先基于现在的 A11y observation 做：
+
+```json
+{
+  "id": "obs7",
+  "url": "...",
+  "state_hash": "...",
+  "elements": [
+    {
+      "ref": "obs7:e42",
+      "role": "link",
+      "name": "Add to cart",
+      "text_context": [
+        "Blue Top",
+        "Rs. 500"
+      ]
+    }
+  ]
+}
+```
+
+然后 Planner：
+
+```text
+只能引用系统给出的 ref
+禁止创建 role/name/scope
+```
+
+这会比 Schema Prompt 再写十条规则更有效。
+
+因为输出空间直接从：
+
+```text
+role
+name
+scope
+test_id
+text
+css
+...
+```
+
+缩小成：
+
+```text
+obs7:e42
+```
+
+这和你目前已经在做的 `observation_ref` 思路是一致延伸；你当前系统已经要求 Planner 引用真实 observation ID。
+
+下一步只是把：
+
+```text
+observation_ref
+```
+
+升级为：
+
+```text
+observation_ref + target_ref
+```
+
+---
+
+# 第三阶段：Node Ref → LocatorSpec Compiler
+
+这是架构里最关键的一层。
+
+**Node Ref 不直接成为持久 DSL locator。**
+
+而是：
+
+```text
+target_ref
+↓
+Observation Registry
+↓
+deterministic compiler
+↓
+LocatorSpec
+```
+
+例如：
+
+```text
+obs7:e42
+```
+
+系统知道：
+
+```text
+role = link
+name = Add to cart
+context = Blue Top
+business id = 1
+```
+
+Compiler 决定生成：
+
+```json
+{
+  "role": "link",
+  "name": "Add to cart",
+  "exact": true,
+  "scope": {
+    "has_text": "Blue Top"
+  }
+}
+```
+
+如果以后 CDP 能拿到：
+
+```text
+data-testid
+data-product-id
+DOM attributes
+```
+
+Compiler 可以优先生成更稳定的 locator。
+
+重点是：
+
+> **稳定 locator 是代码生成的，不是 LLM 发明的。**
+
+你现在很多 Preflight Repair，其实都是在补救 Planner 的 locator invention。
+
+这一层做好后，Repair 可以大幅缩水。
+
+---
+
+# 第四阶段：新建独立 Resolution Engine
+
+不要继续在 `runner.py` 里扩 `_resolve_locator()`。
+
+新建：
+
+```text
+locator/
+    model.py
+    compiler.py
+    semantic.py
+    resolver.py
+```
+
+公开接口只保留一个：
+
+```python
+resolve(
+    page,
+    locator_spec,
+    action,
+    timeout_ms,
+) -> ResolutionResult
+```
+
+返回例如：
+
+```json
+{
+  "status": "resolved",
+  "strategy": "a11y_role_exact",
+  "score": 0.96,
+  "runner_up_score": 0.61,
+  "confidence_margin": 0.35,
+  "dom_matches": 2,
+  "business_entities": 1
+}
+```
+
+### 不再把“三分法”当整个算法
+
+而是：
+
+```text
+Candidate generation
+↓
+Scoring
+↓
+Confidence gate
+↓
+accept / ambiguous
+```
+
+也就是说：
+
+```text
+Scoring = 排序机制
+Strictness = 是否允许执行的门槛
+```
+
+这个区别很重要。
+
+不是：
+
+```text
+最高分就点
+```
+
+而是：
+
+```text
+第一名 0.95
+第二名 0.42
+→ accept
+
+第一名 0.91
+第二名 0.90
+→ ambiguous
+```
+
+这样你既获得 scoring 的抗变化能力，又保留现在最重要的：
+
+> **宁可明确失败，不允许低置信度错误点击。**
+
+---
+
+# 第五阶段：再加入 Tier 0 Corrections
+
+我会把它放在 VLM 前面。
+
+因为这个 ROI 很高。
+
+结构：
+
+```text
+(URL pattern, target semantic key)
+↓
+历史 correction
+```
+
+例如：
+
+```json
+{
+  "site": "automationexercise.com",
+  "target_key": "cart_navigation",
+  "locator": {
+    "role": "link",
+    "name": "Cart"
+  },
+  "successes": 12,
+  "failures": 1,
+  "consecutive_failures": 0,
+  "enabled": true
+}
+```
+
+执行：
+
+```text
+Correction hit
+↓
+Resolution Engine 验证
+↓
+成功 → success++
+失败 → failure++
+连续失败达到阈值 → disable
+```
+
+注意：
+
+> correction 不能绕过 Resolver validation。
+
+它只是：
+
+```text
+高优先级 candidate source
+```
+
+而不是：
+
+```text
+历史记录说点这里 → 无条件点击
+```
+
+这能形成真正的 learning loop。
+
+---
+
+# 第六阶段：再考虑 CDP
+
+我不会让你现在第一步就全面切 CDP。
+
+先把：
+
+```text
+Node Ref abstraction
+```
+
+建立起来。
+
+比如统一：
+
+```python
+ObservedElement(
+    ref,
+    role,
+    name,
+    text_context,
+    attributes,
+    backend_node_id=None,
+)
+```
+
+第一版：
+
+```text
+Playwright aria_snapshot
+```
+
+来填。
+
+后面 benchmark 后再换：
+
+```text
+CDP Accessibility.getFullAXTree
++
+backendDOMNodeId
+```
+
+这样 CDP 是一个 **Observation Adapter**：
+
+```text
+PlaywrightObservationProvider
+CDPObservationProvider
+```
+
+而不是整个架构的根。
+
+这样风险小很多。
+
+---
+
+# CDP node ID 的正确定位
+
+如果以后用了 CDP，我会这样使用：
+
+```text
+backendDOMNodeId
+```
+
+只做：
+
+### 同 session fast-path
+
+```text
+exploration
+↓
+Planner target_ref
+↓
+页面状态仍有效
+↓
+node still alive
+↓
+直接操作
+```
+
+失败：
+
+```text
+fallback → LocatorSpec → Semantic Resolver
+```
+
+而不是：
+
+```text
+把 backendDOMNodeId 永久写进 test case
+```
+
+所以 DSL 最终更像：
+
+```json
+{
+  "action": "click",
+
+  "target_ref": "obs7:e42",
+
+  "target": {
+    "role": "link",
+    "name": "Add to cart"
+  },
+
+  "grounding": {
+    "observation_ref": "obs7"
+  }
+}
+```
+
+运行时 `target_ref` 可以不存在，只靠稳定 `target` replay。
+
+---
+
+# 第七阶段：VLM 放最后
+
+你参考架构里的：
+
+```text
+Tier 2 VLM
+Tier 3 coordinate
+Tier 4 human
+```
+
+我认可顺序，但现在完全不要做。
+
+先证明：
+
+```text
+Node Ref Grounding
++
+Semantic Resolver
++
+Correction loop
+```
+
+已经能把主要问题解决。
+
+只有你收集真实 regression 后发现：
+
+```text
+例如 5~10% 页面
+A11y/DOM semantic resolution 真解决不了
+```
+
+再上 VLM。
+
+否则 VLM 很容易变成：
+
+```text
+一个昂贵、慢、难 debug 的万能 fallback
+```
+
+而你的项目当前最缺的不是能力上限，是**边界清晰度和稳定性**。
+
+---
+
+# 因此我建议你未来的总体架构定成
+
+```text
+User Goal
+   ↓
+Bounded Exploration
+   ↓
+Observation Provider
+(ARIA now / CDP later)
+   ↓
+Observation Registry
+obs7:e42
+   ↓
+Planner
+only chooses refs
+   ↓
+LocatorSpec Compiler
+deterministic
+   ↓
+──────── Resolution Pipeline ────────
+   ↓
+Tier 0 historical correction
+   ↓
+Tier 1 semantic candidates
+   ↓
+scoring
+   ↓
+confidence gate
+   ↓
+resolved / ambiguous
+   ↓
+Tier 2 VLM        [later]
+   ↓
+Tier 3 coordinate [much later]
+   ↓
+Tier 4 human      [product stage]
+───────────────
+   ↓
+Executor
+   ↓
+Evidence / Trace
+```
+
+---
+
+## 这意味着当前哪些代码未来会弱化甚至删除
+
+你现在很多东西不用立即删，但未来目标是逐步淘汰：
+
+```text
+Planner 自由生成 scope
+_goal_match_anchor()
+_choose_scope_text()
+复杂 Browser-backed scope repair
+LLM candidate → scope patch
+大量 parent crawling heuristic
+navigation 特殊 Repair
+```
+
+例如现在 `_resolve_ambiguity()` 还会根据 goal 去 candidate context 里匹配业务实体，并决定 scope。
+
+未来应该变成：
+
+```text
+Planner 已经选择 obs7:e42
+```
+
+所以根本不需要：
+
+```text
+“Blue Top 到底对应哪个 candidate？”
+```
+
+这一轮推理。
+
+这就是新架构真正降低复杂度的地方。
+
+---
+
+# 但是哪些成果必须留下
+
+你之前 Locator 深挖不是白做。
+
+这些原则直接进入 v2：
+
+```text
+✓ exact semantic match 优先
+✓ fuzzy 不可无条件使用
+✓ visibility/actionability 是 evidence
+✓ DOM count != business entity count
+✓ business identity 必须显式证明
+✓ ambiguous 时 fail safely
+✓ runtime 有明确 timeout budget
+✓ 决策必须 traceable
+```
+
+尤其你现在 business identity 的严格规则：
+
+```text
+所有候选都有明确 identity
++
+identity 全部一致
+→ 才折叠
+```
+
+应该保留为 Semantic Resolver 的一个 feature，而不是丢掉。当前实现正是这个逻辑。
+
+---
+
+# 你现在实际应该做什么
+
+我建议接下来严格按这个顺序，不要并行开太多坑：
+
+### 现在
+
+```text
+1. 修 Resolver timeout budget
+2. Planner Schema Recovery 收尾
+3. 保留当前 reference regression
+4. 给当前状态打 locator-v1 tag
+```
+
+### 然后开始 v2
+
+```text
+5. 定义 ObservedElement + target_ref
+6. Planner 改成 refs-only target selection
+7. 做 NodeRef → LocatorSpec Compiler
+8. 抽离 locator_resolver.py
+9. Runner + Browser Preflight 共用 Resolver
+```
+
+### v2 稳定以后
+
+```text
+10. 加 scoring + confidence margin
+11. 加 correction store
+12. 跑几十轮 regression 收数据
+```
+
+### 最后才考虑
+
+```text
+13. CDP full AX tree
+14. VLM
+15. coordinate
+16. human intervention
+```
+
+---
+
+## 一个关键项目目标也应该改变
+
+接下来不要再追：
+
+> “AutomationExercise 12/12 怎么做到？”
+
+把目标换成：
+
+> **“同一个 architecture 在不同页面状态、不同 rerender、重复执行中，是否保持 grounded、bounded、explainable？”**
+
+你的指标也换成：
+
+```text
+Planner raw schema success rate
+Schema recovery success rate
+
+target_ref grounding validity
+Compiler success rate
+
+Resolver success rate
+Ambiguity rate
+False-resolution rate ← 最重要
+
+p50/p95 resolution latency
+Correction reuse success rate
+```
+
+尤其：
+
+> **False resolution rate 比 locator success rate 更重要。**
+
+因为你前面已经亲自遇到了：
+
+```text
+Cart
+→ fuzzy Add to cart
+→ business dedup
+→ 可能错误成功
+```
+
+这就是整个新架构最值得守住的 lesson。
+
+---
+
+如果一句话概括你现在应该转向的方向：
+
+> **停止把 Locator 做得更聪明，开始把“模型如何指向真实元素”和“执行器如何重新找到该元素”拆成两个独立问题。**
+
+最终核心不是“五层 fallback”，而是：
+
+> **Node-ref grounded planning + deterministic locator compilation + confidence-gated semantic resolution + historical corrections。**
+
+这是我认为你现在最值得走的主线。
+
+---
+
+# 补充：State-aware Grounding（第二轮评审，SauceDemo + AutomationExercise 双站点实证）
+
+## 问题定性：state-grounding mismatch，不是 locator failure
+
+两个独立站点复现同一模式：
+
+```text
+SauceDemo:
+inventory state
+├─ 点击商品名 → detail state（实际状态转移）
+└─ 下一步却引用 inventory state 的 add-to-cart ref
+
+AutomationExercise:
+list state
+├─ View Product → detail state
+└─ 下一步却引用 list state 的 Add to cart（详情页是 button 不是 link）
+```
+
+统一抽象：
+
+```text
+S0
+--action-->
+S1
+
+next target ∈ S0 而不是 S1
+=> STATE_GROUNDING_MISMATCH
+```
+
+底层 locator 没坏——是 **Planner representation 不包含足够的 state identity**。
+
+## 架构升级：插入两层
+
+原路线图插入：
+
+```text
+ObservedElement
+        ↓
+Observation State Graph   ← 新增
+        ↓
+Planner refs-only
+        ↓
+State Grounding Validator  ← 新增
+        ↓
+LocatorSpec Compiler
+        ↓
+Resolver
+```
+
+- **Observation = 状态节点，用户操作 = 状态之间的边**（obs3 --click e17--> obs4）
+- Planner 从**探索过的 transition graph** 选动作（from_state/action/target_ref/to_state）
+- 代码 invariant（不靠 Prompt）：
+
+```python
+if step.target_ref.observation_id != current_observation_id:
+    raise StateGroundingMismatch(...)
+```
+
+## 职责拆分（核心）
+
+```text
+Planner grounding: "想操作谁？"    → refs / transitions
+Locator resolution: "DOM 里谁对应它？" → semantic resolver
+```
+
+当前问题根源：两者混在同一个 target/scope 生成里。
+
+## 两个 grounding regression case（v2 验收标准）
+
+```text
+Regression 1 — SauceDemo:
+进 detail 后，不得引用 inventory-only add-to-cart ref
+→ 必须用 detail-state ref，或根本不进 detail（列表页直接加购）
+
+Regression 2 — AutomationExercise:
+进 product detail 后，target_ref 必须来自 detail observation
+```
+
+**验收**：执行前拒绝错误计划（STATE_GROUNDING_MISMATCH）即算成功；
+第二阶段才做"mismatch → 按 transition graph 自动替换为当前 state 的对应 node"。
+
+## 附加收益
+
+1. Planner 优先选"系统真实观察过的动作"，不再按自然语言感觉构造 UI 路径
+   （SauceDemo 案例：列表页直接 add-to-cart，根本不需要进 detail）
+2. Preflight 的 candidate extraction / scope repair / goal anchor matching 等
+   大量 repair 可大幅削薄——"ref 存在性 + 状态归属"由 validator 保证
+
+## 执行建议
+
+- 不修 SauceDemo Step 7 / AutomationExercise Step 9 本身——留作 grounding regression
+- 下一条主线：**state-aware grounding**，不再修 Locator

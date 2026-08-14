@@ -1,0 +1,856 @@
+这个问题的根因其实已经很明确了：
+
+> **不是 Preflight 不够强，而是你把“确定性的歧义消解”继续交给了 LLM。**
+
+`Add to cart` 有 6 个同名按钮，这种场景本质上不是“让 LLM 再想一次”能稳定解决的问题，而是应该把它变成：
+
+> **Preflight 找候选 → 代码构造 scope 候选 → LLM 只选候选 / 甚至代码直接确定 → patch 本地应用**
+
+这样才能把 6/7、7/7、6/7 这种波动压下去。
+
+## 先看你现在为什么会波动
+
+现在链路大概是：
+
+```text
+DSL
+↓
+Preflight
+↓
+发现:
+button=Add to cart
+match_count = 6
+↓
+把问题描述给 LLM
+↓
+LLM 自己重新想 scope
+↓
+生成 patch
+↓
+再次 Preflight
+```
+
+这里 LLM 承担了太多事情：
+
+```text
+理解哪个 step 错了
++
+理解为什么歧义
++
+从 snapshot 找正确商品
++
+决定 scope
++
+生成正确 locator
++
+确保所有 issue 都覆盖
+```
+
+所以 temperature 就算调成 0，也仍然可能：
+
+* 漏掉某个 issue；
+* scope 选成另一个商品；
+* 生成 snapshot 中不存在的文本；
+* 修一个 step，漏另一个；
+* patch JSON 结构偶尔不完整。
+
+你强化：
+
+```text
+必须覆盖全部问题
+```
+
+只能改善概率，不能消灭不确定性。
+
+---
+
+# 最优解：不要让 Repair LLM 自由生成 locator
+
+你现在已经有：
+
+```text
+AMBIGUOUS_LOCATOR
+match_count=6
+```
+
+下一步应该让 Preflight 自己把 **6 个候选所处的上下文找出来**。
+
+比如页面是：
+
+```text
+Sauce Labs Backpack
+$29.99
+Add to cart
+
+Sauce Labs Bike Light
+$9.99
+Add to cart
+```
+
+Preflight 不要只返回：
+
+```json
+{
+  "type": "AMBIGUOUS_LOCATOR",
+  "match_count": 6
+}
+```
+
+改成：
+
+```json
+{
+  "step_index": 6,
+  "type": "AMBIGUOUS_LOCATOR",
+  "target": {
+    "role": "button",
+    "name": "Add to cart"
+  },
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "scope_text": "Sauce Labs Backpack"
+    },
+    {
+      "candidate_id": "c2",
+      "scope_text": "Sauce Labs Bike Light"
+    },
+    {
+      "candidate_id": "c3",
+      "scope_text": "Sauce Labs Bolt T-Shirt"
+    }
+  ]
+}
+```
+
+这就是你稳定性的关键。
+
+---
+
+# 方案一：让 LLM 只做“选择题”
+
+这是我最推荐你现在实现的版本。
+
+不要问：
+
+> 帮我修复这个 Add to cart locator。
+
+改成：
+
+```text
+当前测试目标：
+click add to cart for Sauce Labs Backpack
+
+当前歧义步骤：
+step_index = 6
+
+候选 scope：
+c1 = Sauce Labs Backpack
+c2 = Sauce Labs Bike Light
+c3 = Sauce Labs Bolt T-Shirt
+...
+
+请选择最符合用户目标的 candidate_id。
+禁止创建新的 locator、scope 或文本。
+
+只输出：
+{"step_index": 6, "candidate_id": "c1"}
+```
+
+LLM 输出：
+
+```json
+{
+  "step_index": 6,
+  "candidate_id": "c1"
+}
+```
+
+然后真正 patch **由代码生成**：
+
+```python
+candidate = candidate_map["c1"]
+
+patch = {
+    "step_index": 6,
+    "scope": {
+        "strategy": "text",
+        "text": candidate["scope_text"],
+        "exact": True,
+    },
+}
+```
+
+这样 LLM 根本不能：
+
+```text
+漏字段
+改 locator
+创造 scope
+写 CSS
+改其他步骤
+```
+
+它只选：
+
+```text
+c1 / c2 / c3
+```
+
+稳定性会高很多。
+
+---
+
+# 方案二：能不用 LLM 的情况，直接代码修
+
+甚至很多场景连 LLM 都不用。
+
+假设用户需求：
+
+```text
+click add to cart for Sauce Labs Backpack
+```
+
+而候选：
+
+```text
+Sauce Labs Backpack
+Sauce Labs Bike Light
+Sauce Labs Onesie
+```
+
+直接字符串/模糊匹配：
+
+```python
+from difflib import SequenceMatcher
+
+
+def score(goal: str, candidate: str) -> float:
+    return SequenceMatcher(
+        None,
+        goal.lower(),
+        candidate.lower(),
+    ).ratio()
+```
+
+或者更简单：
+
+```python
+if candidate.lower() in goal.lower():
+    ...
+```
+
+得到：
+
+```text
+Sauce Labs Backpack
+```
+
+直接 patch。
+
+流程：
+
+```text
+AMBIGUOUS
+↓
+候选 scope
+↓
+用户目标包含某 candidate
+↓
+唯一命中
+↓
+代码自动 patch
+```
+
+只有：
+
+```text
+0 个确定匹配
+或
+多个都可能匹配
+```
+
+再调用 LLM。
+
+因此最好：
+
+```text
+Deterministic Resolver
+        ↓
+     能解决？
+    /      \
+   是       否
+   ↓        ↓
+自动 patch  LLM choose candidate
+```
+
+---
+
+# 你这个案例还有一个更根本的问题
+
+你的用户 goal 是：
+
+```text
+Open saucedemo.com,
+login with standard_user / secret_sauce,
+click add to cart
+```
+
+注意最后只是：
+
+```text
+click add to cart
+```
+
+**没有说明加哪个商品。**
+
+所以 6 个按钮实际上都符合用户需求。
+
+这时候系统严格来说根本不能知道：
+
+> 应该点哪个？
+
+所以 `6 个 Add to cart` 并不只是 locator 技术问题，它还是一个：
+
+> **Requirement Ambiguity**
+
+这是非常重要的一点。
+
+你现在 Repair LLM 实际是在偷偷替用户决定：
+
+```text
+随便选择一个商品
+```
+
+于是自然会波动。
+
+---
+
+# 这种情况应该新增一种问题类型
+
+不要全部都叫：
+
+```text
+AMBIGUOUS_LOCATOR
+```
+
+应该区分：
+
+### Locator ambiguity
+
+用户明确说：
+
+```text
+Add Sauce Labs Backpack to cart
+```
+
+页面有 6 个 Add to cart。
+
+这时需求明确，只是 locator 不唯一。
+
+```text
+→ 系统应该自动消歧
+```
+
+---
+
+### Requirement ambiguity
+
+用户只说：
+
+```text
+click add to cart
+```
+
+页面有 6 个商品。
+
+这时：
+
+```text
+→ 系统根本不知道用户要哪个
+```
+
+应该产生：
+
+```json
+{
+  "type": "REQUIREMENT_AMBIGUOUS",
+  "step_index": 6,
+  "message": "页面存在 6 个 Add to cart 按钮，但用户未指定商品",
+  "options": [
+    "Sauce Labs Backpack",
+    "Sauce Labs Bike Light",
+    "Sauce Labs Bolt T-Shirt"
+  ]
+}
+```
+
+Demo 可以有两种策略。
+
+---
+
+# 策略 A：自动选择，但规则必须确定
+
+为了 Demo 不弹窗，可以规定：
+
+> 如果用户没有指定具体对象，并且存在多个等价候选，则选择页面顺序中的第一个，同时记录 implicit_choice。
+
+例如：
+
+```json
+{
+  "resolution": "implicit_first_match",
+  "selected_scope": "Sauce Labs Backpack",
+  "reason": "用户未指定商品，按确定性规则选择第一个候选"
+}
+```
+
+这样每次都是：
+
+```text
+Sauce Labs Backpack
+```
+
+不会：
+
+```text
+第一次 Backpack
+第二次 Bike Light
+第三次 Onesie
+```
+
+这对 Demo 非常实用。
+
+但报告里一定要明确：
+
+```text
+Implicit choice applied
+```
+
+不要假装用户指定过。
+
+---
+
+# 策略 B：要求用户补充
+
+真正产品化的话更正确：
+
+```text
+发现多个符合条件的 "Add to cart"：
+
+1. Sauce Labs Backpack
+2. Sauce Labs Bike Light
+3. Sauce Labs Bolt T-Shirt
+...
+
+请选择要操作的商品。
+```
+
+但你的 Demo 目前 `/api/generate` 是一次性调用，不方便互动，所以第一阶段用：
+
+> deterministic first candidate
+
+更简单。
+
+---
+
+# 你现在最应该改的 Preflight
+
+我建议从：
+
+```python
+if count > 1:
+    issues.append({
+        "type": "AMBIGUOUS_LOCATOR",
+        ...
+    })
+```
+
+升级为：
+
+```python
+if count > 1:
+    candidates = await extract_candidate_contexts(locator)
+
+    issues.append({
+        "step_index": step_index,
+        "type": "AMBIGUOUS_LOCATOR",
+        "target": step.target.model_dump(),
+        "match_count": count,
+        "candidates": candidates,
+    })
+```
+
+候选可以这样提取。
+
+伪代码：
+
+```python
+async def extract_candidate_contexts(locator):
+    candidates = []
+
+    count = await locator.count()
+
+    for i in range(count):
+        node = locator.nth(i)
+
+        # 向上找一个稳定的业务容器
+        container = node.locator(
+            "xpath=ancestor::*[self::li or self::article or @data-testid][1]"
+        )
+
+        if await container.count() == 0:
+            container = node.locator("xpath=../..")
+
+        text = (await container.inner_text()).strip()
+
+        candidates.append({
+            "index": i,
+            "context_text": text[:300],
+        })
+
+    return candidates
+```
+
+不过长期最好不要硬编码：
+
+```text
+../..
+```
+
+Demo 可以先这么做，之后再结构化。
+
+---
+
+# 更进一步：直接给每个候选一个 `candidate_ref`
+
+比如：
+
+```json
+{
+  "candidate_ref": "step6:c1",
+  "context": {
+    "text": "Sauce Labs Backpack $29.99"
+  }
+}
+```
+
+LLM Repair：
+
+```json
+{
+  "step_index": 6,
+  "candidate_ref": "step6:c1"
+}
+```
+
+Executor / patcher 使用对应 scope。
+
+这与你之前 Explore 的：
+
+```text
+element_ref
+```
+
+设计理念完全一致。
+
+你可以形成：
+
+```text
+Explore:
+target_ref
+
+Repair:
+candidate_ref
+```
+
+都是：
+
+> **LLM 只引用系统观察到的实体，不自由创造实体。**
+
+---
+
+# 三轮 Repair 本身也建议改
+
+你现在：
+
+```text
+repair
+→ preflight
+→ repair
+→ preflight
+→ repair
+→ preflight
+```
+
+不是说不能用，但如果三轮每轮都是 LLM 自由生成，实际上只是：
+
+> 重抽三次彩票。
+
+建议改成：
+
+```text
+Round 0
+Planner 生成 DSL
+      ↓
+Preflight
+
+Round 1
+确定性修复
+- role/text fallback
+- exact
+- scope candidate
+      ↓
+Preflight
+
+Round 2
+LLM candidate selection
+      ↓
+Preflight
+
+Round 3
+仍有问题
+      ↓
+停止自动修复
+标记 unresolved
+```
+
+也就是说三轮的能力不同：
+
+```text
+不是：
+LLM → LLM → LLM
+
+而是：
+代码 → constrained LLM → fail-safe
+```
+
+这个设计会专业很多。
+
+---
+
+# Repair Prompt 也应该缩短
+
+你现在可能类似：
+
+```text
+这里有 N 个问题，请全部修复，scope 必须...
+```
+
+改成：
+
+```text
+你是测试定位歧义选择器。
+
+用户目标：
+{sanitized_goal}
+
+以下每个问题都提供了系统实际观察到的候选。
+你只能从 candidates 中选择 candidate_id。
+禁止创建新的 target、scope、文本、CSS 或 locator。
+必须为每个 issue_id 返回且仅返回一个选择。
+
+输入：
+{issues}
+
+输出：
+{
+  "choices": [
+    {
+      "issue_id": "...",
+      "candidate_id": "..."
+    }
+  ]
+}
+```
+
+然后 Pydantic：
+
+```python
+class RepairChoice(BaseModel):
+    issue_id: str
+    candidate_id: str
+
+
+class RepairResponse(BaseModel):
+    choices: list[RepairChoice]
+```
+
+再代码强制：
+
+```python
+expected = {issue.id for issue in issues}
+received = {choice.issue_id for choice in response.choices}
+
+if expected != received:
+    reject_response()
+```
+
+这样“LLM 漏修某一步”会变成：
+
+```text
+invalid repair response
+```
+
+而不是偷偷进入下轮。
+
+---
+
+# 你还可以做一个非常便宜但效果很大的改动
+
+每轮 repair 后，不要只看：
+
+```text
+remaining_issues
+```
+
+记录：
+
+```json
+{
+  "repair_round": 1,
+  "issues_before": 3,
+  "patches_requested": 3,
+  "patches_returned": 3,
+  "patches_applied": 3,
+  "issues_after": 1
+}
+```
+
+然后发现：
+
+```text
+patches_returned < patches_requested
+```
+
+就知道是 LLM coverage 问题。
+
+如果：
+
+```text
+patches_returned = 3
+patches_applied = 3
+issues_after = 1
+```
+
+说明：
+
+> patch 质量问题。
+
+这两类问题解决办法完全不同。
+
+---
+
+# 针对你当前 SauceDemo，我建议这样处理
+
+你的输入：
+
+```text
+Open saucedemo.com,
+login with standard_user / secret_sauce,
+click add to cart
+```
+
+第一次 Preflight：
+
+```text
+button Add to cart → 6 matches
+```
+
+系统识别：
+
+```text
+用户没有指定商品
+```
+
+使用 Demo 策略：
+
+```text
+ambiguity_policy = first_candidate
+```
+
+固定生成：
+
+```json
+{
+  "action": "click",
+  "scope": {
+    "strategy": "text",
+    "text": "Sauce Labs Backpack",
+    "exact": true
+  },
+  "target": {
+    "strategy": "role",
+    "role": "button",
+    "name": "Add to cart",
+    "exact": true
+  }
+}
+```
+
+并在 meta：
+
+```json
+{
+  "implicit_resolutions": [
+    {
+      "step_index": 6,
+      "reason": "用户未指定商品",
+      "selected": "Sauce Labs Backpack",
+      "policy": "first_candidate"
+    }
+  ]
+}
+```
+
+这样跑 10 次应该都一致。
+
+---
+
+## 最建议你现在的修改顺序
+
+这一轮先别急着做“第 7 项结构化 snapshot”。
+
+先解决这 4 件事：
+
+1. **Preflight 为歧义 locator 返回候选上下文，而不只是 count。**
+2. **把 Locator ambiguity 和 Requirement ambiguity 分开。**
+3. **Repair LLM 从“生成 patch”降级为“选择 candidate_id”。**
+4. **用户没有指定对象时采用确定策略，例如 `first_candidate`，而不是让 LLM 随机决定。**
+
+然后再做结构化 observation。
+
+因为现在这个 bug **不是 snapshot 信息不够，而是决策自由度太大**。
+
+如果做完之后链路就会变成：
+
+```text
+Planner
+  ↓
+Preflight
+  ↓
+6 matches
+  ↓
+Candidate Builder
+  ↓
+c1 Backpack
+c2 Bike Light
+c3 T-Shirt
+...
+  ↓
+需求明确？
+ ├─ 是 → deterministic / LLM choose candidate
+ └─ 否 → first_candidate / ask user
+  ↓
+代码生成 Patch
+  ↓
+Preflight
+  ↓
+Execute
+```
+
+这会比“再强化 repair prompt”稳定一个数量级。
+
+你现在这个 6/7 ↔ 7/7 的波动，其实正好暴露出了 Agent 项目一个非常值得讲的工程结论：
+
+> **LLM 最适合做语义判断，不应该承担能够由确定性程序完成的结构修复；模型输出空间越小，Agent 越稳定。**
