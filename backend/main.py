@@ -23,7 +23,9 @@ main.py — FastAPI 入口（HTTP 层：把前端请求接进来）
 ══════════════════════════════════════════════════════════════════════
 """
 
+import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ⚠️ 必须在导入 ai_agent / runner 之前加载 .env！
@@ -53,6 +55,21 @@ from runner import execute_case
 app = FastAPI(title="AI Web Testing", version="1.0.0")
 ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "artifacts"
 
+# ── 耗时自动记录（每次生成/执行成功追加 JSONL，便于 jq 分析）──────────
+# 记录内容：生成各阶段计时（url/explore/planner/preflight）+
+# 执行每步耗时与定位策略。不含敏感值（不记录 value 明文）。
+TIMINGS_LOG = Path(__file__).resolve().parents[1] / "timings.jsonl"
+
+
+def _append_timing(record: dict) -> None:
+    """自动追加耗时记录（失败静默，不影响主链路）。"""
+    try:
+        record["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with open(TIMINGS_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 
 # ── API ────────────────────────────────────────────────────────────────────────
 # 每个 API = 装饰器声明路由 + Pydantic 模型声明请求格式 + 业务函数
@@ -78,6 +95,23 @@ def api_generate(req: GenerateRequest):
     """
     try:
         case, meta = generate_dsl(req.prompt)
+        pf = meta.get("preflight") or {}
+        _append_timing({
+            "type": "generate",
+            "timings": meta.get("timings"),
+            "planner": meta.get("planner"),
+            "cache_hit": meta.get("cache_hit"),
+            "explore": meta.get("explore"),          # pages/steps_used/llm_calls
+            "preflight": {                           # 修复链路各阶段结果
+                "blocking": len(pf.get("blocking_issues") or []),
+                "warnings": len(pf.get("warnings") or []),
+                "issues_before": pf.get("issues_before"),
+                "issues_after": pf.get("issues_after"),
+                "effective_repairs": pf.get("effective_repairs"),
+                "coverage": pf.get("observation_coverage"),
+            },
+            "normalize_removed_assertions": meta.get("normalize_removed_assertions"),
+        })
         return {"ok": True, "case": case.model_dump(), "meta": meta}   # 模型 → dict → JSON
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"AI 生成失败: {str(exc)[:300]}")
@@ -94,6 +128,20 @@ def api_execute(req: ExecuteRequest):
     try:
         case = validate_case(req.case)   # 再次校验（前后端都不能绕过）
         report = execute_case(case, req.input_values)
+        _append_timing({
+            "type": "execute",
+            "case_name": report.get("case_name"),
+            "total_ms": report.get("total_duration_ms"),
+            "avg_step_ms": report.get("avg_step_ms"),
+            "passed": f"{report.get('passed_steps')}/{report.get('total_steps')}",
+            "steps": [
+                {"i": r["step_index"], "action": r["action"], "status": r["status"],
+                 "ms": r.get("duration_ms"), "resolved_by": r.get("resolved_by"),
+                 "target": r.get("target"), "scope": r.get("scope"),
+                 "error": (r.get("error") or "")[:200]}   # error 截断；不含 value 明文
+                for r in report.get("results", [])
+            ],
+        })
         return {"ok": True, "report": report}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"执行失败: {str(exc)[:300]}")

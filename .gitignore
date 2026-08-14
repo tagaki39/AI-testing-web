@@ -11,3 +11,4 @@ test_*.json
 __pycache__/
 *.py[cod]
 .cache/
+timings.jsonl
