@@ -356,7 +356,7 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
         for strategy, locator in _build_locators(page, t):
             try:
                 if locator.count() == 1:
-                    return strategy, locator, 0
+                    return strategy, locator
             except Exception:
                 pass
 
@@ -368,7 +368,6 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
     #   Phase B：全部 count==0 时，全局预算（≤5s）内轮询 rescan
     # 整个 _resolve_locator 的时间上界 ≈ 5s，不再随候选数线性增长。
     resolve_deadline = perf_counter() + min(timeout_ms, 5000) / 1000.0
-    resolve_started = perf_counter()
 
     def scan() -> tuple[list, list[str], bool]:
         """Phase A：只 count()。返回 (唯一命中列表, 策略错误, 是否存在>0 匹配)。"""
@@ -405,10 +404,8 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
         # allow_lazy（wait_for/assert_visible）：visible 等待由执行器
         #（定位唯一后 locator.wait_for(visible)）负责，这里只保证"出现且唯一"
 
-    resolve_ms = int((perf_counter() - resolve_started) * 1000)
-
     if len(matches) == 1:
-        return matches[0][0], matches[0][1], resolve_ms
+        return matches[0][0], matches[0][1]
     if len(matches) > 1:
         # ① 可见性过滤：同一商品 normal+overlay 双 render 时，隐藏的
         #    Add to cart 不计入（overlay 通常不可见）——distinct actionable
@@ -430,7 +427,7 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
                 for _, loc in candidates[1:]
             )
             if all_same:
-                return candidates[0][0], candidates[0][1], resolve_ms
+                return candidates[0][0], candidates[0][1]
         except Exception:
             pass
 
@@ -451,7 +448,7 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
     hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
     error_detail = f"；strategy_errors={strategy_errors}" if strategy_errors else ""
     raise LocatorNotFoundError(
-        f"所有定位策略均未命中: {target}{hint}{error_detail}；resolve_ms={resolve_ms}"
+        f"所有定位策略均未命中: {target}{hint}{error_detail}"
     )
 
 
@@ -539,13 +536,17 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
             # 先定位（三分法），再执行动作
             # wait_for / assert_visible 允许"等待出现"（元素可能渲染中）
             allow_lazy = step.action in ("wait_for", "assert_visible")
-            resolved_by, locator, resolve_ms = _resolve_locator(
-                page, step.target, step.scope,
-                allow_lazy=allow_lazy,
-                timeout_ms=step.timeout_ms,
-            )
+            resolve_started = perf_counter()
+            try:
+                resolved_by, locator = _resolve_locator(
+                    page, step.target, step.scope,
+                    allow_lazy=allow_lazy,
+                    timeout_ms=step.timeout_ms,
+                )
+            finally:
+                # 调用方计时：成功/NotFound/Ambiguous 都有真实 resolve_ms
+                evidence["resolve_ms"] = int((perf_counter() - resolve_started) * 1000)
             evidence["resolved_by"] = resolved_by   # 记录定位策略命中
-            evidence["resolve_ms"] = resolve_ms     # 记录定位解析耗时
 
             if step.action == "click":
                 locator.click(timeout=step.timeout_ms)
