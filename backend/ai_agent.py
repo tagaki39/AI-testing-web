@@ -803,7 +803,10 @@ def _build_locator_for_count(page, target: dict):
     if parsed is None:
         return None
     if parsed.test_id:
-        return page.get_by_test_id(parsed.test_id)
+        loc = page.get_by_test_id(parsed.test_id)
+        if loc.count() == 0:
+            loc = page.locator(f'[data-test="{parsed.test_id}"], [data-qa="{parsed.test_id}"]')
+        return loc
     if parsed.role and parsed.name:
         return page.get_by_role(parsed.role, name=parsed.name)
     if parsed.text:
@@ -945,7 +948,10 @@ def _build_locator_exact_first(page, target: dict):
     if parsed is None:
         return None
     if parsed.test_id:
-        return page.get_by_test_id(parsed.test_id)
+        loc = page.get_by_test_id(parsed.test_id)
+        if loc.count() == 0:
+            loc = page.locator(f'[data-test="{parsed.test_id}"], [data-qa="{parsed.test_id}"]')
+        return loc
     if parsed.role and parsed.name:
         loc = page.get_by_role(parsed.role, name=parsed.name, exact=True)
         if loc.count() == 0:

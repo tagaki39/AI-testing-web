@@ -231,7 +231,12 @@ def _build_locators(container, t: ParsedTarget) -> list[tuple[str, object]]:
     """
     candidates: list[tuple[str, object]] = []
     if t.test_id:
+        # get_by_test_id 默认只认 data-testid；真实站点常用 data-test/data-qa
+        #（saucedemo 用 data-test）→ 附加属性变体
         candidates.append(("test_id", container.get_by_test_id(t.test_id)))
+        candidates.append(("test_id_attr", container.locator(
+            f'[data-test="{t.test_id}"], [data-qa="{t.test_id}"]',
+        )))
     if t.role and t.name:
         # exact-first：避免 "Cart" 模糊命中 "View Cart"（修复 Step 9）
         candidates.append(("role", container.get_by_role(t.role, name=t.name, exact=True)))
