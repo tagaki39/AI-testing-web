@@ -240,7 +240,7 @@ def _record_page(state: ExploreState, page) -> None:
     url = page.url
     state.current_url = url
     state.snapshot = _observe(page)
-    state.elements = _parse_elements(state.snapshot)   # ← ref 表
+    state.elements = _parse_elements(state.snapshot)   # ← ref 表（页面级 e1/e2）
 
     # 状态哈希：snapshot 变化 = 页面状态变化（即使 URL 相同）
     state_hash = hashlib.sha256(state.snapshot.encode()).hexdigest()[:10]
@@ -257,12 +257,19 @@ def _record_page(state: ExploreState, page) -> None:
     if same_url_count >= _MAX_OBSERVATIONS_PER_URL:
         return
 
+    obs_id = f"obs{len(state.observations) + 1}"
+    # G1：state-scoped ref——元素 ref 从页面级 "e1" 升级为状态级 "obs3:e1"。
+    # Planner 引用 obs3:e17 时，系统知道 belongs_to=obs3（state identity）。
+    for element in state.elements:
+        element["ref"] = f"{obs_id}:{element['ref']}"
+
     state.observations.append({
-        "id": f"obs{len(state.observations) + 1}",
+        "id": obs_id,
         "url": url,
         "title": _safe_title(page),
         "state_hash": state_hash,
         "snapshot": state.snapshot,
+        "elements": state.elements,   # G1：observations 携带 state-scoped refs
     })
 
 

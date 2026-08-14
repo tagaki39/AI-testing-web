@@ -1410,16 +1410,26 @@ def _pages_to_text(pages: list[dict]) -> str:
 
     分段标记用 observation id（obs1/obs2/...）——Planner 生成 DSL 时
     用 observation_ref 引用（Commit 2 接入）。
+
+    G1：每页附 state-scoped 元素表（refs）——Planner 可输出 target_ref
+    引用系统观察到的真实元素（obs3:e17），而非自由构造 role/name/scope。
     """
     sections = []
     for page in pages:
         obs_id = page.get("id", f"obs{len(sections) + 1}")
         title = page.get("title") or ""
-        sections.append(
+        section = (
             f"[{obs_id}] {page['url']}"
             + (f"（标题: {title}）" if title else "")
             + f"\n{page['snapshot']}"
         )
+        elements = page.get("elements") or []
+        if elements:
+            lines = [f"      {e['ref']}: {e.get('role', '')} \"{e.get('name', '')}\""
+                     if "role" in e else f"      {e['ref']}: text \"{e.get('text', '')}\""
+                     for e in elements[:30]]
+            section += "\n   元素引用表（target_ref 只能从这些 ref 中选择）:\n" + "\n".join(lines)
+        sections.append(section)
     return "\n\n".join(sections)
 
 
@@ -1500,7 +1510,10 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             '必须用 {"text": "xxx"} 定位，禁止用 {"role": "heading"}；'
             "3. 每个步骤必须设置 observation_ref，且只能从页面分段标记"
             "（[obs1] [obs2] ...）中选择——禁止创造不存在的 observation_ref；"
-            "该步骤的 target/scope 必须来自该 observation 的页面结构。"
+            "该步骤的 target/scope 必须来自该 observation 的页面结构；"
+            "4. （G1）优先使用 target_ref 引用元素引用表中的系统观察元素"
+            "（如 obs3:e17），target_ref 只能从元素引用表选择，禁止编造；"
+            "同时仍需提供 target（语义回退，执行时用 target 定位）。"
         )
     else:
         grounded_prompt = explore_goal   # 无快照时同样用脱敏后的需求

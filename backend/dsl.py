@@ -108,6 +108,9 @@ class DSLStep(DSLModel):
     observation_ref: str | None = None   # 该步骤基于哪个观察到的页面状态生成
                                           # （grounding provenance + Preflight 验证上下文；
                                           #  不参与 Runner 执行）
+    target_ref: str | None = None   # G1：state-scoped 元素引用（"obs3:e17"）——
+                                     # Planner 优先引用系统观察到的真实元素；
+                                     # 执行时回退到 target 语义（R1 Compiler 接管前）
 
     @model_validator(mode="after")
     def _check_required_fields(self) -> "DSLStep":
