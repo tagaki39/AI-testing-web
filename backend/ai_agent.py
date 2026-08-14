@@ -1481,7 +1481,10 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
                 pages = explore_result.get("observations", [])   # ← observations 模型
                 # 保存前脱敏：history 的 value 还原为 ${var}（缓存不落盘真实凭据）
-                cache_save(entry_url, auth_profile, _sanitize_for_cache(explore_result, runtime_inputs))
+                # 只缓存有效探索（至少一次成功动作）——失败/空探索不缓存，
+                # 否则坏结果毒化缓存，后续生成永远命中 steps=0 的假成功。
+                if explore_result.get("steps_used", 0) > 0:
+                    cache_save(entry_url, auth_profile, _sanitize_for_cache(explore_result, runtime_inputs))
             except Exception:
                 explore_result = None   # 探索异常 → 降级无快照生成
     explore_ms = int((perf_counter() - t_explore) * 1000)
@@ -1543,6 +1546,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             "steps_used": (explore_result or {}).get("steps_used", 0),
             "llm_calls": (explore_result or {}).get("llm_calls", 0),
             "done": (explore_result or {}).get("done", False),
+            "transitions": (explore_result or {}).get("transitions", []),   # G2：状态转移边
         } if explore_result else None,
         "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）
     }

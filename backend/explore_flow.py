@@ -84,6 +84,7 @@ class ExploreState:
     elements: list[dict] = field(default_factory=list)      # 当前页元素表（ref）
     history: list[dict] = field(default_factory=list)       # 操作历史
     observations: list[dict] = field(default_factory=list)  # 页面状态观察（含 state_hash）
+    transitions: list[dict] = field(default_factory=list)   # G2：状态转移边（obs3 --click e17--> obs4）
     step_count: int = 0                # 已执行动作数
     llm_calls: int = 0                 # 已用 LLM 调用数
     done: bool = False                 # 探索是否完成
@@ -416,6 +417,8 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             element = next((e for e in state.elements if e["ref"] == ref), None) if ref else None
             target = {"role": element["role"], "name": element["name"]} if element and "role" in element \
                 else ({"text": element["text"]} if element else None)
+            # G2：动作前状态（transition 的 from）
+            from_obs = state.observations[-1]["id"] if state.observations else None
             t0 = perf_counter()
             try:
                 action_done = _act(page, decision, state.elements, runtime_inputs or {})
@@ -450,6 +453,18 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             _record_page(state, page)    # observe 新页面状态
             state.timings["observation_ms"] += int((perf_counter() - t0) * 1000)
 
+            # G2：记录状态转移边（obs3 --click e17--> obs4）。
+            # 动作成功（action_done 非 None）才记录；from/to 为动作前后的
+            # observation id（同状态变化也会形成新 obs → 自转移边）。
+            if action_done is not None and from_obs:
+                to_obs = state.observations[-1]["id"] if state.observations else from_obs
+                state.transitions.append({
+                    "from": from_obs,
+                    "action": decision["action"],
+                    "target_ref": ref,
+                    "to": to_obs,
+                })
+
             # origin 守卫（第 6 项）：点击跨域链接（文档/GitHub/外部认证）
             # → 记录并回退，探索不离开被测站点
             if not _within_origin(state.current_url, state.entry_url):
@@ -471,6 +486,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
 
     return {
         "observations": state.observations,
+        "transitions": state.transitions,   # G2：状态转移边
         "history": state.history,
         "steps_used": state.step_count,
         "llm_calls": state.llm_calls,
