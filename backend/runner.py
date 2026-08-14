@@ -356,60 +356,59 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
         for strategy, locator in _build_locators(page, t):
             try:
                 if locator.count() == 1:
-                    return strategy, locator
+                    return strategy, locator, 0
             except Exception:
                 pass
 
     containers = _resolve_scope_containers(page, scope)
 
-    # scope 联合三分法（修复）：收集所有"容器内 target 唯一命中"的候选，
-    # 最后统一判断——而不是遇到第一个唯一就返回。
-    #   容器内 target 0 个   → 该容器无效（继续找）
-    #   容器内 target 多个   → 容器太宽（继续找更精确的容器，不报歧义）
-    #   全部容器遍历后：
-    #     matches == 0 → NotFound
-    #     matches == 1 → 使用
-    #     matches > 1  → Ambiguous（多个独立容器各自唯一命中——真 scope 歧义）
+    # 两阶段 Resolver + global deadline（修复执行慢：per-candidate 等待
+    # 5s × N 容器 × M 策略可叠加成 60-110s）：
+    #   Phase A：立即扫描（只 count()，不等待）——已有候选就直接处理
+    #   Phase B：全部 count==0 时，全局预算（≤5s）内轮询 rescan
+    # 整个 _resolve_locator 的时间上界 ≈ 5s，不再随候选数线性增长。
+    resolve_deadline = perf_counter() + min(timeout_ms, 5000) / 1000.0
+    resolve_started = perf_counter()
+
+    def scan() -> tuple[list, list[str], bool]:
+        """Phase A：只 count()。返回 (唯一命中列表, 策略错误, 是否存在>0 匹配)。"""
+        matches: list[tuple[str, object]] = []
+        errors: list[str] = []
+        has_positive = False
+        for container in containers:
+            for strategy, locator in _build_locators(container, t):
+                try:
+                    count = locator.count()
+                except Exception as exc:
+                    # strategy-local failure：单策略异常不炸链，记录继续
+                    errors.append(f"{strategy}: {type(exc).__name__}: {str(exc)[:120]}")
+                    continue
+                if count == 1:
+                    matches.append((strategy, locator))
+                    break   # 该容器内唯一命中，下一容器
+                if count > 1:
+                    has_positive = True
+                    continue   # 容器太宽 → 尝试更精确的容器/策略
+                # count == 0：留给 Phase B 判定（全 0 才等待）
+        return matches, errors, has_positive
+
     matches: list[tuple[str, object]] = []
     strategy_errors: list[str] = []
-    for container in containers:
-        for strategy, locator in _build_locators(container, t):
-            try:
-                count = locator.count()
-            except Exception as exc:
-                # strategy-local failure：单个策略内部异常（如 selector 语法）
-                # 不炸整条 fallback 链——记录错误，继续下一个策略
-                strategy_errors.append(f"{strategy}: {type(exc).__name__}: {str(exc)[:120]}")
-                continue
+    while True:
+        matches, strategy_errors, has_positive = scan()
+        if matches:
+            break   # 唯一命中已存在
+        # 无唯一命中：歧义（>1）存在时不值得等待；全 0 且预算内 → 轮询
+        if has_positive or perf_counter() >= resolve_deadline:
+            break
+        page.wait_for_timeout(150)
+        # allow_lazy（wait_for/assert_visible）：visible 等待由执行器
+        #（定位唯一后 locator.wait_for(visible)）负责，这里只保证"出现且唯一"
 
-            if count == 1:
-                matches.append((strategy, locator))
-                break   # 该容器内已唯一命中，进入下一容器
-            if count > 1:
-                continue   # 容器太宽（target 多个）→ 尝试更精确的容器
-            # count == 0：元素可能正在渲染（SPA 异步）——先等待出现再判定
-            # （修复 #8：click/fill 不再立即判 NotFound，否则比原生 Playwright 更 flaky）
-            try:
-                locator.wait_for(state="attached", timeout=min(timeout_ms, 5000))
-            except Exception:
-                if allow_lazy:
-                    # wait_for/assert_visible：继续等 visible（语义是"等待可见"）
-                    try:
-                        locator.wait_for(state="visible", timeout=timeout_ms)
-                        matches.append((strategy, locator))
-                        break
-                    except Exception:
-                        continue   # 超时 → 尝试下一个策略（降级）
-                continue   # 非 lazy 动作：attached 等待失败 → 下一策略
-            count = locator.count()   # 重新计数（等待后元素可能出现）
-            if count == 1:
-                matches.append((strategy, locator))
-                break
-            if count > 1:
-                continue   # 等待后出现多个 → 容器太宽，尝试更精确的
+    resolve_ms = int((perf_counter() - resolve_started) * 1000)
 
     if len(matches) == 1:
-        return matches[0]
+        return matches[0][0], matches[0][1], resolve_ms
     if len(matches) > 1:
         # ① 可见性过滤：同一商品 normal+overlay 双 render 时，隐藏的
         #    Add to cart 不计入（overlay 通常不可见）——distinct actionable
@@ -431,7 +430,7 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
                 for _, loc in candidates[1:]
             )
             if all_same:
-                return candidates[0]
+                return candidates[0][0], candidates[0][1], resolve_ms
         except Exception:
             pass
 
@@ -451,7 +450,9 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
         )
     hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
     error_detail = f"；strategy_errors={strategy_errors}" if strategy_errors else ""
-    raise LocatorNotFoundError(f"所有定位策略均未命中: {target}{hint}{error_detail}")
+    raise LocatorNotFoundError(
+        f"所有定位策略均未命中: {target}{hint}{error_detail}；resolve_ms={resolve_ms}"
+    )
 
 
 # ── 变量替换 ────────────────────────────────────────────────────────────────────
@@ -508,6 +509,7 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
         "screenshot": None,
         "duration_ms": 0,
         "resolved_by": None,     # 定位策略：test_id / role / text / css / None(goto/整页断言)
+        "resolve_ms": 0,         # 定位解析耗时（区分 resolve vs action）
     }
     try:
         if step.action == "goto":
@@ -537,12 +539,13 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
             # 先定位（三分法），再执行动作
             # wait_for / assert_visible 允许"等待出现"（元素可能渲染中）
             allow_lazy = step.action in ("wait_for", "assert_visible")
-            resolved_by, locator = _resolve_locator(
+            resolved_by, locator, resolve_ms = _resolve_locator(
                 page, step.target, step.scope,
                 allow_lazy=allow_lazy,
                 timeout_ms=step.timeout_ms,
             )
             evidence["resolved_by"] = resolved_by   # 记录定位策略命中
+            evidence["resolve_ms"] = resolve_ms     # 记录定位解析耗时
 
             if step.action == "click":
                 locator.click(timeout=step.timeout_ms)
