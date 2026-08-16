@@ -152,7 +152,7 @@ Locator resolution: "DOM 里谁对应它？" → semantic resolver
 | **R2** | scoring + confidence margin | 高分但 margin 低仍拒绝（✅ 已完成：`resolver.decide_resolution`——策略评分分层 + 放松组 + 置信度门槛；`LowConfidenceError` 继承 Ambiguous 保持兼容） |
 | **I1** | 实例身份恢复 | 编译后 locator 可区分 observation 内同名元素（容器内 scope 编译 + 身份证据前移；容器外留给 L1）（✅ 已完成：探索采集容器锚点 `scope_has_text` + verified 标记 → Compiler 同名重复附加 `Scope(has_text)`；E2E saucedemo 6/6、automationexercise 定位步骤全通——剩余失败为探索完整性/规划质量波动，属生成链路增强阶段） |
 | **L1** | corrections JSON loop | correction 是 candidate source，不绕过 Resolver；成功/失败统计 + 连续失败 disable（✅ 已完成：`backend/corrections.py`——URL 泛化 + 语义键匹配、upsert、连续失败 3 次熔断；correction 以 130 分最高候选进入统一裁决；前端失败步骤可提交修正；P4 E2E 验收：失败 → 提交 → 重跑命中 verified_count=1） |
-| **GQ** | 生成链路可靠性（质量门 + 探索完整性） | 见下方 GQ 决策记录（✅ 已完成第一阶段：finish 完整性校验 + 缓存门槛放宽 done/steps≥2 + 目标覆盖警告 fail-open；E2E：saucedemo 二次生成 cache_hit 5.6s、automationexercise 缺动作警告精确触发） |
+| **GQ** | 生成链路可靠性（质量门 + 探索完整性） | 见下方 GQ 决策记录（✅ 已完成：finish 完整性校验 + 缓存门槛放宽 done/steps≥2 + 目标覆盖警告 + GQ2 硬失败/自愈重生/反模式负例；E2E：saucedemo 无回归、automationexercise 不完整计划被明确拦截） |
 
 **首个 milestone**：两个 regression 的执行前拒绝（不要求自动修复）：
 
@@ -223,8 +223,24 @@ exploration_complete 时做代码校验——已执行动作 < 2 的完成宣告
   （fail-open，不误伤合法计划）
 - 本期只警告不硬失败——硬失败与自愈重生配套（GQ2 阶段）
 
-**明确不做（GQ2 阶段）**：质量门硬失败 + 自愈重生（retry_reason_code →
-anti-pattern 负例 few-shot）；生成期读修正库提示 Planner。
+### GQ2 决策记录（质量门硬失败 + 自愈重生，动手前冻结）
+
+**决策 1 — 硬失败只针对可证明的缺陷**：`missing_actions` 非空（目标要求
+动作而计划无对应 click）→ 计划可证明不完整 → 硬失败不返回；
+`exploration_incomplete` 保持警告（done=False 太常见，且实测 done=False
+的计划也能 7/7——不可证明不完整，不硬失败）。
+
+**决策 2 — 重生 ×1（延续 Schema Recovery 哲学）**：失败 → 记录反模式 →
+带负例 few-shot + 上次错误信息重新规划一次（复用探索结果，不重新探索）；
+第二次仍失败 → 明确报错（400），绝不静默降级返回不完整计划。
+
+**决策 3 — 反模式存储（anti_patterns.json，仿 corrections）**：
+{reason_code, summary, created_at}；reason_code 分类：
+missing_step（缺关键动作）/ invalid_structure（schema 恢复失败）/
+invalid_ref（编造 ref / grounding 拒绝）；按 code 取最近 5 条注入重生
+prompt；summary 为失败计划的行为摘要（actions+targets，脱敏）。
+
+**明确不做**：生成期读修正库提示 Planner；多轮重规划。
 
 ---
 

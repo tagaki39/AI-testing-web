@@ -15,3 +15,6 @@ timings.jsonl
 
 # L1 修正规则（持久化覆盖规则，人工数据）
 corrections.json
+
+# GQ2 生成失败反模式库（自愈重生负例）
+anti_patterns.json

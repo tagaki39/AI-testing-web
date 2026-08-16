@@ -35,13 +35,17 @@ from dataclasses import dataclass, asdict
 from time import perf_counter
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from compiler import compile_targets
 from dsl import DSLCase, Locator, Scope, validate_case
 from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
 from explore_flow import GOAL_ACTION_PATTERNS, explore
-from grounding import StateGraph, validate_state_grounding
+import anti_patterns
+from grounding import (
+    StateGraph, StateGroundingMismatchError, UnknownTargetRefError,
+    validate_state_grounding,
+)
 from resolver import (
     PRICE_RE, build_locator_exact_first, build_locator_for_count,
     choose_scope_text, is_navigation_target, parse_target, snapshot_match,
@@ -161,27 +165,32 @@ SYSTEM_PROMPT_REFS_ONLY = """你是 Web UI 自动化测试的 DSL 生成器（re
    - 所有可变测试输入必须使用 ${var}，每个变量必须声明在 input_contract
    - secret=true → default 必须为 null（执行时本地注入）
    - 非敏感变量只有上下文明确提供 default 时才能填写；不得猜测真实值
-4. observation_ref（grounding 引用）：
+4. 业务动作覆盖（最重要）：
+   - 用户目标中要求的每个业务动作都必须生成对应的执行步骤——
+     目标说"加入购物车"就必须有 click 加购元素的步骤，说"登录"就必须
+     有完整的登录步骤（fill + click）
+   - 禁止只生成导航（goto）和断言而跳过目标要求的业务动作
+5. observation_ref（grounding 引用）：
    - 每个可定位步骤应引用产生该定位证据的 observation id（obs1/obs2/...）
    - observation_ref 必须来自系统提供的 observation 列表，禁止编造
    - target_ref 的 obs 前缀必须与 observation_ref 一致（都是 obsN）
-5. 断言动作字段约束（机械规则）：
+6. 断言动作字段约束（机械规则）：
    - assert_text: value 必填（要验证的文本）；验证某个元素内文本时用 target_ref
      引用该元素，验证整页文本时不提供 target_ref；
      禁止把待验证文本只放在 target 里而省略 value（target 字段本来就被禁止）
    - assert_visible: target_ref 必填（验证元素出现）
    - assert_url: value 必填（URL 片段），不需要 target_ref
-6. 最小测试原则：
+7. 最小测试原则：
    - 仅生成完成用户需求所需的最少步骤
    - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
    - 单一最终目标默认生成恰好 1 个最终验证
    - 如果用户明确要求多个独立验证结果，则保留这些明确要求的验证
-7. 验证策略：
+8. 验证策略：
    - 登录/页面跳转 → 优先 assert_url 或目标页面关键元素 assert_visible
    - 元素出现、按钮状态变化 → assert_visible
    - 文本、价格、数量变化 → assert_text
    - 用户未明确验证方式时，选择与最终动作因果关系最直接的可观察结果
-8. 只输出 JSON，不要输出任何解释或代码块标记"""
+9. 只输出 JSON，不要输出任何解释或代码块标记"""
 
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
@@ -540,6 +549,61 @@ def _check_goal_coverage(goal: str, case: DSLCase) -> list[str]:
         if not covered:
             missing.append(label)
     return missing
+
+
+# ── GQ2：生成期质量门异常 + 自愈重生辅助 ──────────────────────────────────────
+
+class GoalCoverageError(Exception):
+    """计划可证明不完整：目标要求动作而计划无对应 click（硬失败，不返回）。"""
+
+    def __init__(self, missing: list[str], case: DSLCase | None = None):
+        self.missing = missing
+        self.case = case
+        names = "、".join(missing)
+        super().__init__(f"目标要求 {names} 动作，但计划中无对应点击步骤")
+
+
+def _failure_reason_code(exc: Exception) -> str:
+    """失败 → 反模式原因码（missing_step / invalid_ref / invalid_structure）。"""
+    if isinstance(exc, GoalCoverageError):
+        return "missing_step"
+    if isinstance(exc, (UnknownTargetRefError, StateGroundingMismatchError)):
+        return "invalid_ref"
+    return "invalid_structure"
+
+
+def _brief_target(target) -> str:
+    """target → 短描述（反模式摘要用，不含 value 明文）。"""
+    if target is None:
+        return "-"
+    if hasattr(target, "model_dump"):
+        d = target.model_dump()
+        return d.get("name") or d.get("text") or d.get("test_id") or d.get("css") or "-"
+    if isinstance(target, str):
+        return target[:30]
+    return "-"
+
+
+def _plan_summary(case: DSLCase | None, error_info: str) -> str:
+    """失败计划的行为摘要（脱敏：action + target 简写 + 错误截断）。"""
+    if case is None:
+        return f"错误: {error_info[:200]}"
+    steps = "; ".join(
+        f"{s.action}({_brief_target(s.target)})" for s in case.steps[:8]
+    )
+    return f"计划: {steps} | 错误: {error_info[:160]}"
+
+
+def _build_retry_hint(error_info: str, patterns: list[str]) -> str:
+    """重生提示：上次失败原因 + 反模式负例（可单测）。"""
+    lines = [
+        "\n\n【重新规划提示】上一次生成失败，必须修正：",
+        f"- {error_info}",
+        "同类失败案例（不得重复犯）：",
+    ]
+    lines += [f"- {p}" for p in patterns] if patterns else ["- （暂无）"]
+    lines.append("请重新输出完整修正后的 JSON。")
+    return "\n".join(lines)
 
 
 def _generate_planner_case(
@@ -1594,35 +1658,56 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         grounded_prompt = explore_goal   # 无快照时同样用脱敏后的需求
 
     t_planner = perf_counter()
-    case, planner_meta = _generate_planner_case(
-        grounded_prompt,
-        mode="refs_only" if multi_snapshot else "legacy",
-        tables=multi_snapshot,
-    )   # ← Schema Recovery ×1（refs-only 模式含契约违规修复）
-    planner_ms = int((perf_counter() - t_planner) * 1000)
-    case, removed_assertions = _normalize_steps(case)   # ← 计划归一化 + 记录删除
-    case = _normalize_invalid_scopes(case)   # ← 导航 scope invariant（Planner 后立即清）
+    planner_mode = "refs_only" if multi_snapshot else "legacy"
 
     # ← grounding 验证：observation_ref 必须来自系统提供的真实 id
     #（不靠 Prompt——代码校验；非法 ref 清空为 None，降级弱验证）
     valid_refs = {obs["id"] for obs in pages}
-    if valid_refs:
-        for step in case.steps:
-            if step.observation_ref and step.observation_ref not in valid_refs:
-                step.observation_ref = None
 
-    # ← R1 LocatorSpec Compiler → G3 State Grounding Validator ──────────
-    # 有探索证据时：target_ref → target 确定性编译（Planner 只选 ref，
-    # locator 由代码从观察到的元素数据生成），然后跨状态 / 编造 ref 在
-    # 执行前被拒绝。图不进 DSL——两个阶段只在生成链路运行（explore_result
-    # 在作用域内）；执行器仍用编译后的 target 语义回放（评审既定结论）。
-    # 放在 Preflight 之前：grounding 错位的计划不值得花浏览器轮次修复。
-    state_graph = None
-    compile_stats: dict = {}
-    if explore_result is not None:
-        state_graph = StateGraph.from_explore_result(explore_result)
-        case = compile_targets(case, state_graph, stats=compile_stats)   # ← R1+I1 编译
-        validate_state_grounding(case, state_graph)        # ← G3 拒绝
+    # ── 计划生成单元（GQ2 重生循环的可重试体）──────────────────────────
+    # planner → 归一化 → scope 清理 → observation_ref 清理 → 编译 →
+    # grounding → 目标覆盖质量门。有探索证据时：target_ref → target
+    # 确定性编译，跨状态/编造 ref 执行前拒绝（放在 Preflight 之前：
+    # grounding 错位的计划不值得花浏览器轮次修复）。
+    def attempt(prompt: str):
+        case, planner_meta = _generate_planner_case(
+            prompt, mode=planner_mode, tables=multi_snapshot,
+        )   # ← Schema Recovery ×1（refs-only 模式含契约违规修复）
+        case, removed = _normalize_steps(case)   # ← 计划归一化 + 记录删除
+        case = _normalize_invalid_scopes(case)   # ← 导航 scope invariant
+        if valid_refs:
+            for step in case.steps:
+                if step.observation_ref and step.observation_ref not in valid_refs:
+                    step.observation_ref = None
+        compile_stats: dict = {}
+        if explore_result is not None:
+            state_graph = StateGraph.from_explore_result(explore_result)
+            case = compile_targets(case, state_graph, stats=compile_stats)   # ← R1+I1 编译
+            validate_state_grounding(case, state_graph)        # ← G3 拒绝
+        missing = _check_goal_coverage(explore_goal, case)
+        if missing:
+            raise GoalCoverageError(missing, case)   # ← GQ2 硬失败（可证明不完整）
+        return case, planner_meta, removed, compile_stats
+
+    # ── GQ2 自愈重生（bounded ×1；网络异常不捕获，仍 fail safely）──────
+    # 失败 → 记录反模式 → 负例 few-shot + 上次错误注入重生 prompt
+    # （复用探索结果，不重新探索）→ 二次失败 → 异常冒出 → api 400。
+    generation_retries = 0
+    anti_pattern_used = 0
+    try:
+        case, planner_meta, removed_assertions, compile_stats = attempt(grounded_prompt)
+    except (GoalCoverageError, UnknownTargetRefError, StateGroundingMismatchError,
+            ValueError, ValidationError) as exc:
+        reason = _failure_reason_code(exc)
+        failed_case = exc.case if isinstance(exc, GoalCoverageError) else None
+        anti_patterns.record(reason, _plan_summary(failed_case, str(exc)))
+        patterns = anti_patterns.list_for(reason)
+        anti_pattern_used = len(patterns)
+        generation_retries = 1
+        case, planner_meta, removed_assertions, compile_stats = attempt(
+            grounded_prompt + _build_retry_hint(str(exc), patterns),
+        )
+    planner_ms = int((perf_counter() - t_planner) * 1000)
 
     meta = {
         "snapshot_used": bool(multi_snapshot),
@@ -1630,6 +1715,9 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         "cache_hit": cache_hit,      # Speed v1：探索结果是否命中缓存
         "normalize_removed_assertions": removed_assertions or None,   # #20：不静默删
         "planner": planner_meta,     # Schema Recovery 统计（attempts/recovery）
+        # GQ2：自愈重生统计（0 = 一次通过；1 = 带反模式负例重来）
+        "generation_retries": generation_retries,
+        "anti_pattern_used": anti_pattern_used,
         "explore": {
             "pages_visited": len(pages),
             "steps_used": (explore_result or {}).get("steps_used", 0),

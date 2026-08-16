@@ -21,6 +21,7 @@ test_compiler.py — G3 refs-only Planner + R1 LocatorSpec Compiler 测试
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
@@ -455,6 +456,73 @@ def test_check_goal_coverage_detects_missing_click():
 
     # 无动作目标 → fail-open 不检查
     assert _check_goal_coverage("验证页面包含文字 Example Domain", assert_visible_only) == []
+
+
+# ── GQ2：质量门硬失败 + 自愈重生 ─────────────────────────────────────────────
+
+def _reset_anti_patterns(tmpdir: str) -> None:
+    import anti_patterns
+    anti_patterns.STORE_FILE = Path(tmpdir) / "anti_patterns.json"
+    anti_patterns._memory.clear()
+    anti_patterns._loaded = False
+
+
+def test_anti_patterns_store():
+    """record / 去重 / 每 code 上限 / list_for 过滤 / 持久化。"""
+    import anti_patterns
+    tmp = tempfile.mkdtemp(prefix="ap_test_")
+    _reset_anti_patterns(tmp)
+    anti_patterns.record("missing_step", "计划: click(Cart) | 缺失 add_to_cart")
+    anti_patterns.record("missing_step", "计划: click(Cart) | 缺失 add_to_cart")   # 去重
+    anti_patterns.record("invalid_ref", "错误: 未知 target_ref obs2:e99")
+    assert len(anti_patterns.list_for("missing_step")) == 1
+    assert len(anti_patterns.list_for("invalid_ref")) == 1
+    assert anti_patterns.list_for("invalid_structure") == []
+    for i in range(6):   # 超上限：裁最旧，保留最近 5
+        anti_patterns.record("missing_step", f"摘要 {i}")
+    assert len(anti_patterns.list_for("missing_step")) == 5
+    assert anti_patterns.list_for("missing_step")[0] == "摘要 5"
+    # 持久化往返（模拟进程重启）
+    anti_patterns._memory.clear()
+    anti_patterns._loaded = False
+    assert len(anti_patterns.list_for("missing_step")) == 5
+
+
+def test_build_retry_hint():
+    """重生提示包含失败原因 + 负例；无负例时有"暂无"。"""
+    from ai_agent import _build_retry_hint
+    hint = _build_retry_hint("目标要求 add_to_cart 动作", ["计划: click(Cart)"])
+    assert "add_to_cart" in hint and "计划: click(Cart)" in hint
+    assert "重新规划提示" in hint and "完整修正后的 JSON" in hint
+    empty = _build_retry_hint("x", [])
+    assert "（暂无）" in empty
+
+
+def test_goal_coverage_error_and_reason_mapping():
+    """GoalCoverageError 携带缺失清单与失败计划；错误 → 反模式原因码。"""
+    from ai_agent import GoalCoverageError, _failure_reason_code
+    from grounding import UnknownTargetRefError
+    case = validate_case({"name": "t", "steps": [
+        {"action": "goto", "value": "https://x.com"},
+    ]})
+    exc = GoalCoverageError(["add_to_cart"], case)
+    assert exc.missing == ["add_to_cart"] and exc.case is case
+    assert _failure_reason_code(exc) == "missing_step"
+    assert _failure_reason_code(UnknownTargetRefError(1, "obs2:e99")) == "invalid_ref"
+    assert _failure_reason_code(ValueError("bad json")) == "invalid_structure"
+
+
+def test_plan_summary_sanitized():
+    """反模式摘要脱敏：不含 value 明文（密码等）。"""
+    from ai_agent import _plan_summary
+    case = validate_case({"name": "t", "steps": [
+        {"action": "goto", "value": "https://x.com"},
+        {"action": "fill", "target": {"role": "textbox", "name": "Password"},
+         "value": "secret_sauce"},
+    ]})
+    summary = _plan_summary(case, "目标要求 add_to_cart 动作")
+    assert "Password" in summary and "add_to_cart" in summary
+    assert "secret_sauce" not in summary   # value 明文绝不入反模式
 
 
 # ── 运行入口 ──────────────────────────────────────────────────────────────────
