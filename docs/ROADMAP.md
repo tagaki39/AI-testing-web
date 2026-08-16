@@ -152,6 +152,7 @@ Locator resolution: "DOM 里谁对应它？" → semantic resolver
 | **R2** | scoring + confidence margin | 高分但 margin 低仍拒绝（✅ 已完成：`resolver.decide_resolution`——策略评分分层 + 放松组 + 置信度门槛；`LowConfidenceError` 继承 Ambiguous 保持兼容） |
 | **I1** | 实例身份恢复 | 编译后 locator 可区分 observation 内同名元素（容器内 scope 编译 + 身份证据前移；容器外留给 L1）（✅ 已完成：探索采集容器锚点 `scope_has_text` + verified 标记 → Compiler 同名重复附加 `Scope(has_text)`；E2E saucedemo 6/6、automationexercise 定位步骤全通——剩余失败为探索完整性/规划质量波动，属生成链路增强阶段） |
 | **L1** | corrections JSON loop | correction 是 candidate source，不绕过 Resolver；成功/失败统计 + 连续失败 disable（✅ 已完成：`backend/corrections.py`——URL 泛化 + 语义键匹配、upsert、连续失败 3 次熔断；correction 以 130 分最高候选进入统一裁决；前端失败步骤可提交修正；P4 E2E 验收：失败 → 提交 → 重跑命中 verified_count=1） |
+| **GQ** | 生成链路可靠性（质量门 + 探索完整性） | 见下方 GQ 决策记录（✅ 已完成第一阶段：finish 完整性校验 + 缓存门槛放宽 done/steps≥2 + 目标覆盖警告 fail-open；E2E：saucedemo 二次生成 cache_hit 5.6s、automationexercise 缺动作警告精确触发） |
 
 **首个 milestone**：两个 regression 的执行前拒绝（不要求自动修复）：
 
@@ -197,6 +198,33 @@ fail-open——只拒绝可证明的错位，不误拒合法计划）；编造 r
 - 编译出的 scope 运行时仍过三分法 + R2 评分 + margin 门槛
 - 消歧失败 → 明确拒绝（Ambiguous / LowConfidence），**绝不 nth 猜测**
 - 探索期只对同名重复元素采集上下文（性能上界：非重复元素零开销）
+
+### GQ 决策记录（生成链路可靠性，动手前冻结）
+
+**问题**（automationexercise 三次生成三种结果）：① Planner 编造 ref 被拒
+② 计划漏掉"点击加购"动作（9/10——断言了可见性却无点击，静默不完整）
+③ 探索 1 步后宣告完成（计划只覆盖登录）。探索完成率 50%，缓存命中率 20%。
+
+**决策 1 — finish 完整性校验（治过早完成）**：探索器宣告
+exploration_complete 时做代码校验——已执行动作 < 2 的完成宣告无效，
+把"探索不充分"作为 decision_rejected 反馈进历史，预算内继续
+（复用既有自纠机制，零新概念）。
+
+**决策 2 — 缓存门槛放宽（治重探索浪费）**：`done=True OR steps_used ≥ 2`
+才缓存。saucedemo done=False 但 steps=4 的探索产出了 7/7 计划——被拒
+缓存是浪费；而毒化历史的坏探索是 steps=1（同页状态堆叠）——阈值 2
+恰好放行前者、拒绝后者。
+
+**决策 3 — 生成期目标覆盖警告（治静默不完整，fail-open）**：
+- 探索 done=False → meta 标记 exploration_incomplete，前端醒目警告
+  "计划可能不覆盖全部目标，建议重新生成"
+- 目标动作覆盖检查（保守 allowlist，人为维护）：goal 含"加购"类动词
+  而计划无指向 add-to-cart 类元素的动作 → warning；匹配不到不警告
+  （fail-open，不误伤合法计划）
+- 本期只警告不硬失败——硬失败与自愈重生配套（GQ2 阶段）
+
+**明确不做（GQ2 阶段）**：质量门硬失败 + 自愈重生（retry_reason_code →
+anti-pattern 负例 few-shot）；生成期读修正库提示 Planner。
 
 ---
 

@@ -407,6 +407,56 @@ def test_compile_verified_is_not_a_bypass():
     assert compiled.steps[1].scope is None
 
 
+# ── GQ：生成链路可靠性（finish 完整性校验 + 目标覆盖检查）─────────────────────
+
+def test_goal_requires_actions():
+    """动作表命中判定（中文/英文/大小写）。"""
+    from explore_flow import goal_requires_actions
+    assert goal_requires_actions("把第一个商品加入购物车") is True
+    assert goal_requires_actions("Add to Cart and verify") is True
+    assert goal_requires_actions("用 x / y 登录后验证") is True
+    assert goal_requires_actions("验证页面包含文字 Example Domain") is False
+
+
+def test_validate_completion_exemption_and_gate():
+    """完成校验：无操作目标豁免；有操作目标 <2 步宣告被拒。"""
+    from explore_flow import ExploreState, _validate_completion
+    s = ExploreState(goal="验证页面包含文字 Example Domain", entry_url="https://x.com")
+    assert _validate_completion(s) is None          # example.com 单页 0 步豁免
+    s = ExploreState(goal="加入购物车", entry_url="https://x.com")
+    s.step_count = 1
+    assert _validate_completion(s) is not None      # 1 步宣告 → 拒绝
+    s.step_count = 2
+    assert _validate_completion(s) is None          # ≥2 步 → 通过
+
+
+def test_check_goal_coverage_detects_missing_click():
+    """9/10 案例：断言可见性不算覆盖，必须存在对应 click。"""
+    from ai_agent import _check_goal_coverage
+    assert_visible_only = validate_case({"name": "t", "steps": [
+        {"action": "goto", "value": "https://x.com"},
+        {"action": "assert_visible", "target": {"role": "button", "name": "Add to cart"}},
+    ]})
+    missing = _check_goal_coverage("把商品加入购物车并验证", assert_visible_only)
+    assert missing == ["add_to_cart"]
+
+    full = validate_case({"name": "t", "steps": [
+        {"action": "goto", "value": "https://x.com"},
+        {"action": "click", "target": {"role": "button", "name": "Add to cart"}},
+    ]})
+    assert _check_goal_coverage("把商品加入购物车并验证", full) == []
+
+    login_case = validate_case({"name": "t", "steps": [
+        {"action": "goto", "value": "https://x.com"},
+        {"action": "click", "target": {"role": "button", "name": "Login"}},
+    ]})
+    assert _check_goal_coverage("登录后验证", login_case) == []
+    assert "login" in _check_goal_coverage("登录后验证", assert_visible_only)
+
+    # 无动作目标 → fail-open 不检查
+    assert _check_goal_coverage("验证页面包含文字 Example Domain", assert_visible_only) == []
+
+
 # ── 运行入口 ──────────────────────────────────────────────────────────────────
 
 def main() -> int:

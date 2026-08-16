@@ -148,7 +148,21 @@ async function generate() {
       parts.push(`${planner.mode === "refs_only" ? "refs-only 模式" : String(planner.mode || "")}· 编译定位 ${grounding.compiled_targets || 0} 处`);
       if (data.meta.cache_hit) parts.push("探索缓存命中");
     }
-    setStatus(`✅ DSL 生成成功（${parts.join(" · ")}），点击「执行测试」运行`);
+    // GQ：生成期目标覆盖警告（探索不完整 / 目标动作缺失——只提示不阻断）
+    const goalCoverage = data.meta && data.meta.goal_coverage;
+    let hasWarning = false;
+    if (goalCoverage) {
+      if (goalCoverage.exploration_incomplete) {
+        hasWarning = true;
+        parts.push("⚠️ 探索未完成，计划可能不覆盖全部目标，建议重新生成");
+      }
+      if (goalCoverage.missing_actions && goalCoverage.missing_actions.length) {
+        hasWarning = true;
+        const names = { add_to_cart: "加购", login: "登录", checkout: "结算" };
+        parts.push(`⚠️ 目标要求${goalCoverage.missing_actions.map(a => names[a] || a).join("/")}，但计划中无对应点击动作`);
+      }
+    }
+    setStatus(`${hasWarning ? "⚠️" : "✅"} DSL 生成成功（${parts.join(" · ")}），点击「执行测试」运行`);
   } catch (e) {
     setStatus("❌ " + e.message, true);
   } finally {

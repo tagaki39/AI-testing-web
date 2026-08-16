@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
-from resolver import PRICE_RE, choose_scope_text
+from resolver import PRICE_RE, _strip_leading_decoration, choose_scope_text
 from runner import _resolve_locator, _substitute
 
 # ── 预算（bounded：探索必须有限）───────────────────────────────────────────────
@@ -60,6 +60,38 @@ _TEXT_RE = re.compile(r'-\s+text:\s*(.+)')                  # - text: Products
 # ── 探索安全保护（第 6 项：代码层二次拦截，不只靠 Prompt）──────────────
 # press 允许的按键（枚举，防止 LLM 输出"按下回车"/"return" 等让执行器猜）
 _PRESS_KEYS = {"Enter", "Escape", "Tab", "ArrowDown", "ArrowUp"}
+
+# ── GQ：目标动作表（保守 allowlist，人为维护）──────────────────────────
+# 用于两处：① 探索完成性校验（goal 要求操作时，0/1 步宣告完成无效）
+# ② 生成期目标覆盖检查（ai_agent._check_goal_coverage 引用同表）。
+# 只认明确动作动词；goal 不命中任何 pattern → 不检查（fail-open）。
+GOAL_ACTION_PATTERNS: dict[str, "re.Pattern"] = {
+    "add_to_cart": re.compile(r"(加入购物车|加购|add\s+to\s+cart)", re.IGNORECASE),
+    "login": re.compile(r"(登录|login|sign\s*in)", re.IGNORECASE),
+    "checkout": re.compile(r"(结算|下单|checkout)", re.IGNORECASE),
+}
+
+
+def goal_requires_actions(goal: str) -> bool:
+    """goal 是否要求页面操作（命中动作表任一 pattern）。"""
+    return any(p.search(goal) for p in GOAL_ACTION_PATTERNS.values())
+
+
+def _validate_completion(state: "ExploreState") -> str | None:
+    """探索完成宣告的完整性校验（GQ 决策 1，可单测）。
+
+    真实 E2E 踩坑：1 步 fill 后宣告完成 → Planner 只能规划登录，
+    用户目标（加购/验证）全部落空。校验规则：
+      - goal 不要求操作（如"验证页面含文字"）→ 豁免（单页 0 步合法）
+      - 已执行动作 ≥ 2 → 通过
+      - 否则 → 返回拒绝原因（由主循环反馈进历史，预算内继续探索）
+    """
+    if not goal_requires_actions(state.goal):
+        return None
+    if state.step_count >= 2:
+        return None
+    return (f"探索不充分：仅执行 {state.step_count} 步就宣告完成"
+            "（用户目标要求页面操作），请继续探索目标流程")
 
 # 不可逆/危险操作关键词（点击前拦截：删除/支付/提交订单等）
 _DESTRUCTIVE_PATTERNS = (
@@ -318,32 +350,47 @@ def _pick_anchor_text(lines: list[str], node_text: str) -> str | None:
 def _attach_scope_context(state: ExploreState, page) -> None:
     """I1：为 observation 内同名重复的元素采集容器文本锚点（scope_has_text）。
 
-    只处理 (role, name) 重复的元素——非重复元素零开销（决策 3 性能上界）。
-    锚点来自 DOM 祖先链（li/article/@data-testid/@data-product-id/
-    @data-item-id）——比 a11y 树 parent 更贴近真实业务容器结构
-    （原项目实测 a11y 树里 View Product 不在产品容器内，DOM 链可兜底）。
+    只处理重复的元素（role+name 或 text 键）——非重复零开销（决策 3
+    性能上界）。锚点来自 DOM 祖先链（li/article/@data-testid/
+    @data-product-id/@data-item-id）——比 a11y 树 parent 更贴近真实
+    业务容器结构。文本节点（无 role 的 <a> 等）同样处理：图标前缀先
+    剥掉再匹配（PUA 在 CSS 伪元素里，DOM 文本不含）。
     采集失败静默（无锚点 → Compiler 不附加 scope → 运行时诚实拒绝）。
     """
     name_counts: dict[tuple[str, str], int] = {}
+    text_counts: dict[str, int] = {}
     for e in state.elements:
         if "role" in e and e.get("name"):
             key = (e["role"], e["name"])
             name_counts[key] = name_counts.get(key, 0) + 1
+        elif e.get("text"):
+            text_counts[e["text"]] = text_counts.get(e["text"], 0) + 1
     duplicates = {k for k, c in name_counts.items() if c > 1}
-    if not duplicates:
+    dup_texts = {t for t, c in text_counts.items() if c > 1}
+    if not duplicates and not dup_texts:
         return
 
     seen: dict[tuple[str, str], int] = {}
+    text_seen: dict[str, int] = {}
     for e in state.elements:
-        if "role" not in e or not e.get("name"):
-            continue
-        key = (e["role"], e["name"])
-        if key not in duplicates or e.get("scope_has_text"):
-            continue
-        i = seen.get(key, 0)
-        seen[key] = i + 1
+        anchor = None
         try:
-            node = page.get_by_role(e["role"], name=e["name"], exact=True).nth(i)
+            if "role" in e and e.get("name"):
+                key = (e["role"], e["name"])
+                if key not in duplicates or e.get("scope_has_text"):
+                    continue
+                i = seen.get(key, 0)
+                seen[key] = i + 1
+                node = page.get_by_role(e["role"], name=e["name"], exact=True).nth(i)
+            elif e.get("text") and e["text"] in dup_texts and not e.get("scope_has_text"):
+                i = text_seen.get(e["text"], 0)
+                text_seen[e["text"]] = i + 1
+                # 图标前缀在 CSS 伪元素中 → 剥掉装饰后按 DOM 文本精确匹配
+                node = page.get_by_text(
+                    _strip_leading_decoration(e["text"]), exact=True,
+                ).nth(i)
+            else:
+                continue
             container = node.locator(
                 "xpath=ancestor::*[self::li or self::article or @data-testid"
                 " or @data-product-id or @data-item-id][1]"
@@ -357,10 +404,10 @@ def _attach_scope_context(state: ExploreState, page) -> None:
             anchor = _pick_anchor_text(
                 [ln.strip() for ln in raw.splitlines() if ln.strip()], node_text,
             )
-            if anchor:
-                e["scope_has_text"] = anchor
         except Exception:
             continue
+        if anchor:
+            e["scope_has_text"] = anchor
 
 
 # ── decide：LLM 决策（ref 强校验 + exploration_complete）──────────────────────
@@ -508,6 +555,17 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                 continue
 
             if decision.get("exploration_complete") or decision.get("action") == "finish":
+                # GQ：完成宣告完整性校验——动作过少的宣告无效，
+                # 拒绝原因反馈进历史、预算内继续（复用 decision_rejected
+                # 自纠机制；goal 无操作要求时豁免，见 _validate_completion）
+                completion_error = _validate_completion(state)
+                if completion_error is not None:
+                    state.history.append({
+                        "url": state.current_url,
+                        "action": "decision_rejected",
+                        "error": completion_error,
+                    })
+                    continue
                 state.done = True
                 break
 

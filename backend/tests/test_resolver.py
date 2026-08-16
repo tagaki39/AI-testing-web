@@ -397,6 +397,75 @@ def test_attach_scope_context_duplicates_only():
         pw.stop()
 
 
+def test_text_candidates_strip_icon_prefix():
+    """图标前缀文本：候选含 text_clean 变体（PUA 在 CSS 伪元素，DOM 无）。"""
+    from resolver import RELAXATION_GROUP_OF, STRATEGY_SCORES
+    pw, browser, page = _launch()
+    try:
+        page.set_content('<a class="add">Add to cart</a>\n<a class="add">Add to cart</a>')
+        candidates = build_locator_candidates(
+            page, ParsedTarget(text=chr(0xF07A) + " Add to cart"),
+        )
+        strategies = [s for s, _ in candidates]
+        assert strategies == ["text", "text_clean"]           # 原样 + 剥装饰
+        assert STRATEGY_SCORES["text_clean"] == 55
+        assert RELAXATION_GROUP_OF["text_clean"] == "text"    # 同族不互相竞争
+        # 原样 0 命中；text_clean 命中 2（歧义由裁决层处理）
+        assert candidates[0][1].count() == 0
+        assert candidates[1][1].count() == 2
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_text_node_scope_resolution():
+    """文本节点 + 编译 scope：图标前缀文本在容器内唯一命中（I1 完整闭环）。"""
+    from runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<div data-product-id="p1"><div>Blue Top</div>'
+            '<a class="add">Add to cart</a></div>\n'
+            '<div data-product-id="p2"><div>Red Top</div>'
+            '<a class="add">Add to cart</a></div>'
+        )
+        strategy, locator = _resolve_locator(
+            page, {"text": chr(0xF07A) + " Add to cart"},
+            scope={"has_text": "Blue Top"},
+        )
+        assert strategy == "text_clean" and locator.count() == 1
+        assert "Blue Top" in locator.evaluate(
+            "el => el.parentElement ? el.parentElement.innerText : ''",
+        )
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_capture_anchors_text_nodes():
+    """采集：重复文本节点（无 role）同样获得容器锚点。"""
+    from explore_flow import ExploreState, _attach_scope_context
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<div data-product-id="p1"><div>Blue Top</div>'
+            '<a class="add">Add to cart</a></div>\n'
+            '<div data-product-id="p2"><div>Red Top</div>'
+            '<a class="add">Add to cart</a></div>'
+        )
+        state = ExploreState(goal="t", entry_url="https://x.com")
+        state.elements = [
+            {"ref": "e1", "type": "text", "text": chr(0xF07A) + " Add to cart"},
+            {"ref": "e2", "type": "text", "text": chr(0xF07A) + " Add to cart"},
+        ]
+        _attach_scope_context(state, page)
+        anchors = {e.get("scope_has_text") for e in state.elements}
+        assert anchors == {"Blue Top", "Red Top"}
+    finally:
+        browser.close()
+        pw.stop()
+
+
 # ── 运行入口 ──────────────────────────────────────────────────────────────────
 
 def main() -> int:

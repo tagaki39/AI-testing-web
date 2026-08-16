@@ -242,6 +242,12 @@ def build_locator_candidates(container, t: ParsedTarget) -> list[tuple[str, obje
             candidates.append(("role_fuzzy", container.get_by_role(t.role, name=t.name)))
     if t.text:
         candidates.append(("text", container.get_by_text(t.text)))
+        # 修复（真实 E2E）：图标前缀文本——PUA 字符来自 CSS 伪元素内容
+        #（a11y 树可见、DOM 文本不存在）→ 原样匹配必然 0 命中。
+        # 剥掉开头装饰字符再匹配（与 decorated_name_pattern 同一哲学）。
+        cleaned = _strip_leading_decoration(t.text)
+        if cleaned != t.text:
+            candidates.append(("text_clean", container.get_by_text(cleaned)))
     if t.css:
         candidates.append(("css", container.locator(t.css)))
     return candidates
@@ -353,7 +359,8 @@ def build_locator_for_count(page, target: dict):
 STRATEGY_SCORES = {
     "correction": 130,
     "test_id": 100, "test_id_attr": 95, "role": 90,
-    "role_decorated": 80, "text": 60, "role_fuzzy": 50, "css": 30,
+    "role_decorated": 80, "text": 60, "text_clean": 55,
+    "role_fuzzy": 50, "css": 30,
 }
 
 # 置信度门槛：winner 与最强竞争证据的分差低于此值 → LowConfidenceError
@@ -383,7 +390,8 @@ class ResolutionResult:
 RELAXATION_GROUP_OF = {
     "role": "role", "role_decorated": "role", "role_fuzzy": "role",
     "test_id": "test_id", "test_id_attr": "test_id_attr",
-    "text": "text", "css": "css",
+    "text": "text", "text_clean": "text",   # 同族：装饰清理是放松阶梯
+    "css": "css",
     "correction": "correction",   # L1：独立身份来源，参与 margin 门槛
 }
 

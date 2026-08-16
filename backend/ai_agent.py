@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from compiler import compile_targets
 from dsl import DSLCase, Locator, Scope, validate_case
 from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
-from explore_flow import explore
+from explore_flow import GOAL_ACTION_PATTERNS, explore
 from grounding import StateGraph, validate_state_grounding
 from resolver import (
     PRICE_RE, build_locator_exact_first, build_locator_for_count,
@@ -500,6 +500,46 @@ def check_refs_only(case: DSLCase) -> None:
             raise ValueError(
                 f"步骤 {index}: {step.action} 必须通过 target_ref 引用元素引用表"
             )
+
+
+# ── GQ：生成期目标覆盖检查（保守 allowlist，fail-open 只警告）────────────────
+
+# 动作 label → 步骤中必须出现的关键词（target 的 name/text，casefold 匹配）
+_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "add_to_cart": ("add to cart",),
+    "login": ("login", "sign in"),
+    "checkout": ("checkout",),
+}
+
+
+def _check_goal_coverage(goal: str, case: DSLCase) -> list[str]:
+    """检查计划是否覆盖 goal 明确要求的动作（GQ 决策 3，可单测）。
+
+    真实 E2E 踩坑（9/10 案例）：计划断言了 Add to cart 的可见性却漏了
+    【点击】动作——assert_visible 不算覆盖，必须存在对应的 click 步骤。
+    goal 未命中动作表（GOAL_ACTION_PATTERNS）→ 不检查（fail-open，
+    不误伤"验证页面文字"这类无操作目标）。
+    """
+    missing: list[str] = []
+
+    def _step_text(step) -> str:
+        parsed = parse_target(step.target)
+        if parsed is None:
+            return ""
+        return f"{parsed.name or ''} {parsed.text or ''}".strip().casefold()
+
+    for label, pattern in GOAL_ACTION_PATTERNS.items():
+        if not pattern.search(goal):
+            continue
+        keywords = _ACTION_KEYWORDS[label]
+        covered = any(
+            step.action == "click" and step.target is not None
+            and any(k in _step_text(step) for k in keywords)
+            for step in case.steps
+        )
+        if not covered:
+            missing.append(label)
+    return missing
 
 
 def _generate_planner_case(
@@ -1513,10 +1553,10 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
                 pages = explore_result.get("observations", [])   # ← observations 模型
                 # 保存前脱敏：history 的 value 还原为 ${var}（缓存不落盘真实凭据）
-                # 只缓存"探索声明完成"的结果——未完成的浅探索（预算耗尽/决策
-                # 反复被拒）会给 Planner 残缺的页面证据（真实 E2E：steps=1 的
-                # 登录页探索被缓存后毒化后续生成），下次重新探索即可。
-                if explore_result.get("done"):
+                # 缓存门槛（GQ 决策 2）：done=True，或已执行 ≥2 步——
+                # saucedemo 的 done=False/steps=4 探索产出了 7/7 计划（好探索
+                # 被拒缓存是浪费）；steps=1 的浅探索仍拒缓存（历史毒化案例）。
+                if explore_result.get("done") or explore_result.get("steps_used", 0) >= 2:
                     cache_save(entry_url, auth_profile, _sanitize_for_cache(explore_result, runtime_inputs))
             except Exception:
                 explore_result = None   # 探索异常 → 降级无快照生成
@@ -1621,6 +1661,15 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             case, pages, urls, explore_goal, runtime_inputs,
         )
     preflight_ms = int((perf_counter() - t_preflight) * 1000)
+
+    # ── GQ：生成期目标覆盖警告（fail-open，只提示不硬失败）───────────
+    # 探索不完整 / 目标动作缺失 → 前端醒目提示，避免"看似能跑"的静默
+    # 不完整计划（9/10 案例：断言了可见性却漏点击）。
+    meta["goal_coverage"] = {
+        "exploration_incomplete": bool(pages)
+        and not (explore_result or {}).get("done", False),
+        "missing_actions": _check_goal_coverage(explore_goal, case) or None,
+    }
 
     # Speed v1：生成链路计时（定位耗时构成，决定下一刀砍哪）
     meta["timings"] = {
