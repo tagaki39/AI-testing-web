@@ -221,6 +221,32 @@ def test_exact_first_and_for_count_on_dom():
         pw.stop()
 
 
+def test_resolve_locator_ambiguous_not_notfound():
+    """多匹配无唯一命中必须报 Ambiguous 而不是 NotFound。
+
+    真实 E2E：products 页 N 个 View Product 链接，Runner 报
+    "所有定位策略均未命中"——元素明明存在，错误语义误导排查。
+    """
+    from runner import _resolve_locator
+    from resolver import LocatorAmbiguousError
+    pw, browser, page = _launch()
+    try:
+        page.set_content('<button>Add to cart</button>\n<button>Add to cart</button>')
+        try:
+            _resolve_locator(page, {"role": "button", "name": "Add to cart"})
+        except LocatorAmbiguousError:
+            pass
+        else:
+            raise AssertionError("多匹配未报 LocatorAmbiguousError")
+        # 唯一匹配仍正常解析
+        page.set_content('<button>Only one</button>')
+        strategy, locator = _resolve_locator(page, {"role": "button", "name": "Only one"})
+        assert strategy == "role" and locator.count() == 1
+    finally:
+        browser.close()
+        pw.stop()
+
+
 # ── 运行入口 ──────────────────────────────────────────────────────────────────
 
 def main() -> int:

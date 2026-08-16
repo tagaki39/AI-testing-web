@@ -36,7 +36,8 @@ from runner import _resolve_locator, _substitute
 
 # ── 预算（bounded：探索必须有限）───────────────────────────────────────────────
 MAX_STEPS = 8        # 最多执行 8 个动作
-MAX_LLM_CALLS = 8    # 最多 8 次 LLM 决策调用（登录→商品→购物车流程约需 7-8 步）
+MAX_LLM_CALLS = 10   # 最多 10 次 LLM 决策调用（登录→商品→购物车流程实测 8 次
+                     # 才够，且坏决策自纠也消耗预算——留 2 次余量）
 _MAX_SNAPSHOT_CHARS = 6000   # 裁剪后快照的最终兜底上限（重组后仍超限才截断）
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
 _MAX_TEXT_ELEMENTS = 20      # 文本节点最多注入 20 个（防上下文膨胀）
@@ -67,9 +68,20 @@ _DESTRUCTIVE_PATTERNS = (
 
 
 def _within_origin(url: str, entry_url: str) -> bool:
-    """origin 限制：探索不得离开入口站点（跨域导航会触发回退）。"""
+    """origin 限制：探索不得离开入口站点（跨域导航会触发回退）。
+
+    修复：容忍 www/非 www 重定向——入口 saucedemo.com 会 302 到
+    www.saucedemo.com，严格 netloc 相等把初始重定向误判为跨域，
+    go_back 回到 about:blank 后探索彻底失效（真实 E2E 踩坑）。
+    """
     try:
-        return urlparse(url).netloc == urlparse(entry_url).netloc
+        host_a = urlparse(url).netloc.lower()
+        host_b = urlparse(entry_url).netloc.lower()
+        if host_a.startswith("www."):
+            host_a = host_a[4:]
+        if host_b.startswith("www."):
+            host_b = host_b[4:]
+        return host_a == host_b
     except Exception:
         return False
 
@@ -169,12 +181,12 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
   "reason": "为什么这么做",
   "exploration_complete": false,
   "action": "click | fill | press | back | finish",
-  "target_ref": "e1",
+  "target_ref": "obs1:e1",
   "value": "fill 的 value 必须使用 ${{var}} 占位符（如 ${{username}}）；不得输出真实敏感值，真实值由执行器本地注入"
 }}
 
 规则：
-1. target_ref 必须来自上面的元素表，不得编造
+1. target_ref 必须来自上面的元素表，不得编造（ref 带 obs 前缀，如 obs1:e1——照抄表里的完整格式，不要省略 obs 前缀）
 2. action 只能从上面 5 种选（wait 已移除，点击后执行器自动等待页面加载）
 3. press 的 value 只能是: Enter, Escape, Tab, ArrowDown, ArrowUp
 4. 每一步只做一个动作
@@ -283,11 +295,12 @@ def _safe_title(page) -> str:
 
 # ── decide：LLM 决策（ref 强校验 + exploration_complete）──────────────────────
 
-def _decide(state: ExploreState, llm_call) -> dict | None:
-    """调 LLM 决定下一步；ref 不在元素表 → 决策无效（返回 None 停止）。
+def _decide(state: ExploreState, llm_call) -> tuple[dict | None, str | None]:
+    """调 LLM 决定下一步，返回 (决策, 校验错误)。
 
-    这是"LLM 没有权限创造元素"的代码保证：
+    ref 不在元素表 → 决策无效——这是"LLM 没有权限创造元素"的代码保证：
       prompt 只给元素表，输出必须引用 ref，代码校验 ref 存在。
+    错误信息返回给调用方（预算内反馈进历史让 LLM 自纠，不直接夭折）。
     """
     history_text = "\n".join(
         f"- {h.get('action')} {h.get('target_ref')} {h.get('value') or ''} @ {h.get('url')}"
@@ -304,24 +317,25 @@ def _decide(state: ExploreState, llm_call) -> dict | None:
         t0 = perf_counter()
         text = llm_call(prompt, system_prompt=EXPLORE_SYSTEM_PROMPT)
         state.timings["llm_ms"] += int((perf_counter() - t0) * 1000)
+        state.llm_calls += 1   # 每次决策尝试都计（预算护栏：坏决策也消耗预算）
         decision = json.loads(re.search(r"\{.*\}", text, re.DOTALL).group(0))
-        state.llm_calls += 1
 
         # 强校验：action 白名单 + target_ref 必须存在于当前元素表
         action = decision.get("action")
         if action not in {"click", "fill", "press", "back", "finish"}:
-            return None
+            return None, f"非法 action {action!r}（白名单: click/fill/press/back/finish）"
         if action == "press":
             # press 按键枚举（第 6 项：不允许 LLM 自由输出按键）
             if (decision.get("value") or "") not in _PRESS_KEYS:
-                return None
+                return None, f"press 的 value 必须是: {'/'.join(sorted(_PRESS_KEYS))}"
         if action != "finish":
             ref = decision.get("target_ref")
             if ref is None or not any(e["ref"] == ref for e in state.elements):
-                return None   # 编造 ref → 决策无效
-        return decision
-    except Exception:
-        return None
+                return None, (f"target_ref {ref!r} 不在当前元素表——"
+                              "ref 带 obs 前缀，照抄表内完整格式（如 obs1:e1）")
+        return decision, None
+    except Exception as exc:
+        return None, f"决策解析失败: {str(exc)[:120]}"
 
 
 # ── act：ref → locator → 执行（LLM=Planner，这里=Executor）────────────────────
@@ -404,9 +418,18 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         while (not state.done
                and state.step_count < MAX_STEPS
                and state.llm_calls < MAX_LLM_CALLS):
-            decision = _decide(state, llm_call)
+            decision, decision_error = _decide(state, llm_call)
             if decision is None:
-                break   # 决策失败（编造 ref / 非法动作）→ 停止
+                # 决策被校验拒绝：把错误反馈进历史，预算内让 LLM 自纠。
+                # 修复：单次坏决策直接夭折整个探索——真实 E2E 中 fill 之后
+                # 模型沿用历史里的旧 ref 被拒，探索止步登录页。
+                # 预算护栏在 _decide 内（每次尝试都计 llm_calls），不会死循环。
+                state.history.append({
+                    "url": state.current_url,
+                    "action": "decision_rejected",
+                    "error": decision_error,
+                })
+                continue
 
             if decision.get("exploration_complete") or decision.get("action") == "finish":
                 state.done = True

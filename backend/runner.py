@@ -274,8 +274,15 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
         raise LocatorAmbiguousError(
             f"scope 下存在多个候选容器，target 在 {len(candidates)} 处唯一命中（可见、不同元素、不同业务实体）: {target}"
         )
+    # matches 为空分两种情况（修复错误语义：多匹配无唯一 ≠ 未找到）：
+    #   has_positive=True  → 各策略均有 count>1（元素存在但不唯一）→ 歧义
+    #   has_positive=False → 全部策略 count==0（元素确实不存在）→ 未找到
     hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
     error_detail = f"；strategy_errors={strategy_errors}" if strategy_errors else ""
+    if has_positive:
+        raise LocatorAmbiguousError(
+            f"target 存在多个匹配但无唯一命中（各定位策略 count>1，需 scope 消歧）: {target}{hint}"
+        )
     raise LocatorNotFoundError(
         f"所有定位策略均未命中: {target}{hint}{error_detail}"
     )

@@ -258,7 +258,7 @@ _PASSWORD_PATTERNS = [
     re.compile(r'(?:密码|口令)[：:\s]+([^\s，,。;；]+)'),
     re.compile(r'password[：:\s]+([^\s，,。;；]+)', re.IGNORECASE),
     re.compile(
-        r'(?:login\s+with|账号|用户名|using|with)\s*[:：]?\s*'
+        r'(?:login\s+with|账号|用户名|using|with|用|使用)\s*[:：]?\s*'
         r'([^\s,/]+)\s+/\s+([^\s，,。;；]+)',
         re.IGNORECASE,
     ),
@@ -1532,9 +1532,10 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
                 pages = explore_result.get("observations", [])   # ← observations 模型
                 # 保存前脱敏：history 的 value 还原为 ${var}（缓存不落盘真实凭据）
-                # 只缓存有效探索（至少一次成功动作）——失败/空探索不缓存，
-                # 否则坏结果毒化缓存，后续生成永远命中 steps=0 的假成功。
-                if explore_result.get("steps_used", 0) > 0:
+                # 只缓存"探索声明完成"的结果——未完成的浅探索（预算耗尽/决策
+                # 反复被拒）会给 Planner 残缺的页面证据（真实 E2E：steps=1 的
+                # 登录页探索被缓存后毒化后续生成），下次重新探索即可。
+                if explore_result.get("done"):
                     cache_save(entry_url, auth_profile, _sanitize_for_cache(explore_result, runtime_inputs))
             except Exception:
                 explore_result = None   # 探索异常 → 降级无快照生成

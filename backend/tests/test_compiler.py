@@ -276,6 +276,60 @@ def test_pipeline_end_to_end():
     raise AssertionError("跨状态错位未被拒绝")
 
 
+# ── 7. 探索 prompt 契约（真实 E2E 发现的 bug 防回归）────────────────────────
+
+def test_explore_prompt_example_ref_is_state_scoped():
+    """DECIDE_PROMPT 示例必须用 state-scoped ref（obs1:e1）。
+
+    真实 E2E 踩坑：示例写页面级 e1，探索决策全部被 _decide 严格校验
+    拒绝（元素表里是 obs1:e1）→ 探索 0 步夭折，Planner 只看得到首页。
+    """
+    from explore_flow import DECIDE_PROMPT
+    assert '"target_ref": "obs1:e1"' in DECIDE_PROMPT
+
+
+def test_credential_redaction_chinese_phrasing():
+    """用 X / Y 登录 的中文写法必须命中凭据提取。
+
+    真实 E2E 踩坑：该写法此前不在匹配模式内 → 凭据未脱敏（泄漏进 LLM
+    上下文）、探索无登录凭据、Planner 编造 ref 被 Validator 拒绝。
+    """
+    from ai_agent import _extract_and_redact_goal
+    redacted, runtime = _extract_and_redact_goal(
+        "打开 saucedemo.com，用 standard_user / secret_sauce 登录，"
+        "把第一个商品加入购物车"
+    )
+    assert runtime == {"username": "standard_user", "password": "secret_sauce"}
+    assert "standard_user" not in redacted and "secret_sauce" not in redacted
+    assert "${username}" in redacted and "${password}" in redacted
+
+
+def test_origin_guard_tolerates_www_redirect():
+    """www/非 www 重定向不得误判为跨域。
+
+    真实 E2E：入口 saucedemo.com 302 → www.saucedemo.com，严格 netloc
+    相等把初始重定向当跨域 → go_back 落在 about:blank → 探索彻底失效。
+    """
+    from explore_flow import _within_origin
+    assert _within_origin("https://www.saucedemo.com/", "https://saucedemo.com")
+    assert _within_origin("https://saucedemo.com/", "https://www.saucedemo.com")
+    assert _within_origin("https://www.saucedemo.com/inventory.html", "https://saucedemo.com")
+    assert not _within_origin("https://evil.com/", "https://saucedemo.com")
+    assert not _within_origin("https://saucedemo.com.evil.com/", "https://saucedemo.com")
+
+
+def test_credential_redaction_english_phrasing():
+    """login with email / password 写法：邮箱与密码都提取、都脱敏。"""
+    from ai_agent import _extract_and_redact_goal
+    redacted, runtime = _extract_and_redact_goal(
+        "login with test123@example.com / test123 on automationexercise"
+    )
+    assert runtime["email"] == "test123@example.com"
+    assert runtime["password"] == "test123"
+    assert "test123@example.com" not in redacted
+    assert "test123" not in redacted
+
+
 # ── 运行入口 ──────────────────────────────────────────────────────────────────
 
 def main() -> int:
