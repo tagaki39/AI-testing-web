@@ -26,9 +26,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from resolver import (   # noqa: E402
-    ParsedTarget, build_locator_candidates, build_locator_exact_first,
-    build_locator_for_count, decorated_name_pattern, is_navigation_name,
-    parse_target, snapshot_match,
+    LowConfidenceError, ParsedTarget, build_locator_candidates,
+    build_locator_exact_first, build_locator_for_count,
+    decorated_name_pattern, is_navigation_name, parse_target, snapshot_match,
 )
 
 # FontAwesome 购物车图标（U+F07A，PUA 区）：用 chr() 构造，避免源码含字面 PUA
@@ -245,6 +245,128 @@ def test_resolve_locator_ambiguous_not_notfound():
     finally:
         browser.close()
         pw.stop()
+
+
+# ── R2：评分 + 置信度门槛（真实 DOM 背书）─────────────────────────────────────
+
+def test_scoring_stronger_strategy_wins():
+    """test_id(100) 命中 + text(60) 命中不同元素 → margin 40 → 接受 test_id。"""
+    from runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button data-testid="add-1">Different</button>\n<button>Add to cart</button>'
+        )
+        strategy, locator = _resolve_locator(
+            page, {"test_id": "add-1", "text": "Add to cart"},
+        )
+        assert strategy == "test_id"
+        assert "Different" in locator.inner_text()
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_margin_gate_rejects():
+    """test_id + test_id_attr 各命中不同元素 → margin 5 < 20 → LowConfidence。"""
+    from runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button data-testid="add-1">A</button>\n<button data-test="add-1">B</button>'
+        )
+        try:
+            _resolve_locator(page, {"test_id": "add-1"})
+        except LowConfidenceError as exc:
+            assert "低于门槛" in str(exc)
+            return
+        raise AssertionError("margin 不足未拒绝")
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_weak_winner_rejected():
+    """css(30) 命中 + text(60) ×2 → 弱胜强证据存在 → LowConfidence。"""
+    from runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button class="cart-btn">C</button>\n'
+            '<button>Add to cart</button>\n<button>Add to cart</button>'
+        )
+        try:
+            _resolve_locator(page, {"css": ".cart-btn", "text": "Add to cart"})
+        except LowConfidenceError:
+            return
+        raise AssertionError("弱策略胜出未被拒绝")
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_fuzzy_commonality_does_not_block_exact():
+    """role(90) 命中 + role_fuzzy(50) ×2 → margin 40 → 接受 exact。"""
+    from runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button>Add to cart</button>\n'
+            '<button>Add to cart now</button>\n<button>Add to cart now</button>'
+        )
+        strategy, locator = _resolve_locator(
+            page, {"role": "button", "name": "Add to cart"},
+        )
+        assert strategy == "role" and locator.count() == 1
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_same_element_dedup_preserved():
+    """scope 多容器同策略命中 → 仍走 dedup 消歧（R2 不破坏既有行为）。"""
+    from runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<div data-product-id="p1">Blue Top<button>Buy</button></div>\n'
+            '<div data-product-id="p2">Red Top<button>Buy</button></div>'
+        )
+        # scope 锁定 Blue Top 容器；同策略（role）在多容器中的 count>1
+        # 是 scope 消歧的正常形态，不得触发 margin 拒绝
+        strategy, locator = _resolve_locator(
+            page, {"role": "button", "name": "Buy"},
+            scope={"has_text": "Blue Top"},
+        )
+        assert strategy == "role" and locator.count() == 1
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_low_confidence_is_ambiguous_subclass():
+    """LowConfidenceError 继承 LocatorAmbiguousError（既有 catch 兼容）。"""
+    from resolver import LocatorAmbiguousError
+    assert issubclass(LowConfidenceError, LocatorAmbiguousError)
+
+
+# ── decorated 修复（名称本身以图标开头）────────────────────────────────────────
+
+def test_decorated_pattern_leading_icon_name():
+    """名称以图标开头时 decorated pattern 仍可匹配（真实 E2E bug 修复）。"""
+    name = chr(0xF0FE) + " View Product"
+    pat = decorated_name_pattern(name)
+    assert pat.fullmatch(name) is not None            # 图标 + 名称
+    assert pat.fullmatch(" " + name) is not None      # 空白 + 图标 + 名称
+    assert pat.fullmatch("View Product") is not None  # 纯名称（零装饰）
+
+
+def test_snapshot_match_decorated_leading_icon():
+    """快照中名称带图标前缀时，decorated 分支命中（导航名禁 fuzzy，
+    命中只可能来自 decorated——修复前该场景为 False）。"""
+    snap = '- link "' + chr(0xF0FE) + ' Contact Us"'
+    found, count = snapshot_match(snap, "link", "Contact Us")
+    assert (found, count) == (True, 1)
 
 
 # ── 运行入口 ──────────────────────────────────────────────────────────────────

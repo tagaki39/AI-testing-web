@@ -33,7 +33,7 @@ resolver.py — Semantic Resolver 语义层（R1：单一事实源）
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # ── 导航 target 名（locator 语义共享：导航名禁止 fuzzy substring）────
@@ -60,6 +60,23 @@ _DECORATED_PREFIX = (
 )
 
 
+def _strip_leading_decoration(name: str) -> str:
+    """剥掉名称开头的图标字符与空白（它们是"装饰"，由 pattern 前缀类表达）。
+
+    修复（真实 E2E）：名称本身以图标开头时（如 "<图标> View Product"），
+    旧实现把图标当字面 token——前缀类吃掉一个 PUA 后又要求一个 PUA，
+    导致永远无法匹配。剥掉后 "<图标> View Product" → "View Product"。
+    """
+    stripped = name
+    while stripped:
+        first = stripped[0]
+        if first.isspace() or 0xE000 <= ord(first) <= 0xF8FF:
+            stripped = stripped[1:]
+        else:
+            break
+    return stripped or name   # 全是装饰 → 退化为原名（罕见）
+
+
 def decorated_name_pattern(name: str):
     """构建可匹配"图标前缀 + 名称"的正则（Playwright selector 安全）。
 
@@ -68,10 +85,11 @@ def decorated_name_pattern(name: str):
       - "\\s" 只在字符类内安全（类外 "\\s+" 报 InvalidSelectorError）
       - "\\uE000" 等 Unicode 转义安全
     因此：token 级 re.escape + "/" 手动转义 + 空白用字符类 "[ \\s]*"。
+    名称自身的开头图标/空白先剥掉（见 _strip_leading_decoration）。
     "Signup / Login" → ^[<PUA 范围>\\s]*Signup[ \\s]*\\/[ \\s]*Login$
     """
     parts = []
-    for part in name.strip().split():
+    for part in _strip_leading_decoration(name).split():
         escaped = re.escape(part)
         escaped = escaped.replace("/", "\\/")   # Playwright 正则定界符转义
         parts.append(escaped)
@@ -117,6 +135,14 @@ class LocatorNotFoundError(Exception):
 
 class LocatorAmbiguousError(Exception):
     """2+ 个匹配：定位不唯一，必须通过作用域/更精确的 target 消歧。"""
+
+
+class LowConfidenceError(LocatorAmbiguousError):
+    """R2：高分命中但与其他证据的 margin 不足——宁可靠错误，不可低置信度点击。
+
+    继承 LocatorAmbiguousError：既有 catch 兼容；错误类型名可供 metrics
+    区分"真歧义"与"低置信度拒绝"。
+    """
 
 
 # ── target 解析（字符串 / 结构化 → 统一数据结构）────────────────────────────────
@@ -315,3 +341,123 @@ def build_locator_for_count(page, target: dict):
     if parsed.css:
         return page.locator(parsed.css)
     return None
+
+
+# ── R2：候选评分 + 置信度门槛（Tier 1 semantic candidates）─────────────────────
+# 取代"固定顺序第一个 count==1 胜出"：收集全部策略证据后评分裁决，
+# 高分但与其他证据的 margin 不足 → 拒绝（宁可靠错误，不可低置信度点击）。
+
+# 策略稳定性分层：test_id 是显式契约（最高）；语义定位其次；
+# fuzzy / css 是最弱证据。
+STRATEGY_SCORES = {
+    "test_id": 100, "test_id_attr": 95, "role": 90,
+    "role_decorated": 80, "text": 60, "role_fuzzy": 50, "css": 30,
+}
+
+# 置信度门槛：winner 与最强竞争证据的分差低于此值 → LowConfidenceError
+CONFIDENCE_MARGIN = 20
+
+
+@dataclass
+class ResolutionResult:
+    """decide_resolution 的裁决结果。
+
+    status:
+      resolved       唯一命中（可能同策略多容器，交由调用方 dedup）
+      low_confidence 高分命中但 margin 不足（拒绝）
+      ambiguous      无唯一命中且存在 count>1（拒绝）
+      not_found      全部策略 count==0（可轮询等待）
+    """
+    status: str
+    strategy: str | None = None
+    hits: list = field(default_factory=list)   # [(strategy, locator), ...]
+    detail: str = ""
+
+
+# 放松组：组内策略是同一身份来源的不同放松级别（exact ⊂ decorated ⊂ fuzzy），
+# 组内不互相竞争——exact 命中 + decorated 命中同一元素是常态而非矛盾；
+# 竞争只发生在【不同身份来源】之间（test_id vs test_id_attr 各自成组，
+# 因为它们是不同属性契约，命中不同元素 = 真矛盾）。
+RELAXATION_GROUP_OF = {
+    "role": "role", "role_decorated": "role", "role_fuzzy": "role",
+    "test_id": "test_id", "test_id_attr": "test_id_attr",
+    "text": "text", "css": "css",
+}
+
+
+def decide_resolution(rows: list) -> ResolutionResult:
+    """评分裁决：rows = [(strategy, locator, count), ...]（全部容器×策略）。
+
+    规则（可解释、有上界）：
+      1. count==1 的行按策略分组；winner = 分数最高的分组
+      2. 竞争证据 = 【不同放松组】的命中或 count>=2 行：
+         - 组内（role/decorated/fuzzy）是放松阶梯，最严格命中吸收组内
+           证据，不自我否决
+         - 同策略多容器命中不算竞争（scope 消歧的用途，调用方 dedup）
+      3. 最强竞争证据分数 ≥ winner 分数 − CONFIDENCE_MARGIN → 拒绝
+      4. 无命中：有 count>1 → ambiguous；全零 → not_found
+    """
+    hits_by_strategy: dict[str, list] = {}
+    positive_by_strategy: dict[str, int] = {}   # 策略 → count>1 的行数
+    for strategy, locator, count in rows:
+        if count == 1:
+            hits_by_strategy.setdefault(strategy, []).append((strategy, locator))
+        elif count > 1:
+            positive_by_strategy[strategy] = positive_by_strategy.get(strategy, 0) + 1
+
+    if not hits_by_strategy:
+        if positive_by_strategy:
+            return ResolutionResult(
+                status="ambiguous",
+                detail=f"各定位策略均多匹配（{positive_by_strategy}），无唯一命中",
+            )
+        return ResolutionResult(status="not_found")
+
+    winner = max(hits_by_strategy, key=lambda s: STRATEGY_SCORES.get(s, 0))
+    winner_score = STRATEGY_SCORES.get(winner, 0)
+    winner_group = RELAXATION_GROUP_OF.get(winner, winner)
+
+    # 竞争证据按放松组聚合：每组取最强的一条证据
+    group_hits: dict[str, tuple[str, int, int]] = {}
+    for strategy, hits in hits_by_strategy.items():
+        group = RELAXATION_GROUP_OF.get(strategy, strategy)
+        score = STRATEGY_SCORES.get(strategy, 0)
+        current = group_hits.get(group)
+        if current is None or score > current[1]:
+            group_hits[group] = (strategy, score, len(hits))
+    group_positives: dict[str, tuple[str, int, int]] = {}
+    for strategy, n in positive_by_strategy.items():
+        group = RELAXATION_GROUP_OF.get(strategy, strategy)
+        score = STRATEGY_SCORES.get(strategy, 0)
+        current = group_positives.get(group)
+        if current is None or score > current[1]:
+            group_positives[group] = (strategy, score, n)
+
+    blockers: list[tuple[str, int, str]] = []
+    for group, (strategy, score, n) in group_hits.items():
+        if group != winner_group:
+            blockers.append((
+                strategy, score,
+                f"{n} 处唯一命中（{group} 组，与 winner 不同身份来源）",
+            ))
+    for group, (strategy, score, n) in group_positives.items():
+        if group != winner_group:
+            blockers.append((
+                strategy, score,
+                f"{n} 行多匹配（{group} 组，count>1）",
+            ))
+    if blockers:
+        best = max(blockers, key=lambda b: b[1])
+        if best[1] >= winner_score - CONFIDENCE_MARGIN:
+            return ResolutionResult(
+                status="low_confidence",
+                detail=(
+                    f"winner={winner}({winner_score}) 与竞争证据 "
+                    f"{best[0]}({best[1]}，{best[2]}) 的分差 "
+                    f"{winner_score - best[1]} 低于门槛 {CONFIDENCE_MARGIN}"
+                ),
+            )
+
+    return ResolutionResult(
+        status="resolved", strategy=winner, hits=hits_by_strategy[winner],
+    )

@@ -159,6 +159,26 @@ button = container.get_by_role("button", name="Add to cart")
   上一页元素的步骤 → `STATE_GROUNDING_MISMATCH`）
 - 无探索的降级路径保留 legacy 生成能力（LLM 直接生成定位字段）
 
+### 6. 评分与置信度门槛（R2）
+
+定位解析不再"固定顺序第一个唯一命中胜出"，而是**收集全部策略证据后评分裁决**：
+
+| 策略 | 分数 | 语义 |
+|------|------|------|
+| test_id | 100 | 显式测试契约（最强身份） |
+| test_id_attr | 95 | data-test/data-qa 属性变体 |
+| role（exact） | 90 | 语义定位精确匹配 |
+| role_decorated | 80 | 容忍图标前缀 |
+| text | 60 | 文本定位 |
+| role_fuzzy | 50 | 语义模糊匹配 |
+| css | 30 | 兜底 |
+
+- **放松组**：role/decorated/fuzzy 是同一身份的放松阶梯，组内不互相竞争
+- **置信度门槛**：winner 与最强竞争证据（不同身份来源的命中/多匹配）的分差
+  < 20 → `LowConfidenceError` 拒绝——**高分但 margin 低仍拒绝**，
+  宁可靠错误，不可低置信度点击
+- 拒绝原因完整可解释（winner/竞争证据/分差都在错误信息里）
+
 ---
 
 ## 当前范围与后续规划

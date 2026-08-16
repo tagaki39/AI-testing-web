@@ -44,8 +44,9 @@ from playwright.sync_api import sync_playwright, expect
 
 from dsl import DSLCase, DSLStep
 from resolver import (
-    LocatorAmbiguousError, LocatorNotFoundError, ParsedTarget,
-    build_locator_candidates, business_identity, parse_target,
+    LocatorAmbiguousError, LocatorNotFoundError, LowConfidenceError,
+    ParsedTarget, build_locator_candidates, business_identity,
+    decide_resolution, parse_target,
 )
 
 # 执行截图保存目录（项目根/artifacts）
@@ -198,11 +199,15 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
     # 整个 _resolve_locator 的时间上界 ≈ 5s，不再随候选数线性增长。
     resolve_deadline = perf_counter() + min(timeout_ms, 5000) / 1000.0
 
-    def scan() -> tuple[list, list[str], bool]:
-        """Phase A：只 count()。返回 (唯一命中列表, 策略错误, 是否存在>0 匹配)。"""
-        matches: list[tuple[str, object]] = []
+    def scan() -> tuple[list, list[str]]:
+        """Phase A：只 count()。返回 (完整证据行, 策略错误)。
+
+        R2：收集全部容器×策略的 count（评分裁决需要完整证据，
+        多几次 count() 调用，无等待，时间上界不变）。
+        证据行格式 (strategy, locator, count)，count==0 的行不收集。
+        """
+        rows: list[tuple[str, object, int]] = []
         errors: list[str] = []
-        has_positive = False
         for container in containers:
             for strategy, locator in build_locator_candidates(container, t):
                 try:
@@ -211,41 +216,40 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
                     # strategy-local failure：单策略异常不炸链，记录继续
                     errors.append(f"{strategy}: {type(exc).__name__}: {str(exc)[:120]}")
                     continue
-                if count == 1:
-                    matches.append((strategy, locator))
-                    break   # 该容器内唯一命中，下一容器
-                if count > 1:
-                    has_positive = True
-                    continue   # 容器太宽 → 尝试更精确的容器/策略
-                # count == 0：留给 Phase B 判定（全 0 才等待）
-        return matches, errors, has_positive
+                if count > 0:
+                    rows.append((strategy, locator, count))
+        return rows, errors
 
-    matches: list[tuple[str, object]] = []
+    rows: list = []
     strategy_errors: list[str] = []
+    result = None
     while True:
-        matches, strategy_errors, has_positive = scan()
-        if matches:
-            break   # 唯一命中已存在
-        # 无唯一命中：歧义（>1）存在时不值得等待；全 0 且预算内 → 轮询
-        if has_positive or perf_counter() >= resolve_deadline:
+        rows, strategy_errors = scan()
+        result = decide_resolution(rows)   # ← R2：评分 + 置信度门槛
+        if result.status != "not_found":
+            break   # resolved / low_confidence / ambiguous → 立即裁决，无需等待
+        # 全零：预算内轮询；allow_lazy（wait_for/assert_visible）的 visible
+        # 等待由执行器（定位唯一后 locator.wait_for(visible)）负责，
+        # 这里只保证"出现且唯一"
+        if perf_counter() >= resolve_deadline:
             break
         page.wait_for_timeout(150)
-        # allow_lazy（wait_for/assert_visible）：visible 等待由执行器
-        #（定位唯一后 locator.wait_for(visible)）负责，这里只保证"出现且唯一"
 
-    if len(matches) == 1:
-        return matches[0][0], matches[0][1]
-    if len(matches) > 1:
+    if result.status == "resolved":
+        hits = result.hits   # winner 策略的命中（可能多容器）
+        if len(hits) == 1:
+            return hits[0]
+        # 多容器同策略命中 → 既有 dedup：
         # ① 可见性过滤：同一商品 normal+overlay 双 render 时，隐藏的
         #    Add to cart 不计入（overlay 通常不可见）——distinct actionable
         visible: list[tuple[str, object]] = []
-        for m in matches:
+        for m in hits:
             try:
                 if m[1].is_visible():
                     visible.append(m)
             except Exception:
                 visible.append(m)   # 无法判断 → 保留
-        candidates = visible if visible else matches
+        candidates = visible if visible else hits
 
         # ② 同一元素判定：多个容器指向同一个 DOM 元素（容器嵌套冗余）
         #    → 消歧成功，不是真歧义
@@ -256,7 +260,7 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
                 for _, loc in candidates[1:]
             )
             if all_same:
-                return candidates[0][0], candidates[0][1]
+                return candidates[0]
         except Exception:
             pass
 
@@ -274,15 +278,15 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
         raise LocatorAmbiguousError(
             f"scope 下存在多个候选容器，target 在 {len(candidates)} 处唯一命中（可见、不同元素、不同业务实体）: {target}"
         )
-    # matches 为空分两种情况（修复错误语义：多匹配无唯一 ≠ 未找到）：
-    #   has_positive=True  → 各策略均有 count>1（元素存在但不唯一）→ 歧义
-    #   has_positive=False → 全部策略 count==0（元素确实不存在）→ 未找到
+    if result.status == "low_confidence":
+        # R2：高分但 margin 低仍拒绝（拒绝原因完整可解释）
+        raise LowConfidenceError(f"{result.detail} —— target: {target}")
+    if result.status == "ambiguous":
+        hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
+        raise LocatorAmbiguousError(f"{result.detail} —— target: {target}{hint}")
+    # not_found：全部策略 count==0
     hint = f"，请用 scope 消歧（如 scope={'{'}\"role\":\"listitem\",\"has_text\":\"...\"{'}'}）" if scope is None else ""
     error_detail = f"；strategy_errors={strategy_errors}" if strategy_errors else ""
-    if has_positive:
-        raise LocatorAmbiguousError(
-            f"target 存在多个匹配但无唯一命中（各定位策略 count>1，需 scope 消歧）: {target}{hint}"
-        )
     raise LocatorNotFoundError(
         f"所有定位策略均未命中: {target}{hint}{error_detail}"
     )
@@ -407,7 +411,9 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
         shot = step_dir / f"step-{index:02d}.png"
         try:
             page.screenshot(path=str(shot), full_page=True)
-            evidence["screenshot"] = f"/artifacts/{step_dir.name}/step-{index:02d}.png"
+            # 路径必须与 main.py 的 /api/artifacts/{run_id}/{filename} 路由一致
+            #（修复：此前是 /artifacts/...，前端 img 请求落进静态托管 → 404）
+            evidence["screenshot"] = f"/api/artifacts/{step_dir.name}/step-{index:02d}.png"
         except Exception:
             pass
 
@@ -417,11 +423,11 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
         # 记录失败：保留异常类型名 + 前 300 字符的错误信息
         evidence["status"] = "failed"
         evidence["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
-        # 失败也截图，方便排查
+        # 失败也截图，方便排查（路径同上，带 /api 前缀）
         try:
             shot = step_dir / f"step-{index:02d}.png"
             page.screenshot(path=str(shot))
-            evidence["screenshot"] = f"/artifacts/{step_dir.name}/step-{index:02d}.png"
+            evidence["screenshot"] = f"/api/artifacts/{step_dir.name}/step-{index:02d}.png"
         except Exception:
             pass
 
