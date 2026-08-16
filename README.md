@@ -61,10 +61,11 @@ python main.py
 | `backend/dsl.py` | ~150 | DSL 数据结构（含结构化 target/scope），Pydantic 强校验 |
 | `backend/explore_flow.py` | ~420 | bounded 探索：element ref 表 + Observation State Graph |
 | `backend/explore_cache.py` | ~70 | 探索结果缓存（脱敏落盘） |
-| `backend/ai_agent.py` | ~1550 | 双模式 Planner（refs-only / legacy）+ Preflight 修复链路 |
-| `backend/grounding.py` | ~230 | G3 State Grounding Validator（跨状态引用执行前拒绝） |
-| `backend/compiler.py` | ~90 | R1 LocatorSpec Compiler（target_ref → Locator 确定性编译） |
-| `backend/runner.py` | ~610 | Playwright 执行引擎 + 三分法定位 + 作用域消歧 |
+| `backend/ai_agent.py` | ~1430 | 双模式 Planner（refs-only / legacy）+ Preflight 修复链路 |
+| `backend/grounding.py` | ~175 | G3 State Grounding Validator（跨状态引用执行前拒绝） |
+| `backend/compiler.py` | ~80 | R1 LocatorSpec Compiler（target_ref → Locator 确定性编译） |
+| `backend/resolver.py` | ~220 | R1 Semantic Resolver：定位语义单一事实源（解析/候选顺序/导航限制/快照匹配） |
+| `backend/runner.py` | ~390 | Playwright 执行引擎：三分法编排 + 作用域消歧 + 时间预算 |
 | `backend/main.py` | ~150 | FastAPI 路由 + 静态托管 |
 | `frontend/index.html` | ~230 | 单页 UI（零构建） |
 

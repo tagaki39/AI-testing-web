@@ -42,7 +42,10 @@ from dsl import DSLCase, Locator, Scope, validate_case
 from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
 from explore_flow import explore
 from grounding import StateGraph, validate_state_grounding
-from runner import _decorated_name_pattern, _is_navigation_name, _parse_target
+from resolver import (
+    build_locator_exact_first, build_locator_for_count,
+    is_navigation_target, parse_target, snapshot_match,
+)
 
 # ── 配置（环境变量）───────────────────────────────────────────────────────────
 # os.getenv("名字", 默认值)：读环境变量，没设置就用默认值。
@@ -625,49 +628,16 @@ class RepairResponse(BaseModel):
     choices: list[RepairChoice] = Field(default_factory=list)
 
 
-def _snapshot_check(snapshot: str, role: str | None, name: str) -> tuple[bool, int]:
-    """在 ARIA 快照文本中查找 role+name 或纯文本，返回 (是否找到, 出现次数)。
-
-    匹配语义与 Runner 对齐（修复 Preflight/Runner 漂移）：
-      exact → decorated-exact（FontAwesome 图标前缀）→ 非导航才 fuzzy。
-      导航短名（Cart 等）禁止 fuzzy substring——否则 "Cart" 会把
-      "Add to cart"/"View Cart" 计入，制造 false AMBIGUOUS。
-
-    快照格式（aria_snapshot 输出）：
-      - button "Add to cart"        ← role+name 格式
-      - text: Your Cart             ← 纯文本格式
-    """
-    if role:
-        pattern = re.compile(rf'\b{re.escape(role)}\s+"([^"]*)"')
-        quotes = pattern.findall(snapshot)
-        if not quotes:
-            return False, 0
-        # exact
-        exact = [q for q in quotes if q.strip() == name]
-        if exact:
-            return True, len(exact)
-        # decorated-exact（图标前缀：" Cart"）
-        decorated = [q for q in quotes if _decorated_name_pattern(name).fullmatch(q.strip())]
-        if decorated:
-            return True, len(decorated)
-        # 非导航才 fuzzy substring
-        if not _is_navigation_name(role, name):
-            fuzzy = [q for q in quotes if name.lower() in q.lower()]
-            return bool(fuzzy), len(fuzzy)
-        return False, 0
-    # 纯文本：直接在快照里找
-    return name.lower() in snapshot.lower(), snapshot.lower().count(name.lower())
-
-
-def _scope_snapshot_check(snapshot: str, scope_text: str | None) -> tuple[bool, int]:
+def _scopesnapshot_match(snapshot: str, scope_text: str | None) -> tuple[bool, int]:
     """scope 的三分验证：has_text 文本在快照中出现 0 / 1 / N 次。
 
     修复：有 scope ≠ 已消歧——scope 值可能是"不存在的商品"（0 次）
     或匹配多个容器（N 次），Preflight 必须和 Runner 的三分法一致。
+    匹配语义来自 resolver.snapshot_match（单一事实源，R1）。
     """
     if not scope_text:
         return True, 1   # 无 scope → 视为消歧通过（交由 target 检查）
-    return _snapshot_check(snapshot, None, scope_text)
+    return snapshot_match(snapshot, None, scope_text)
 
 
 def _target_to_dict(t) -> dict:
@@ -702,7 +672,7 @@ def _preflight_targets(
         if not t:
             continue   # goto / 无 target 断言，无需验证
 
-        parsed = _parse_target(t)   # 复用执行器的解析（单一实现）
+        parsed = parse_target(t)   # 复用执行器的解析（单一实现）
         if parsed is None:
             continue
         role, name = parsed.role, parsed.name
@@ -720,7 +690,7 @@ def _preflight_targets(
             snapshot = fallback_snapshot
             strong = False
 
-        found, count = _snapshot_check(snapshot, role, name)
+        found, count = snapshot_match(snapshot, role, name)
         if not found:
             issues.append(PreflightIssue(
                 step_index=index,
@@ -747,7 +717,7 @@ def _preflight_targets(
                     detail=f"步骤 {index}: 页面存在 {count} 个同名 {role}，需 scope 消歧",
                 ))
             else:
-                scope_found, scope_count = _scope_snapshot_check(snapshot, scope_text)
+                scope_found, scope_count = _scopesnapshot_match(snapshot, scope_text)
                 scope_dict = None
                 if step.scope is not None:
                     scope_dict = step.scope.model_dump() if hasattr(step.scope, "model_dump") \
@@ -838,11 +808,11 @@ def _extract_candidate_contexts(
 
     # 快照筛选：只访问可能包含 target 的 observation
     if observations:
-        parsed = _parse_target(target)
+        parsed = parse_target(target)
         role, name = (parsed.role, parsed.name or parsed.text) if parsed else (None, None)
         if role and name:
             hits = [o["url"] for o in observations
-                    if _snapshot_check(o["snapshot"], role, name)[0]]
+                    if snapshot_match(o["snapshot"], role, name)[0]]
             if hits:
                 urls = hits
 
@@ -865,7 +835,7 @@ def _extract_candidate_contexts(
                             page.wait_for_timeout(500)
                         except Exception:
                             pass
-                    locator = _build_locator_for_count(page, target)
+                    locator = build_locator_for_count(page, target)
                     if locator is None:
                         continue
                     count = locator.count()
@@ -930,28 +900,9 @@ def _try_login(page, login_inputs: dict) -> bool:
         return False
 
 
-def _build_locator_for_count(page, target: dict):
-    """直接构建定位器（绕过三分法，允许 count>1）——候选提取专用。"""
-    parsed = _parse_target(target)
-    if parsed is None:
-        return None
-    if parsed.test_id:
-        loc = page.get_by_test_id(parsed.test_id)
-        if loc.count() == 0:
-            loc = page.locator(f'[data-test="{parsed.test_id}"], [data-qa="{parsed.test_id}"]')
-        return loc
-    if parsed.role and parsed.name:
-        return page.get_by_role(parsed.role, name=parsed.name)
-    if parsed.text:
-        return page.get_by_text(parsed.text)
-    if parsed.css:
-        return page.locator(parsed.css)
-    return None
-
-
 def _text_alternative(snapshot: str, name: str) -> Locator | None:
     """NOT_FOUND 的确定性修复：目标名在快照中存在文本 → 换成文本定位。"""
-    found, _ = _snapshot_check(snapshot, None, name)
+    found, _ = snapshot_match(snapshot, None, name)
     return Locator(text=name) if found else None
 
 
@@ -1008,7 +959,7 @@ def _scope_patch(issue: PreflightIssue, scope_text: str) -> RepairItem:
     Invariant：导航 target 禁止商品/业务 scope——即使修复流程想加，
     也改为 clear_scope（导航 locator 的消歧走导航语义，不是商品 scope）。
     """
-    if _is_navigation_target(issue.target):
+    if is_navigation_target(issue.target):
         return RepairItem(step_index=issue.step_index, clear_scope=True)
     return RepairItem(
         step_index=issue.step_index,
@@ -1026,7 +977,7 @@ def _normalize_invalid_scopes(case: DSLCase) -> DSLCase:
     changed = False
     for step in case.steps:
         if (step.scope is not None and step.target is not None
-                and _is_navigation_target(_target_to_dict(step.target))):
+                and is_navigation_target(_target_to_dict(step.target))):
             step.scope = None
             changed = True
     if changed:
@@ -1062,45 +1013,6 @@ def _goal_match_anchor(goal: str, anchors: list[str]) -> str | None:
     return None
 
 
-def _is_navigation_target(target: dict) -> bool:
-    """target 是否属于导航级元素（link 且名称在 allowlist）。
-    判定语义与 Runner 共享（_is_navigation_name）。"""
-    parsed = _parse_target(target)
-    if parsed is None:
-        return False
-    return _is_navigation_name(parsed.role, parsed.name)
-
-
-def _build_locator_exact_first(page, target: dict):
-    """构建定位器（与 Runner 共享语义）：exact → decorated-exact → fuzzy（导航名禁止 fuzzy）。
-
-    修复：FontAwesome 图标字符进 accessible name（" Cart"）——
-    exact 失败后尝试 decorated-exact，而不是直接跳脏 fuzzy。
-    """
-    parsed = _parse_target(target)
-    if parsed is None:
-        return None
-    if parsed.test_id:
-        loc = page.get_by_test_id(parsed.test_id)
-        if loc.count() == 0:
-            loc = page.locator(f'[data-test="{parsed.test_id}"], [data-qa="{parsed.test_id}"]')
-        return loc
-    if parsed.role and parsed.name:
-        loc = page.get_by_role(parsed.role, name=parsed.name, exact=True)
-        if loc.count() == 0:
-            loc = page.get_by_role(
-                parsed.role, name=_decorated_name_pattern(parsed.name),
-            )
-        if loc.count() == 0 and not _is_navigation_name(parsed.role, parsed.name):
-            loc = page.get_by_role(parsed.role, name=parsed.name)
-        return loc
-    if parsed.text:
-        return page.get_by_text(parsed.text, exact=True)
-    if parsed.css:
-        return page.locator(parsed.css)
-    return None
-
-
 def _inspect_scoped_steps(
     scoped_items: list[tuple[int, dict]],
     urls: list[str], login_inputs: dict | None,
@@ -1128,11 +1040,11 @@ def _inspect_scoped_steps(
                 # 快照筛选：所有待检查 target 的 URL 并集
                 target_urls: list[str] = []
                 for _, target in scoped_items:
-                    parsed = _parse_target(target)
+                    parsed = parse_target(target)
                     role, name = (parsed.role, parsed.name or parsed.text) if parsed else (None, None)
                     if observations and role and name:
                         hits = [o["url"] for o in observations
-                                if _snapshot_check(o["snapshot"], role, name)[0]]
+                                if snapshot_match(o["snapshot"], role, name)[0]]
                         target_urls.extend(hits)
                 if not target_urls:
                     target_urls = urls
@@ -1159,14 +1071,14 @@ def _inspect_scoped_steps(
                             continue
                         # 导航级 target：商品/价格 scope 一律禁止 → remove_scope
                         # （deterministic 规则，修复 Step 9 Cart→Blue Top 误修）
-                        if _is_navigation_target(target):
+                        if is_navigation_target(target):
                             result[idx] = {
                                 "action": "remove_scope",
                                 "anchors": [],
                                 "reason": "navigation_target_cannot_use_product_scope",
                             }
                             continue
-                        locator = _build_locator_exact_first(page, target)
+                        locator = build_locator_exact_first(page, target)
                         if locator is None:
                             continue
                         count = locator.count()
@@ -1351,7 +1263,7 @@ def _preflight_and_repair(
         # AMBIGUOUS_SCOPE 统一由 Round 1.5（Browser-backed）处理——
         # 浏览器判定 target 唯一性 + goal 业务实体锚点
         elif issue.type == "LOCATOR_NOT_FOUND":
-            parsed = _parse_target(issue.target)
+            parsed = parse_target(issue.target)
             name = (parsed.name or parsed.text) if parsed else None
             if name:
                 alt = _text_alternative(multi_snapshot, name)

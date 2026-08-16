@@ -148,7 +148,7 @@ Locator resolution: "DOM 里谁对应它？" → semantic resolver
 | **G3** | refs-only Planner | Planner 不再自由生成 role/name/scope（✅ 已完成：grounded 模式双 Prompt + `check_refs_only` 代码契约；无探索降级保留 legacy 生成能力） |
 | **G3** | State Grounding Validator | 跨 state ref 在执行前被拒绝（`STATE_GROUNDING_MISMATCH`）（✅ 已完成：`backend/grounding.py`） |
 | **R1** | NodeRef → LocatorSpec Compiler | locator 由代码确定性生成（✅ 已完成：`backend/compiler.py`，target_ref → Locator 查表编译） |
-| **R1** | 独立 Semantic Resolver（抽离模块） | Runner / Preflight 共用 resolution semantics |
+| **R1** | 独立 Semantic Resolver（抽离模块） | Runner / Preflight 共用 resolution semantics（✅ 已完成：`backend/resolver.py`——target 解析 / 候选顺序 / 导航名限制 / 图标前缀容忍 / 快照匹配 / 定位异常单一事实源；Runner 与 Preflight 全部改引，ai_agent 不再 import runner，DAG 无环；`backend/tests/test_resolver.py` 13/13 锁定语义防再漂移） |
 | **R2** | scoring + confidence margin | 高分但 margin 低仍拒绝 |
 | **L1** | corrections JSON loop | correction 是 candidate source，不绕过 Resolver；成功/失败统计 + 连续失败 disable |
 
