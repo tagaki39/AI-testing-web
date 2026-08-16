@@ -42,11 +42,12 @@ from uuid import uuid4
 
 from playwright.sync_api import sync_playwright, expect
 
+from corrections import find_enabled, record_failure, record_success
 from dsl import DSLCase, DSLStep
 from resolver import (
     LocatorAmbiguousError, LocatorNotFoundError, LowConfidenceError,
-    ParsedTarget, build_locator_candidates, business_identity,
-    decide_resolution, parse_target,
+    ParsedTarget, build_locator_candidates, build_locator_for_count,
+    business_identity, decide_resolution, parse_target, target_key,
 )
 
 # 执行截图保存目录（项目根/artifacts）
@@ -192,6 +193,18 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
 
     containers = _resolve_scope_containers(page, scope)
 
+    # L1：持久化覆盖规则查找（URL 模式 + 语义键）。
+    # correction 作为最高分候选进入统一裁决——不绕过 Resolver：
+    # 唯一性/评分/margin/可见性全部照常（count!=1 时自然落回标准候选）。
+    key = target_key(target)   # 原始 target（str/dict/Locator），非已解析的 ParsedTarget
+    correction_locator = None
+    if key:
+        correction = find_enabled(page.url, key)
+        if correction is not None:
+            correction_locator = build_locator_for_count(
+                page, correction.locator.model_dump(),
+            )
+
     # 两阶段 Resolver + global deadline（修复执行慢：per-candidate 等待
     # 5s × N 容器 × M 策略可叠加成 60-110s）：
     #   Phase A：立即扫描（只 count()，不等待）——已有候选就直接处理
@@ -205,9 +218,18 @@ def _resolve_locator(page, target, scope=None, *, allow_lazy: bool = False, time
         R2：收集全部容器×策略的 count（评分裁决需要完整证据，
         多几次 count() 调用，无等待，时间上界不变）。
         证据行格式 (strategy, locator, count)，count==0 的行不收集。
+        L1：correction 候选行最先注入（同轮重算——页面渲染中 count
+        可能变化）。
         """
         rows: list[tuple[str, object, int]] = []
         errors: list[str] = []
+        if correction_locator is not None:
+            try:
+                c_count = correction_locator.count()
+                if c_count > 0:
+                    rows.append(("correction", correction_locator, c_count))
+            except Exception:
+                pass
         for container in containers:
             for strategy, locator in build_locator_candidates(container, t):
                 try:
@@ -433,6 +455,16 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
 
     # 量化字段：本步耗时（毫秒）
     evidence["duration_ms"] = max(0, int((perf_counter() - step_started_at) * 1000))
+
+    # L1：correction 命中统计——success 清零失败计数，failure 驱动熔断
+    #（连续 ≥3 次自动禁用，由 corrections store 执行）
+    if evidence["resolved_by"] == "correction" and page.url:
+        key = target_key(step.target)
+        if key:
+            if evidence["status"] == "passed":
+                record_success(page.url, key)
+            else:
+                record_failure(page.url, key)
     return evidence
 
 

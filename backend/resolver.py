@@ -348,8 +348,10 @@ def build_locator_for_count(page, target: dict):
 # 高分但与其他证据的 margin 不足 → 拒绝（宁可靠错误，不可低置信度点击）。
 
 # 策略稳定性分层：test_id 是显式契约（最高）；语义定位其次；
-# fuzzy / css 是最弱证据。
+# fuzzy / css 是最弱证据。correction 是人工验证的持久化覆盖规则（L1），
+# 高于一切自动策略——但仍走统一裁决（唯一性 + margin 门槛），不绕过。
 STRATEGY_SCORES = {
+    "correction": 130,
     "test_id": 100, "test_id_attr": 95, "role": 90,
     "role_decorated": 80, "text": 60, "role_fuzzy": 50, "css": 30,
 }
@@ -382,7 +384,29 @@ RELAXATION_GROUP_OF = {
     "role": "role", "role_decorated": "role", "role_fuzzy": "role",
     "test_id": "test_id", "test_id_attr": "test_id_attr",
     "text": "text", "css": "css",
+    "correction": "correction",   # L1：独立身份来源，参与 margin 门槛
 }
+
+
+def target_key(target) -> str:
+    """target → 语义键（L1 corrections 的匹配维度——locator 序列化）。
+
+    例：{"role":"button","name":"Login"} → "role:button:name:Login"
+        {"text": "Products"} → "text:Products"
+        "css=.btn" / {"test_id": "x"} 同理。
+    """
+    parsed = parse_target(target)
+    if parsed is None:
+        return ""
+    if parsed.test_id:
+        return f"test_id:{parsed.test_id}"
+    if parsed.css:
+        return f"css:{parsed.css}"
+    if parsed.role:
+        return f"role:{parsed.role}:name:{parsed.name or ''}"
+    if parsed.text:
+        return f"text:{parsed.text}"
+    return ""
 
 
 def decide_resolution(rows: list) -> ResolutionResult:

@@ -46,6 +46,9 @@
   .badge.failed { background: #fdecec; color: #d43c3c; }
   .step-detail { margin-top: 8px; font-size: 13px; color: #555; }
   .step-meta { margin-left: auto; font-size: 11px; color: #9aa3ad; font-family: "Cascadia Code", Consolas, monospace; white-space: nowrap; }
+  .step-correction { margin-top: 8px; display: flex; gap: 8px; }
+  .step-correction input { flex: 1; border: 1px solid #e0e4e8; border-radius: 6px; padding: 6px 10px; font-size: 12px; font-family: "Cascadia Code", Consolas, monospace; }
+  .step-correction button { padding: 6px 12px; font-size: 12px; background: #fff; border: 1px solid #c8cdd4; border-radius: 6px; cursor: pointer; }
   .step-error { margin-top: 8px; font-size: 13px; color: #d43c3c; background: #fdf3f3;
                 padding: 8px; border-radius: 6px; }
   .step img { margin-top: 10px; max-width: 100%; border: 1px solid #eee; border-radius: 6px; }
@@ -200,6 +203,7 @@ async function execute() {
 
 // ③ 渲染报告：后端返回的 JSON → HTML 卡片
 function renderReport(report) {
+  window._lastReport = report;   // 供修正提交读取步骤数据
   document.getElementById("report-card").style.display = "block";  // 显示报告区
   const passed = report.passed_steps;
   const total = report.total_steps;
@@ -231,6 +235,11 @@ function renderReport(report) {
         <span class="step-meta">${r.resolved_by ? `${escapeHtml(String(r.resolved_by))} · 定位 ${r.resolve_ms}ms · 本步 ${r.duration_ms}ms` : (r.duration_ms ? `本步 ${r.duration_ms}ms` : "")}</span>
       </div>
       ${r.error ? `<div class="step-error">${escapeHtml(r.error)}</div>` : ""}
+      ${r.status === "failed" && r.target ? `
+      <div class="step-correction">
+        <input id="corr-${i}" placeholder="提交修正定位：test_id=xxx / css=.btn / text=xxx">
+        <button onclick="submitCorrection(${i})">提交修正</button>
+      </div>` : ""}
       ${r.screenshot ? `<img src="${r.screenshot}" alt="步骤${i + 1}截图">` : ""}
     </div>
   `).join("");
@@ -240,6 +249,35 @@ function renderReport(report) {
 function fillExample() {
   document.getElementById("prompt").value =
     "打开 https://example.com，验证页面包含文字 \"Example Domain\"";
+}
+
+// ④ 提交定位修正（L1：持久化覆盖规则——保存后再次执行将优先命中）
+// 修正定位只接受三种契约：test_id=xxx / css=xxx / text=xxx
+async function submitCorrection(i) {
+  const report = window._lastReport;
+  if (!report) { setStatus("无执行报告", true); return; }
+  const step = report.results[i - 1];
+  if (!step || !step.url) { setStatus("该步骤无页面 URL，无法提交修正", true); return; }
+  const input = document.getElementById("corr-" + i);
+  const raw = (input.value || "").trim();
+  if (!raw) { setStatus("请先填写修正定位", true); return; }
+  let locator = null;
+  if (raw.startsWith("test_id=")) locator = { test_id: raw.slice(8) };
+  else if (raw.startsWith("css=")) locator = { css: raw.slice(4) };
+  else if (raw.startsWith("text=")) locator = { text: raw.slice(5) };
+  else { setStatus("修正格式：test_id=xxx / css=xxx / text=xxx", true); return; }
+  try {
+    const resp = await fetch("/api/corrections", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: step.url, target: step.target, locator }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "保存失败");
+    setStatus("✅ 修正已保存为持久化覆盖规则——再次执行该用例时将优先命中（仍过全部安全闸门）");
+  } catch (e) {
+    setStatus("❌ 修正提交失败: " + e.message, true);
+  }
 }
 
 // 辅助：转义 HTML 特殊字符（防止错误信息里的 <script> 被执行——安全细节）

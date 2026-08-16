@@ -12,3 +12,6 @@ __pycache__/
 *.py[cod]
 .cache/
 timings.jsonl
+
+# L1 修正规则（持久化覆盖规则，人工数据）
+corrections.json

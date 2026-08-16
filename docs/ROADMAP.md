@@ -151,7 +151,7 @@ Locator resolution: "DOM 里谁对应它？" → semantic resolver
 | **R1** | 独立 Semantic Resolver（抽离模块） | Runner / Preflight 共用 resolution semantics（✅ 已完成：`backend/resolver.py`——target 解析 / 候选顺序 / 导航名限制 / 图标前缀容忍 / 快照匹配 / 定位异常单一事实源；Runner 与 Preflight 全部改引，ai_agent 不再 import runner，DAG 无环；`backend/tests/test_resolver.py` 13/13 锁定语义防再漂移） |
 | **R2** | scoring + confidence margin | 高分但 margin 低仍拒绝（✅ 已完成：`resolver.decide_resolution`——策略评分分层 + 放松组 + 置信度门槛；`LowConfidenceError` 继承 Ambiguous 保持兼容） |
 | **I1** | 实例身份恢复 | 编译后 locator 可区分 observation 内同名元素（容器内 scope 编译 + 身份证据前移；容器外留给 L1）（✅ 已完成：探索采集容器锚点 `scope_has_text` + verified 标记 → Compiler 同名重复附加 `Scope(has_text)`；E2E saucedemo 6/6、automationexercise 定位步骤全通——剩余失败为探索完整性/规划质量波动，属生成链路增强阶段） |
-| **L1** | corrections JSON loop | correction 是 candidate source，不绕过 Resolver；成功/失败统计 + 连续失败 disable |
+| **L1** | corrections JSON loop | correction 是 candidate source，不绕过 Resolver；成功/失败统计 + 连续失败 disable（✅ 已完成：`backend/corrections.py`——URL 泛化 + 语义键匹配、upsert、连续失败 3 次熔断；correction 以 130 分最高候选进入统一裁决；前端失败步骤可提交修正；P4 E2E 验收：失败 → 提交 → 重跑命中 verified_count=1） |
 
 **首个 milestone**：两个 regression 的执行前拒绝（不要求自动修复）：
 

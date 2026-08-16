@@ -47,7 +47,9 @@ from pydantic import BaseModel
 
 # 本项目模块（注意：现在才 import，.env 已加载完毕）
 from ai_agent import generate_dsl
-from dsl import DSLCase, validate_case
+from corrections import list_all, upsert
+from dsl import DSLCase, Locator, validate_case
+from resolver import target_key
 from runner import execute_case
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -154,6 +156,36 @@ def api_execute(req: ExecuteRequest):
         return _json_utf8({"ok": True, "report": report})
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"执行失败: {str(exc)[:300]}")
+
+
+class CorrectionRequest(BaseModel):
+    """POST /api/corrections 的请求体契约（L1：持久化定位覆盖规则）。"""
+    url: str               # 失败步骤所在页面 URL
+    target: dict | str     # 失败步骤的原始 target（生成语义键）
+    locator: dict          # 修正后的定位（test_id/css/text/role+name）
+
+
+@app.post("/api/corrections")
+def api_upsert_correction(req: CorrectionRequest):
+    """保存一条定位覆盖规则（同 URL 模式 + 语义键 upsert）。
+
+    L1 原则：correction 不绕过 Resolver——只是最高优先级候选，
+    执行时仍过唯一性 + 评分 + margin 门槛（见 runner._resolve_locator）。
+    """
+    try:
+        key = target_key(req.target)
+        if not key:
+            raise ValueError("target 无法生成语义键（无定位字段）")
+        saved = upsert(req.url, key, Locator(**req.locator))
+        return _json_utf8({"ok": True, "correction": saved.model_dump()})
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"修正保存失败: {str(exc)[:200]}")
+
+
+@app.get("/api/corrections")
+def api_list_corrections():
+    """全部覆盖规则（最新在前，供前端展示/管理）。"""
+    return _json_utf8({"ok": True, "corrections": [c.model_dump() for c in list_all()]})
 
 
 @app.get("/api/artifacts/{run_id}/{filename}")
