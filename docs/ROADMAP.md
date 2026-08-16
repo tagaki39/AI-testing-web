@@ -181,7 +181,7 @@ fail-open——只拒绝可证明的错位，不误拒合法计划）；编造 r
 **问题**：refs-only 编译的 LocatorSpec 只含 (role, name)——observation 内同名的
 元素在执行时无法区分（automationexercise View Product ×N，实测 6/9 失败）。
 
-**决策 1 — 分而治之**（参考原项目实测结论，见 docs/原项目机制参考.md）：
+**决策 1 — 分而治之**（参考实测结论，见 docs/机制参考与借鉴评估.md）：
 - **容器内重复**（元素在业务容器内，如 Add to cart ×6）：探索期为重复元素
   采集"容器上下文"（data-product-id/data-item-id 容器 → 容器首行稳定文本），
   Compiler 发现 observation 内同名 >1 时附加 scope 编译
