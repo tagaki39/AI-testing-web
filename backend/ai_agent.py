@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 from dsl import DSLCase, Locator, Scope, validate_case
 from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
 from explore_flow import explore
+from grounding import StateGraph, validate_state_grounding
 from runner import _decorated_name_pattern, _is_navigation_name, _parse_target
 
 # ── 配置（环境变量）───────────────────────────────────────────────────────────
@@ -1535,6 +1536,17 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             if step.observation_ref and step.observation_ref not in valid_refs:
                 step.observation_ref = None
 
+    # ← G3 State Grounding Validator（Architecture v2 首个 invariant）──
+    # 静态推导每步 expected state：跨状态 target_ref / 编造 ref 在执行前
+    # 被拒绝（milestone 只要求拒绝，不自动修复；mismatch 按转移图自动
+    # 替换是第二阶段）。图不进 DSL——校验只在生成链路运行（explore_result
+    # 在作用域内）；执行器本期不变（Runner 仍用 target 语义回放）。
+    # 放在 Preflight 之前：grounding 错位的计划不值得花浏览器轮次修复。
+    if explore_result is not None:
+        validate_state_grounding(
+            case, StateGraph.from_explore_result(explore_result),
+        )
+
     meta = {
         "snapshot_used": bool(multi_snapshot),
         "entry_url": entry_url,
@@ -1549,6 +1561,11 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             "transitions": (explore_result or {}).get("transitions", []),   # G2：状态转移边
         } if explore_result else None,
         "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）
+        # G3：target_ref grounding 校验覆盖（ROADMAP §8 指标 target_ref
+        # grounding validity 的分母；被拒绝的计划不会走到这里）
+        "grounding": {
+            "ref_steps_checked": sum(1 for s in case.steps if s.target_ref),
+        },
     }
 
     # ── 阶段 4：Page-aware Preflight（按 observation_ref 验证 + 分层修复）─

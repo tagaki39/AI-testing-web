@@ -143,11 +143,11 @@ Locator resolution: "DOM 里谁对应它？" → semantic resolver
 |------|------|---------|
 | **C0** | Resolver global timeout budget | 任意 resolution ≤5s（✅ 已完成） |
 | **C0** | Schema Recovery 收尾 | malformed JSON 一次 recovery 后明确成功/失败（✅ 已完成） |
-| **C0** | 固化 regressions + `locator-v1` tag | 两个 grounding regression 保存为文件；v1 freeze（⏳ 待做） |
-| **G1** | ObservedElement + state-scoped target_ref | observation 能产生 `obs3:e17` |
-| **G2** | Observation State Graph | 能表达 `obs3 --click e17--> obs4` |
+| **C0** | 固化 regressions + `locator-v1` tag | 两个 grounding regression 保存为文件；v1 freeze（✅ 已完成） |
+| **G1** | ObservedElement + state-scoped target_ref | observation 能产生 `obs3:e17`（✅ 已完成：探索产出 + DSL 字段 + Prompt 引导） |
+| **G2** | Observation State Graph | 能表达 `obs3 --click e17--> obs4`（✅ 已完成：transitions 边记录 + 注入） |
 | **G3** | refs-only Planner | Planner 不再自由生成 role/name/scope |
-| **G3** | State Grounding Validator | 跨 state ref 在执行前被拒绝（`STATE_GROUNDING_MISMATCH`） |
+| **G3** | State Grounding Validator | 跨 state ref 在执行前被拒绝（`STATE_GROUNDING_MISMATCH`）（✅ 已完成：`backend/grounding.py`） |
 | **R1** | NodeRef → LocatorSpec Compiler | locator 由代码确定性生成 |
 | **R1** | 独立 Semantic Resolver（抽离模块） | Runner / Preflight 共用 resolution semantics |
 | **R2** | scoring + confidence margin | 高分但 margin 低仍拒绝 |
@@ -159,6 +159,12 @@ Locator resolution: "DOM 里谁对应它？" → semantic resolver
 SauceDemo wrong-state ref      → STATE_GROUNDING_MISMATCH
 AutomationExercise wrong-state → STATE_GROUNDING_MISMATCH
 ```
+
+**✅ 已达成**（`backend/grounding.py` + `backend/tests/test_grounding.py`，13/13 通过）。
+实现要点：静态推导 expected state（goto URL 匹配 + 转移边追踪，不可追踪处
+fail-open——只拒绝可证明的错位，不误拒合法计划）；编造 ref 硬拒绝
+（UnknownTargetRefError，不清空降级）；Validator 在生成链路 Preflight 之前
+运行，mismatch 的自动替换留待第二阶段。
 
 ---
 
@@ -191,10 +197,11 @@ AutomationExercise wrong-state → STATE_GROUNDING_MISMATCH
 
 ## 8. Regression & Metrics
 
-### Grounding regressions（C0.3 待固化）
+### Grounding regressions（已固化 + Validator 覆盖）
 
 - Regression 1 — SauceDemo：detail state 后不得引用 inventory ref
 - Regression 2 — AutomationExercise：detail state 后 target_ref 必须来自 detail observation
+- 验收实现：`backend/tests/test_grounding.py`（零依赖 plain-assert，`py backend/tests/test_grounding.py`）
 
 ### 核心指标
 
