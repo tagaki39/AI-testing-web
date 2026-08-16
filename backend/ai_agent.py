@@ -43,8 +43,8 @@ from explore_cache import invalidate as cache_invalidate, load as cache_load, sa
 from explore_flow import explore
 from grounding import StateGraph, validate_state_grounding
 from resolver import (
-    build_locator_exact_first, build_locator_for_count,
-    is_navigation_target, parse_target, snapshot_match,
+    PRICE_RE, build_locator_exact_first, build_locator_for_count,
+    choose_scope_text, is_navigation_target, parse_target, snapshot_match,
 )
 
 # ── 配置（环境变量）───────────────────────────────────────────────────────────
@@ -906,25 +906,6 @@ def _text_alternative(snapshot: str, name: str) -> Locator | None:
     return Locator(text=name) if found else None
 
 
-# 价格行正则（scope 选择时跳过 "$29.99" "Rs. 500" 这类噪音——
-# 支持 $€£₹ 与 Rs. 前缀，修复 Rs. 价格未被识别导致 goal 误匹配价格）
-_PRICE_RE = re.compile(r"(?:[$€£₹]|Rs\.?)\s*\d+(?:\.\d{1,2})?")
-
-
-def _choose_scope_text(scope_candidates: list[str]) -> str | None:
-    """从候选行中选最终 scope 文本（启发式）：
-    跳过空行/按钮文本（已排除）/纯价格/过短行，返回第一个像"名称"的行。
-    """
-    for line in scope_candidates:
-        line = line.strip()
-        if not line or len(line) < 2:
-            continue
-        if _PRICE_RE.fullmatch(line):
-            continue
-        return line[:60]
-    return None
-
-
 def _resolve_ambiguity(goal: str, issue: PreflightIssue) -> tuple[str, dict | None, str | None]:
     """需求明确性判断（区分 Locator / Requirement ambiguity）：
       - goal 命中某候选的业务实体行 → ("auto", 候选, scope)  需求明确，代码直接修
@@ -939,14 +920,14 @@ def _resolve_ambiguity(goal: str, issue: PreflightIssue) -> tuple[str, dict | No
     for cand in (issue.candidates or []):
         for scope in cand.get("scope_candidates", []):
             scope = scope.strip()
-            if not scope or len(scope) < 2 or _PRICE_RE.fullmatch(scope):
+            if not scope or len(scope) < 2 or PRICE_RE.fullmatch(scope):
                 continue   # 跳过价格/短行（Rs. 500 等易重复文本）
             if scope.lower() in goal.lower():
                 return "auto", cand, scope
 
     # 需求歧义：取第一个候选的第一个"好" scope 行（同样跳过价格）
     for cand in (issue.candidates or []):
-        scope = _choose_scope_text(cand.get("scope_candidates", []))
+        scope = choose_scope_text(cand.get("scope_candidates", []))
         if scope:
             return "first", cand, scope
 
@@ -1006,7 +987,7 @@ def _goal_match_anchor(goal: str, anchors: list[str]) -> str | None:
     价格行不能因顺序靠前被误选——业务实体优先。
     """
     for anchor in anchors:
-        if not anchor or len(anchor) < 2 or _PRICE_RE.fullmatch(anchor):
+        if not anchor or len(anchor) < 2 or PRICE_RE.fullmatch(anchor):
             continue
         if anchor.lower() in goal.lower():
             return anchor
@@ -1328,7 +1309,7 @@ def _preflight_and_repair(
                     ) if issue else None
                     # LLM 只选 candidate_id，最终 scope 文本由代码从候选行中确定
                     if issue and candidate:
-                        scope_text = _choose_scope_text(candidate.get("scope_candidates", []))
+                        scope_text = choose_scope_text(candidate.get("scope_candidates", []))
                         if scope_text:
                             patches.append(_scope_patch(issue, scope_text))
                 if patches:
@@ -1597,9 +1578,10 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     # 在作用域内）；执行器仍用编译后的 target 语义回放（评审既定结论）。
     # 放在 Preflight 之前：grounding 错位的计划不值得花浏览器轮次修复。
     state_graph = None
+    compile_stats: dict = {}
     if explore_result is not None:
         state_graph = StateGraph.from_explore_result(explore_result)
-        case = compile_targets(case, state_graph)          # ← R1 编译
+        case = compile_targets(case, state_graph, stats=compile_stats)   # ← R1+I1 编译
         validate_state_grounding(case, state_graph)        # ← G3 拒绝
 
     meta = {
@@ -1623,6 +1605,9 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             "compiled_targets": sum(
                 1 for s in case.steps if s.target_ref and s.target is not None
             ),
+            # I1：实例身份编译产出（scope 消歧 / 容器外无锚点清单）
+            "scoped_compiled": compile_stats.get("scoped_compiled", 0),
+            "unscoped_duplicates": compile_stats.get("unscoped_duplicates") or None,
         },
     }
 

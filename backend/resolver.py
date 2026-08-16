@@ -461,3 +461,23 @@ def decide_resolution(rows: list) -> ResolutionResult:
     return ResolutionResult(
         status="resolved", strategy=winner, hits=hits_by_strategy[winner],
     )
+
+
+# ── scope 锚点启发式（共享：Preflight 修复与 I1 探索采集）──────────────────────
+# 价格行正则（scope 选择时跳过 "$29.99" "Rs. 500" 这类噪音——
+# 支持 $€£₹ 与 Rs. 前缀，修复 Rs. 价格未被识别导致 goal 误匹配价格）
+PRICE_RE = re.compile(r"(?:[$€£₹]|Rs\.?)\s*\d+(?:\.\d{1,2})?")
+
+
+def choose_scope_text(scope_candidates: list[str]) -> str | None:
+    """从候选行中选最终 scope 文本（启发式）：
+    跳过空行/按钮文本（已排除）/纯价格/过短行，返回第一个像"名称"的行。
+    """
+    for line in scope_candidates:
+        line = line.strip()
+        if not line or len(line) < 2:
+            continue
+        if PRICE_RE.fullmatch(line):
+            continue
+        return line[:60]
+    return None

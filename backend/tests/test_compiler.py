@@ -330,6 +330,83 @@ def test_credential_redaction_english_phrasing():
     assert "test123" not in redacted
 
 
+# ── I1：实例身份（GraphElement 扩展 + scope 编译）────────────────────────────
+
+def test_graph_element_identity_fields_roundtrip():
+    """verified / scope_has_text 字段往返；旧缓存形态（缺字段）取默认值。"""
+    explore_result = {
+        "observations": [{
+            "id": "obs1", "url": "https://x.com/", "state_hash": "h",
+            "elements": [
+                {"ref": "obs1:e1", "role": "button", "name": "Buy",
+                 "verified": True, "scope_has_text": "Blue Top"},
+                {"ref": "obs1:e2", "type": "text", "text": "Products"},   # 旧形态
+            ],
+        }],
+        "transitions": [],
+    }
+    graph = StateGraph.from_explore_result(explore_result)
+    e1 = graph.observations[0].elements[0]
+    assert e1.verified is True and e1.scope_has_text == "Blue Top"
+    e2 = graph.observations[0].elements[1]
+    assert e2.verified is False and e2.scope_has_text is None
+
+
+def _dup_graph(with_anchors: bool) -> StateGraph:
+    return StateGraph(observations=[
+        GraphObservation(
+            id="obs1", url="https://x.com/list", state_hash="h",
+            elements=[
+                GraphElement(ref="obs1:e1", role="button", name="Buy",
+                             scope_has_text="Blue Top" if with_anchors else None),
+                GraphElement(ref="obs1:e2", role="button", name="Buy",
+                             scope_has_text="Red Top" if with_anchors else None),
+                GraphElement(ref="obs1:e3", role="link", name="Home"),
+            ],
+        ),
+    ])
+
+
+def test_compile_attaches_scope_for_duplicates():
+    """同名重复 + 锚点 → 编译附加 Scope(has_text)；唯一元素不附加。"""
+    case = validate_case({"name": "t", "steps": [
+        {"action": "goto", "value": "https://x.com/list"},
+        {"action": "click", "target_ref": "obs1:e1"},
+        {"action": "click", "target_ref": "obs1:e3"},
+    ]})
+    stats = {}
+    compiled = compile_targets(case, _dup_graph(with_anchors=True), stats=stats)
+    assert compiled.steps[1].scope is not None
+    assert compiled.steps[1].scope.has_text == "Blue Top"
+    assert compiled.steps[2].scope is None          # 唯一元素不附加（scope 最小化）
+    assert stats["scoped_compiled"] == 1 and stats["unscoped_duplicates"] == []
+
+
+def test_compile_duplicate_without_anchor():
+    """重复但无锚点（容器外）→ 不附加 scope，stats 记录 ref（L1 输入）。"""
+    case = validate_case({"name": "t", "steps": [
+        {"action": "goto", "value": "https://x.com/list"},
+        {"action": "click", "target_ref": "obs1:e1"},
+    ]})
+    stats = {}
+    compiled = compile_targets(case, _dup_graph(with_anchors=False), stats=stats)
+    assert compiled.steps[1].scope is None
+    assert stats["scoped_compiled"] == 0
+    assert stats["unscoped_duplicates"] == ["obs1:e1"]
+
+
+def test_compile_verified_is_not_a_bypass():
+    """verified 是证据不是豁免：重复元素无锚点时即使 verified 也不附加。"""
+    graph = _dup_graph(with_anchors=False)
+    graph.observations[0].elements[0].verified = True
+    case = validate_case({"name": "t", "steps": [
+        {"action": "goto", "value": "https://x.com/list"},
+        {"action": "click", "target_ref": "obs1:e1"},
+    ]})
+    compiled = compile_targets(case, graph)
+    assert compiled.steps[1].scope is None
+
+
 # ── 运行入口 ──────────────────────────────────────────────────────────────────
 
 def main() -> int:

@@ -179,6 +179,21 @@ button = container.get_by_role("button", name="Add to cart")
   宁可靠错误，不可低置信度点击
 - 拒绝原因完整可解释（winner/竞争证据/分差都在错误信息里）
 
+### 7. 实例身份（I1）
+
+同名元素（6 个 Add to cart）的"哪个"由探索期采集的证据确定，而不是执行时现猜：
+
+- **探索期**：`_resolve_locator` 命中即标 `verified`（身份证据前移）；
+  对 observation 内同名重复的元素，沿 DOM 祖先链（li/article/
+  data-testid/data-product-id/data-item-id）采集容器首行稳定文本
+  （跳过价格/短行/自身文本）作为 `scope_has_text` 锚点——
+  **只对重复元素采集，非重复零开销**
+- **编译期**：Compiler 发现 observation 内同名 >1 且有锚点 → 自动附加
+  `Scope(has_text=...)`；唯一元素不附加（scope 最小化）；
+  重复无锚点（容器外元素）→ 记录 `unscoped_duplicates`（L1 corrections 输入）
+- **执行期**：scope 是证据不是命令——仍过三分法 + R2 评分 + margin 门槛；
+  失败明确拒绝，绝不 nth 猜测
+
 ---
 
 ## 当前范围与后续规划

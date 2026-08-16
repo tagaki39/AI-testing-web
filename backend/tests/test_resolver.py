@@ -369,6 +369,34 @@ def test_snapshot_match_decorated_leading_icon():
     assert (found, count) == (True, 1)
 
 
+def test_attach_scope_context_duplicates_only():
+    """I1 采集：同名重复按钮获容器锚点（跳过价格行）；唯一元素零采集。"""
+    from explore_flow import ExploreState, _attach_scope_context, _observe, _parse_elements
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<div data-product-id="p1"><div>Blue Top</div><button>Buy</button></div>\n'
+            '<div data-product-id="p2"><div>Rs. 700</div><div>Red Top</div>'
+            '<button>Buy</button></div>\n'
+            '<button>Only One</button>'
+        )
+        state = ExploreState(goal="t", entry_url="https://x.com")
+        state.snapshot = _observe(page)
+        state.elements = _parse_elements(state.snapshot)
+        _attach_scope_context(state, page)
+
+        buys = [e for e in state.elements if e.get("name") == "Buy"]
+        assert len(buys) == 2
+        anchors = {e.get("scope_has_text") for e in buys}
+        assert anchors == {"Blue Top", "Red Top"}   # 价格行 Rs. 700 被跳过
+
+        only = [e for e in state.elements if e.get("name") == "Only One"][0]
+        assert only.get("scope_has_text") is None   # 唯一元素零采集
+    finally:
+        browser.close()
+        pw.stop()
+
+
 # ── 运行入口 ──────────────────────────────────────────────────────────────────
 
 def main() -> int:

@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
+from resolver import PRICE_RE, choose_scope_text
 from runner import _resolve_locator, _substitute
 
 # ── 预算（bounded：探索必须有限）───────────────────────────────────────────────
@@ -285,12 +286,81 @@ def _record_page(state: ExploreState, page) -> None:
         "elements": state.elements,   # G1：observations 携带 state-scoped refs
     })
 
+    # I1：同名重复元素采集容器文本锚点（只处理重复，非重复零开销）
+    _attach_scope_context(state, page)
+
 
 def _safe_title(page) -> str:
     try:
         return page.title() or ""
     except Exception:
         return ""
+
+
+def _pick_anchor_text(lines: list[str], node_text: str) -> str | None:
+    """从容器文本行选锚点（跳过价格/短行/元素自身文本）。
+
+    I1：与 Preflight 的 choose_scope_text 同族启发式，但需排除节点
+    自身文本（Preflight 侧调用方已排除，这里统一处理）。
+    """
+    for line in lines:
+        line = line.strip()
+        if not line or len(line) < 2:
+            continue
+        if line == node_text:
+            continue
+        if PRICE_RE.fullmatch(line):
+            continue
+        return line[:60]
+    return None
+
+
+def _attach_scope_context(state: ExploreState, page) -> None:
+    """I1：为 observation 内同名重复的元素采集容器文本锚点（scope_has_text）。
+
+    只处理 (role, name) 重复的元素——非重复元素零开销（决策 3 性能上界）。
+    锚点来自 DOM 祖先链（li/article/@data-testid/@data-product-id/
+    @data-item-id）——比 a11y 树 parent 更贴近真实业务容器结构
+    （原项目实测 a11y 树里 View Product 不在产品容器内，DOM 链可兜底）。
+    采集失败静默（无锚点 → Compiler 不附加 scope → 运行时诚实拒绝）。
+    """
+    name_counts: dict[tuple[str, str], int] = {}
+    for e in state.elements:
+        if "role" in e and e.get("name"):
+            key = (e["role"], e["name"])
+            name_counts[key] = name_counts.get(key, 0) + 1
+    duplicates = {k for k, c in name_counts.items() if c > 1}
+    if not duplicates:
+        return
+
+    seen: dict[tuple[str, str], int] = {}
+    for e in state.elements:
+        if "role" not in e or not e.get("name"):
+            continue
+        key = (e["role"], e["name"])
+        if key not in duplicates or e.get("scope_has_text"):
+            continue
+        i = seen.get(key, 0)
+        seen[key] = i + 1
+        try:
+            node = page.get_by_role(e["role"], name=e["name"], exact=True).nth(i)
+            container = node.locator(
+                "xpath=ancestor::*[self::li or self::article or @data-testid"
+                " or @data-product-id or @data-item-id][1]"
+            )
+            container_count = container.count()
+            if container_count == 0:
+                container = node.locator("xpath=../..")
+                container_count = container.count()
+            raw = container.inner_text().strip() if container_count > 0 else ""
+            node_text = node.inner_text().strip()
+            anchor = _pick_anchor_text(
+                [ln.strip() for ln in raw.splitlines() if ln.strip()], node_text,
+            )
+            if anchor:
+                e["scope_has_text"] = anchor
+        except Exception:
+            continue
 
 
 # ── decide：LLM 决策（ref 强校验 + exploration_complete）──────────────────────
@@ -361,6 +431,12 @@ def _act(page, decision: dict, elements: list[dict], runtime_inputs: dict) -> st
     target = {"role": element["role"], "name": element["name"]} if "role" in element \
         else {"text": element["text"]}
     _, locator = _resolve_locator(page, target)
+    # I1：身份证据前移——探索时 count==1 命中即标 verified
+    #（证据不是豁免，运行时仍过三分法 + 评分；供 Compiler/metrics 使用）
+    for e in elements:
+        if e["ref"] == ref:
+            e["verified"] = True
+            break
 
     if action == "click":
         # 危险操作二次拦截（第 6 项：代码层，不只靠 Prompt）——

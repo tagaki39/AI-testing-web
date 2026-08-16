@@ -52,12 +52,19 @@ class GraphElement(DSLModel):
     """图中的一个已观察元素（state-scoped ref，如 obs3:e17）。
 
     role + name = 可交互元素（R1 Compiler 将用它确定性生成 locator）；
-    text        = 文本节点（无角色语义）。
+    text        = 文本节点（无角色语义）；
+    verified    = I1：探索期 _resolve_locator 成功命中（当时页面 count==1）
+                 的身份证据——是证据不是豁免，运行时仍过全部闸门；
+    scope_has_text = I1：容器文本锚点（observation 内同名元素的消歧证据，
+                   Compiler 发现同名重复时附加为 scope）。
+    两个新字段可选——旧探索缓存缺字段时取默认值（向后兼容）。
     """
     ref: str
     role: str | None = None
     name: str | None = None
     text: str | None = None
+    verified: bool = False
+    scope_has_text: str | None = None
 
 
 class GraphObservation(DSLModel):
@@ -101,8 +108,12 @@ class StateGraph(DSLModel):
                 url=o["url"],
                 state_hash=o.get("state_hash"),
                 elements=[
-                    GraphElement(ref=e["ref"], role=e.get("role"),
-                                 name=e.get("name"), text=e.get("text"))
+                    GraphElement(
+                        ref=e["ref"], role=e.get("role"),
+                        name=e.get("name"), text=e.get("text"),
+                        verified=e.get("verified", False),
+                        scope_has_text=e.get("scope_has_text"),
+                    )
                     for e in o.get("elements", [])
                 ],
             )

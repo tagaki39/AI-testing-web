@@ -150,6 +150,7 @@ Locator resolution: "DOM 里谁对应它？" → semantic resolver
 | **R1** | NodeRef → LocatorSpec Compiler | locator 由代码确定性生成（✅ 已完成：`backend/compiler.py`，target_ref → Locator 查表编译） |
 | **R1** | 独立 Semantic Resolver（抽离模块） | Runner / Preflight 共用 resolution semantics（✅ 已完成：`backend/resolver.py`——target 解析 / 候选顺序 / 导航名限制 / 图标前缀容忍 / 快照匹配 / 定位异常单一事实源；Runner 与 Preflight 全部改引，ai_agent 不再 import runner，DAG 无环；`backend/tests/test_resolver.py` 13/13 锁定语义防再漂移） |
 | **R2** | scoring + confidence margin | 高分但 margin 低仍拒绝（✅ 已完成：`resolver.decide_resolution`——策略评分分层 + 放松组 + 置信度门槛；`LowConfidenceError` 继承 Ambiguous 保持兼容） |
+| **I1** | 实例身份恢复 | 编译后 locator 可区分 observation 内同名元素（容器内 scope 编译 + 身份证据前移；容器外留给 L1）（✅ 已完成：探索采集容器锚点 `scope_has_text` + verified 标记 → Compiler 同名重复附加 `Scope(has_text)`；E2E saucedemo 6/6、automationexercise 定位步骤全通——剩余失败为探索完整性/规划质量波动，属生成链路增强阶段） |
 | **L1** | corrections JSON loop | correction 是 candidate source，不绕过 Resolver；成功/失败统计 + 连续失败 disable |
 
 **首个 milestone**：两个 regression 的执行前拒绝（不要求自动修复）：
@@ -174,6 +175,28 @@ fail-open——只拒绝可证明的错位，不误拒合法计划）；编造 r
   确定性 > Planner）；执行侧防线 `ensure_executable_targets` 在浏览器启动前
   拒绝未编译的 ref-only 步骤（防手改 DSL 绕过编译）
 - 无探索降级路径（legacy 模式）保留 role/name/scope 生成能力，行为不变
+
+### I1 决策记录（实例身份恢复，动手前冻结）
+
+**问题**：refs-only 编译的 LocatorSpec 只含 (role, name)——observation 内同名的
+元素在执行时无法区分（automationexercise View Product ×N，实测 6/9 失败）。
+
+**决策 1 — 分而治之**（参考原项目实测结论，见 docs/原项目机制参考.md）：
+- **容器内重复**（元素在业务容器内，如 Add to cart ×6）：探索期为重复元素
+  采集"容器上下文"（data-product-id/data-item-id 容器 → 容器首行稳定文本），
+  Compiler 发现 observation 内同名 >1 时附加 scope 编译
+- **容器外元素**（View Product 不在产品容器内，a11y 树独立元素）：
+  本期**不做** DOM has 链自动生成——明确拒绝 + 可解释错误，
+  兜底职责留给 L1 corrections（人工提交 css 修正）
+
+**决策 2 — 身份证据前移（verified 标记）**：探索期 `_resolve_locator` 成功
+命中的元素标记 verified（探索时页面 count==1）。verified 是证据不是豁免——
+运行时仍过三分法 + R2 评分；作用：编译时无需 scope 也有把握，入 meta 供指标。
+
+**决策 3 — scope 是证据不是命令（fail-safe）**：
+- 编译出的 scope 运行时仍过三分法 + R2 评分 + margin 门槛
+- 消歧失败 → 明确拒绝（Ambiguous / LowConfidence），**绝不 nth 猜测**
+- 探索期只对同名重复元素采集上下文（性能上界：非重复元素零开销）
 
 ---
 
