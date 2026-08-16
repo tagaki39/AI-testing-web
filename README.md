@@ -38,6 +38,16 @@ python main.py
 2. 点击「AI 生成 DSL」→ AI 返回结构化 DSL JSON，可在编辑框中人工调整
 3. 点击「执行测试」→ Playwright 执行全部步骤，逐步骤展示状态与截图
 
+### 量化指标
+
+每次生成/执行自动追加耗时与定位策略记录（`timings.jsonl`，已脱敏）。
+聚合输出 ROADMAP §8 核心指标（Planner 成功率 / 各阶段 p50/p95 /
+定位策略分布 / resolve 延迟等）：
+
+```bash
+py backend/metrics.py
+```
+
 ---
 
 ## 架构

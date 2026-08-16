@@ -41,7 +41,7 @@ if ENV_FILE.exists():
 
 # 第三方库：FastAPI（Web 框架）、Pydantic（数据校验）、StaticFiles（托管静态文件）
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -73,6 +73,13 @@ def _append_timing(record: dict) -> None:
 
 # ── API ────────────────────────────────────────────────────────────────────────
 # 每个 API = 装饰器声明路由 + Pydantic 模型声明请求格式 + 业务函数
+
+# 统一 JSON 响应（带 charset=utf-8）：无 charset 时非浏览器客户端按 Latin-1
+# 解码，PUA 图标字符（FontAwesome 等）会被拆坏——真实 E2E 用 PowerShell 调用
+# 时踩坑（浏览器 fetch 不受影响，但 API 应对任意客户端健壮）。
+def _json_utf8(content: dict, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(content, status_code=status_code,
+                        media_type="application/json; charset=utf-8")
 
 class GenerateRequest(BaseModel):
     """POST /api/generate 的请求体契约：必须有一个非空字符串 prompt。"""
@@ -111,8 +118,9 @@ def api_generate(req: GenerateRequest):
                 "coverage": pf.get("observation_coverage"),
             },
             "normalize_removed_assertions": meta.get("normalize_removed_assertions"),
+            "grounding": meta.get("grounding"),   # G3/R1：ref 校验覆盖 + 编译产出
         })
-        return {"ok": True, "case": case.model_dump(), "meta": meta}   # 模型 → dict → JSON
+        return _json_utf8({"ok": True, "case": case.model_dump(), "meta": meta})   # 模型 → dict → JSON
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"AI 生成失败: {str(exc)[:300]}")
 
@@ -136,13 +144,14 @@ def api_execute(req: ExecuteRequest):
             "passed": f"{report.get('passed_steps')}/{report.get('total_steps')}",
             "steps": [
                 {"i": r["step_index"], "action": r["action"], "status": r["status"],
-                 "ms": r.get("duration_ms"), "resolved_by": r.get("resolved_by"),
+                 "ms": r.get("duration_ms"), "resolve_ms": r.get("resolve_ms"),
+                 "resolved_by": r.get("resolved_by"),
                  "target": r.get("target"), "scope": r.get("scope"),
                  "error": (r.get("error") or "")[:200]}   # error 截断；不含 value 明文
                 for r in report.get("results", [])
             ],
         })
-        return {"ok": True, "report": report}
+        return _json_utf8({"ok": True, "report": report})
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"执行失败: {str(exc)[:300]}")
 

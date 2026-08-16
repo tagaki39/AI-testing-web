@@ -45,6 +45,7 @@
   .badge.passed { background: #e6f7ed; color: #1a9c4f; }
   .badge.failed { background: #fdecec; color: #d43c3c; }
   .step-detail { margin-top: 8px; font-size: 13px; color: #555; }
+  .step-meta { margin-left: auto; font-size: 11px; color: #9aa3ad; font-family: "Cascadia Code", Consolas, monospace; white-space: nowrap; }
   .step-error { margin-top: 8px; font-size: 13px; color: #d43c3c; background: #fdf3f3;
                 padding: 8px; border-radius: 6px; }
   .step img { margin-top: 10px; max-width: 100%; border: 1px solid #eee; border-radius: 6px; }
@@ -127,17 +128,24 @@ async function generate() {
     document.getElementById("btn-execute").disabled = false;   // 解锁执行按钮
     // meta.snapshot_used：AI 是否参考了真实页面结构（ARIA 快照）
     // meta.preflight：Preflight 校验发现问题后自动 patch 修复的数量
+    // meta.planner / meta.grounding：G3/R1 量化（模式、编译产出）
     const snapshotUsed = data.meta && data.meta.snapshot_used;
     const preflight = data.meta && data.meta.preflight;
-    let msg;
+    const planner = (data.meta && data.meta.planner) || {};
+    const grounding = (data.meta && data.meta.grounding) || {};
+    const parts = [];
     if (preflight && preflight.repairs_applied > 0) {
-      msg = `✅ DSL 生成成功（Preflight 自动修正 ${preflight.repairs_applied} 处定位），点击「执行测试」运行`;
+      parts.push(`Preflight 修正 ${preflight.repairs_applied} 处定位`);
     } else if (snapshotUsed) {
-      msg = "✅ DSL 生成成功（AI 已参考真实页面结构），点击「执行测试」运行";
+      parts.push("已参考真实页面结构");
     } else {
-      msg = "✅ DSL 生成成功（未获取到页面快照，已降级生成），点击「执行测试」运行";
+      parts.push("未获取到页面快照，已降级生成");
     }
-    setStatus(msg);
+    if (snapshotUsed) {
+      parts.push(`${planner.mode === "refs_only" ? "refs-only 模式" : String(planner.mode || "")}· 编译定位 ${grounding.compiled_targets || 0} 处`);
+      if (data.meta.cache_hit) parts.push("探索缓存命中");
+    }
+    setStatus(`✅ DSL 生成成功（${parts.join(" · ")}），点击「执行测试」运行`);
   } catch (e) {
     setStatus("❌ " + e.message, true);
   } finally {
@@ -220,6 +228,7 @@ function renderReport(report) {
         <span style="color:#888">${escapeHtml(typeof r.target === "object" ? JSON.stringify(r.target) : String(r.target || ""))}</span>
         <span style="color:#888">${escapeHtml(String(r.value || ""))}</span>
         <span class="badge ${r.status}">${r.status === "passed" ? "通过" : "失败"}</span>
+        <span class="step-meta">${r.resolved_by ? `${escapeHtml(String(r.resolved_by))} · 定位 ${r.resolve_ms}ms · 本步 ${r.duration_ms}ms` : (r.duration_ms ? `本步 ${r.duration_ms}ms` : "")}</span>
       </div>
       ${r.error ? `<div class="step-error">${escapeHtml(r.error)}</div>` : ""}
       ${r.screenshot ? `<img src="${r.screenshot}" alt="步骤${i + 1}截图">` : ""}
