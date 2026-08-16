@@ -118,15 +118,20 @@ class DSLStep(DSLModel):
 
         例：click 无 target / goto 无 value / assert_url 无 value——
         Pydantic 类型校验管不到，这里按 action 语义强制。
+
+        G3 refs-only：target 与 target_ref 二选一（或都有）——
+        Planner 输出只有 target_ref，target 由 Compiler 确定性编译填入；
+        两者皆无的步骤在生成链路会被 refs-only 检查/恢复拦截。
         """
         if self.action == "goto" and not self.value:
             raise ValueError("goto 必须提供 value（URL）")
         if self.action in {"click", "check", "wait_for", "assert_visible"} \
-                and self.target is None:
-            raise ValueError(f"{self.action} 必须提供 target")
+                and self.target is None and self.target_ref is None:
+            raise ValueError(f"{self.action} 必须提供 target 或 target_ref")
         if self.action in {"fill", "input", "select"} \
-                and (self.target is None or self.value is None):
-            raise ValueError(f"{self.action} 必须提供 target 和 value")
+                and ((self.target is None and self.target_ref is None)
+                     or self.value is None):
+            raise ValueError(f"{self.action} 必须提供 target/target_ref 和 value")
         if self.action in {"assert_text", "assert_url"} and not self.value:
             raise ValueError(f"{self.action} 必须提供 value")
         return self

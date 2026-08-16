@@ -42,9 +42,8 @@ Runner → 最终真实 DOM 安全边界
 - 耗时自动记录（timings.jsonl）
 - 测试数据脱敏、URL 解析四级链、SSRF 基础防护
 
-### 已知边界（Locator v1 不解决）
+### 已知边界（Locator v1 不解决；前两项已由 v2 的 G3 Validator / R1 Compiler 解决）
 
-- **STATE_GROUNDING_MISMATCH**（见 §3）——Planner 表示不含足够的状态身份
 - 无运行时变量捕获（capture_text）
 - 无修正闭环（corrections）
 - 无 Trace / SSE / 登录态复用
@@ -146,9 +145,9 @@ Locator resolution: "DOM 里谁对应它？" → semantic resolver
 | **C0** | 固化 regressions + `locator-v1` tag | 两个 grounding regression 保存为文件；v1 freeze（✅ 已完成） |
 | **G1** | ObservedElement + state-scoped target_ref | observation 能产生 `obs3:e17`（✅ 已完成：探索产出 + DSL 字段 + Prompt 引导） |
 | **G2** | Observation State Graph | 能表达 `obs3 --click e17--> obs4`（✅ 已完成：transitions 边记录 + 注入） |
-| **G3** | refs-only Planner | Planner 不再自由生成 role/name/scope |
+| **G3** | refs-only Planner | Planner 不再自由生成 role/name/scope（✅ 已完成：grounded 模式双 Prompt + `check_refs_only` 代码契约；无探索降级保留 legacy 生成能力） |
 | **G3** | State Grounding Validator | 跨 state ref 在执行前被拒绝（`STATE_GROUNDING_MISMATCH`）（✅ 已完成：`backend/grounding.py`） |
-| **R1** | NodeRef → LocatorSpec Compiler | locator 由代码确定性生成 |
+| **R1** | NodeRef → LocatorSpec Compiler | locator 由代码确定性生成（✅ 已完成：`backend/compiler.py`，target_ref → Locator 查表编译） |
 | **R1** | 独立 Semantic Resolver（抽离模块） | Runner / Preflight 共用 resolution semantics |
 | **R2** | scoring + confidence margin | 高分但 margin 低仍拒绝 |
 | **L1** | corrections JSON loop | correction 是 candidate source，不绕过 Resolver；成功/失败统计 + 连续失败 disable |
@@ -165,6 +164,16 @@ AutomationExercise wrong-state → STATE_GROUNDING_MISMATCH
 fail-open——只拒绝可证明的错位，不误拒合法计划）；编造 ref 硬拒绝
 （UnknownTargetRefError，不清空降级）；Validator 在生成链路 Preflight 之前
 运行，mismatch 的自动替换留待第二阶段。
+
+**G3 refs-only Planner + R1 Compiler 已达成**（`backend/compiler.py` +
+`backend/tests/test_compiler.py`，14/14 通过）：
+- grounded 模式 Planner 只从元素引用表选 ref——`check_refs_only` 代码契约
+  （禁止 target/scope 字段、定位动作必须有 ref），违规进入 Schema Recovery
+  （带引用表上下文），恢复仍失败 → 明确失败
+- locator 由 Compiler 从观察到的元素数据确定性编译（覆盖 Planner 手写字段，
+  确定性 > Planner）；执行侧防线 `ensure_executable_targets` 在浏览器启动前
+  拒绝未编译的 ref-only 步骤（防手改 DSL 绕过编译）
+- 无探索降级路径（legacy 模式）保留 role/name/scope 生成能力，行为不变
 
 ---
 

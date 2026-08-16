@@ -5,7 +5,7 @@ AI 增强的 Web UI 自动化测试平台。
 - **AI 生成**：自然语言 → DeepSeek API → 结构化 DSL（Pydantic 强校验）
 - **Playwright 执行**：DSL → 真实浏览器 → 步骤级证据（截图）
 
-项目共 **4 个 Python 文件 + 1 个 HTML 文件**，无前端构建步骤。
+项目共 **8 个 Python 文件 + 1 个 HTML 文件**，无前端构建步骤。
 
 ---
 
@@ -58,11 +58,15 @@ python main.py
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `backend/dsl.py` | ~80 | DSL 数据结构（含结构化 target/scope），Pydantic 强校验 |
-| `backend/ai_agent.py` | ~100 | LLM 调用 + Prompt 工程 + JSON 容错解析 |
-| `backend/runner.py` | ~250 | Playwright 执行引擎 + 三分法定位 + 作用域消歧 |
-| `backend/main.py` | ~100 | FastAPI 路由 + 静态托管 |
-| `frontend/index.html` | ~250 | 单页 UI（零构建） |
+| `backend/dsl.py` | ~150 | DSL 数据结构（含结构化 target/scope），Pydantic 强校验 |
+| `backend/explore_flow.py` | ~420 | bounded 探索：element ref 表 + Observation State Graph |
+| `backend/explore_cache.py` | ~70 | 探索结果缓存（脱敏落盘） |
+| `backend/ai_agent.py` | ~1550 | 双模式 Planner（refs-only / legacy）+ Preflight 修复链路 |
+| `backend/grounding.py` | ~230 | G3 State Grounding Validator（跨状态引用执行前拒绝） |
+| `backend/compiler.py` | ~90 | R1 LocatorSpec Compiler（target_ref → Locator 确定性编译） |
+| `backend/runner.py` | ~610 | Playwright 执行引擎 + 三分法定位 + 作用域消歧 |
+| `backend/main.py` | ~150 | FastAPI 路由 + 静态托管 |
+| `frontend/index.html` | ~230 | 单页 UI（零构建） |
 
 ---
 
@@ -129,6 +133,20 @@ AI 只负责生成结构化测试步骤，执行是确定性的 Playwright 代�
 container = page.get_by_role("listitem").filter(has_text="Blue Top")
 button = container.get_by_role("button", name="Add to cart")
 ```
+
+### 5. refs-only Planner 与确定性编译（Architecture v2）
+
+职责分离——**AI 负责"想操作谁"，代码负责"DOM 里谁对应它"**：
+
+- 生成时先探索页面，产出带编号的元素引用表（`obs3:e17`）与状态转移图
+- grounded 模式下 Planner **只从引用表选 `target_ref`**，禁止生成任何定位字段
+  （违反契约进入恢复修复，仍失败则明确拒绝）
+- `target_ref` 由 Compiler 从观察到的元素数据**确定性编译**成 target
+  （`obs3:e17` → `{"role": "button", "name": "Add to cart"}`），
+  用户可见的 DSL 格式不变，只是来源从 LLM 变为代码
+- State Grounding Validator 在执行前拒绝跨状态引用（页面已跳转却仍引用
+  上一页元素的步骤 → `STATE_GROUNDING_MISMATCH`）
+- 无探索的降级路径保留 legacy 生成能力（LLM 直接生成定位字段）
 
 ---
 

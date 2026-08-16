@@ -37,6 +37,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
+from compiler import compile_targets
 from dsl import DSLCase, Locator, Scope, validate_case
 from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
 from explore_flow import explore
@@ -119,6 +120,65 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
    - 文本、价格、数量变化 → assert_text
    - 用户未明确验证方式时，选择与最终动作因果关系最直接的可观察结果
 9. 只输出 JSON，不要输出任何解释或代码块标记"""
+
+# G3 refs-only 模式：grounded 生成（有探索元素表）时使用。
+# 与 SYSTEM_PROMPT（legacy 模式，无探索降级路径）的区别只有定位方式：
+#   Planner 只从元素引用表选 target_ref，禁止生成任何定位字段——
+#   locator 由系统确定性编译（R1 Compiler），不再信任 LLM 的 role/name/scope。
+SYSTEM_PROMPT_REFS_ONLY = """你是 Web UI 自动化测试的 DSL 生成器（refs-only 模式）。
+根据用户描述的自然语言测试需求，从系统提供的元素引用表中选择元素，输出一个 JSON 对象。示例（与最小步骤规则完全一致）：
+
+{
+  "name": "登录并进入商品页",
+  "description": "登录后验证进入商品页",
+  "base_url": "https://xxx.com",
+  "input_contract": [
+    {"key": "username", "type": "string", "required": true, "secret": false, "default": "standard_user"},
+    {"key": "password", "type": "secret", "required": true, "secret": true, "default": null}
+  ],
+  "steps": [
+    {"action": "goto", "value": "https://xxx.com", "observation_ref": "obs1"},
+    {"action": "fill", "target_ref": "obs1:e3", "value": "${username}", "observation_ref": "obs1"},
+    {"action": "fill", "target_ref": "obs1:e4", "value": "${password}", "observation_ref": "obs1"},
+    {"action": "click", "target_ref": "obs1:e5", "observation_ref": "obs1"},
+    {"action": "assert_url", "value": "/inventory.html", "observation_ref": "obs2"}
+  ]
+}
+
+规则：
+1. action 只能是: goto, click, fill, select, check, wait_for, assert_visible, assert_text, assert_url
+2. 定位元素只能通过 target_ref 引用元素引用表中的 ref（格式 obsN:eM）：
+   - 每个需要定位元素的步骤（click/fill/select/check/wait_for/assert_visible）
+     必须提供 target_ref，且只能从系统提供的元素引用表中选择
+   - 禁止生成 target、scope、role、name、text、css、test_id 等任何定位字段
+     （locator 由系统根据 ref 确定性编译）
+   - 引用表中没有合适元素时，调整步骤设计（如改用 assert_text 验证页面文本），
+     禁止编造 ref
+3. 变量：
+   - 所有可变测试输入必须使用 ${var}，每个变量必须声明在 input_contract
+   - secret=true → default 必须为 null（执行时本地注入）
+   - 非敏感变量只有上下文明确提供 default 时才能填写；不得猜测真实值
+4. observation_ref（grounding 引用）：
+   - 每个可定位步骤应引用产生该定位证据的 observation id（obs1/obs2/...）
+   - observation_ref 必须来自系统提供的 observation 列表，禁止编造
+   - target_ref 的 obs 前缀必须与 observation_ref 一致（都是 obsN）
+5. 断言动作字段约束（机械规则）：
+   - assert_text: value 必填（要验证的文本）；验证某个元素内文本时用 target_ref
+     引用该元素，验证整页文本时不提供 target_ref；
+     禁止把待验证文本只放在 target 里而省略 value（target 字段本来就被禁止）
+   - assert_visible: target_ref 必填（验证元素出现）
+   - assert_url: value 必填（URL 片段），不需要 target_ref
+6. 最小测试原则：
+   - 仅生成完成用户需求所需的最少步骤
+   - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
+   - 单一最终目标默认生成恰好 1 个最终验证
+   - 如果用户明确要求多个独立验证结果，则保留这些明确要求的验证
+7. 验证策略：
+   - 登录/页面跳转 → 优先 assert_url 或目标页面关键元素 assert_visible
+   - 元素出现、按钮状态变化 → assert_visible
+   - 文本、价格、数量变化 → assert_text
+   - 用户未明确验证方式时，选择与最终动作因果关系最直接的可观察结果
+8. 只输出 JSON，不要输出任何解释或代码块标记"""
 
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
@@ -377,6 +437,27 @@ PLANNER_RECOVERY_SYSTEM_PROMPT = """你是 Web 测试 DSL 的 schema 修复器�
 - 不重新规划测试流程
 - 只输出修复后的完整 JSON"""
 
+# refs-only 模式的 recovery：除 schema 错误外还要修复 ref 契约违规
+#（缺失 target_ref / 携带被禁止的 target/scope 字段 / 编造 ref——
+#  引用表在 recovery prompt 中提供）。
+PLANNER_RECOVERY_SYSTEM_PROMPT_REFS_ONLY = """你是 Web 测试 DSL 的 schema 修复器（refs-only 模式）。
+
+你会收到：
+1. 上一次 Planner 生成的 JSON
+2. Schema 校验错误
+3. 元素引用表（target_ref 只能从这个表中选择）
+
+只修复这些 schema 错误。
+
+规则：
+- 不新增无关步骤
+- 不改变已有步骤顺序
+- 定位步骤必须通过 target_ref 引用元素引用表中的 ref
+- 禁止生成 target、scope 或任何定位字段（locator 由系统编译）
+- 禁止编造 ref——引用表中没有的元素不得引用
+- 不重新规划测试流程
+- 只输出修复后的完整 JSON"""
+
 
 def _summarize_validation_error(exc) -> str:
     """把 Pydantic ValidationError 提炼成模型可读的错误行（不是 traceback）。"""
@@ -390,30 +471,74 @@ def _summarize_validation_error(exc) -> str:
     return str(exc)[:500]
 
 
-def _generate_planner_case(grounded_prompt: str) -> tuple[DSLCase, dict]:
+# ── refs-only 契约检查（代码执行，不靠 Prompt）────────────────────────────────
+# G3：Planner 没有权限创造定位字段——grounded 模式下输出的每个定位步骤
+# 必须且只能引用元素表；违规按 schema 失败处理（进入 recovery，引用表上下文）。
+
+_LOCATABLE_ACTIONS = {"click", "check", "fill", "input", "select",
+                      "wait_for", "assert_visible"}
+
+
+def check_refs_only(case: DSLCase) -> None:
+    """refs-only 契约（独立函数，可单测）：
+
+      - 任何步骤不得携带 target/scope（locator 由系统编译，不由 Planner 生成）
+      - 定位类动作必须有 target_ref
+    违规 → ValueError（被 _generate_planner_case 的 recovery 捕获；
+    恢复后仍违规 → 生成失败——宁可明确失败）。
+    """
+    for index, step in enumerate(case.steps, start=1):
+        if step.target is not None or step.scope is not None:
+            raise ValueError(
+                f"步骤 {index}: refs-only 模式禁止生成 target/scope 字段"
+                "（locator 由系统根据 target_ref 确定性编译）"
+            )
+        if step.action in _LOCATABLE_ACTIONS and step.target_ref is None:
+            raise ValueError(
+                f"步骤 {index}: {step.action} 必须通过 target_ref 引用元素引用表"
+            )
+
+
+def _generate_planner_case(
+    grounded_prompt: str,
+    mode: str = "legacy",
+    tables: str | None = None,
+) -> tuple[DSLCase, dict]:
     """Planner 生成 + 校验；schema 失败 constrained recovery ×1。
+
+    mode: "refs_only"（grounded，有元素表——只允许 target_ref 定位）
+          "legacy"（无探索降级——保留 role/name/scope 生成能力）
 
     返回 (case, planner_meta)，meta 记录：
       planner_attempts / schema_recovery_used / schema_recovery_success
-      initial_validation_errors / planner_recovery_ms
+      initial_validation_errors / planner_recovery_ms / mode
 
-    只对"生成结果不合法"（JSON 解析 / Pydantic ValidationError）做 recovery；
-    LLM API 异常（超时/网络）不在此吞掉，让上层 fail safely。
+    只对"生成结果不合法"（JSON 解析 / Pydantic ValidationError /
+    refs-only 契约违规）做 recovery；LLM API 异常（超时/网络）不在此
+    吞掉，让上层 fail safely。
     """
     from pydantic import ValidationError
 
+    refs_only = mode == "refs_only"
     meta = {
         "planner_attempts": 1,
         "schema_recovery_used": False,
         "schema_recovery_success": False,
         "initial_validation_errors": None,
         "planner_recovery_ms": 0,
+        "mode": mode,
     }
 
     def parse_and_validate(text: str) -> DSLCase:
-        return validate_case(_extract_json(text))
+        case = validate_case(_extract_json(text))
+        if refs_only:
+            check_refs_only(case)
+        return case
 
-    raw_text = _call_llm(grounded_prompt)
+    raw_text = _call_llm(
+        grounded_prompt,
+        system_prompt=SYSTEM_PROMPT_REFS_ONLY if refs_only else SYSTEM_PROMPT,
+    )
     try:
         return parse_and_validate(raw_text), meta
     except (ValueError, ValidationError) as exc:
@@ -427,8 +552,15 @@ def _generate_planner_case(grounded_prompt: str) -> tuple[DSLCase, dict]:
             "Schema 校验错误：\n"
             f"{meta['initial_validation_errors']}"
         )
+        if refs_only and tables:
+            # refs-only 修复需要引用表上下文（补 ref / 改 ref 都只能在表内选）
+            recovery_prompt += f"\n\n元素引用表（target_ref 只能从这里选择）：\n{tables}"
         t = perf_counter()
-        repaired_text = _call_llm(recovery_prompt, system_prompt=PLANNER_RECOVERY_SYSTEM_PROMPT)
+        repaired_text = _call_llm(
+            recovery_prompt,
+            system_prompt=PLANNER_RECOVERY_SYSTEM_PROMPT_REFS_ONLY
+            if refs_only else PLANNER_RECOVERY_SYSTEM_PROMPT,
+        )
         meta["planner_recovery_ms"] = int((perf_counter() - t) * 1000)
 
         case = parse_and_validate(repaired_text)   # 仍失败 → 抛异常（fail safely）
@@ -1321,7 +1453,13 @@ _ASSERT_ACTIONS = {"assert_visible", "assert_text", "assert_url"}
 
 
 def _target_key(step) -> str:
-    """步骤 target 的归一化键（用于判断 wait_for 与断言是否同一元素）。"""
+    """步骤 target 的归一化键（用于判断 wait_for 与断言是否同一元素）。
+
+    refs-only 模式：target 由 Compiler 在归一化之后才填入——
+    此处必须用 target_ref 作为键（否则 ref 不同的步骤会被误判为同一元素，
+    断言去重误删）。"""
+    if step.target_ref:
+        return f"ref:{step.target_ref}"
     t = step.target
     if t is None:
         return ""
@@ -1510,20 +1648,23 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             + "\n\n规则："
             "1. 用户提供的测试数据用 ${var} 占位并声明在 input_contract："
             "需求中给出的值填 default；密码等敏感信息 secret=true 且 default=null；"
-            "2. 快照中以 'text: xxx' 形式出现的标题（span/div 无 heading 语义）"
-            '必须用 {"text": "xxx"} 定位，禁止用 {"role": "heading"}；'
+            "2. （G3 refs-only）定位元素一律通过 target_ref 引用元素引用表中的"
+            "系统观察元素（如 obs3:e17）——target_ref 只能从元素引用表选择，"
+            "禁止编造；禁止生成 target/scope 等定位字段（locator 由系统"
+            "根据 ref 确定性编译，不要输出 role/name/text/css/test_id）；"
             "3. 每个步骤必须设置 observation_ref，且只能从页面分段标记"
             "（[obs1] [obs2] ...）中选择——禁止创造不存在的 observation_ref；"
-            "该步骤的 target/scope 必须来自该 observation 的页面结构；"
-            "4. （G1）优先使用 target_ref 引用元素引用表中的系统观察元素"
-            "（如 obs3:e17），target_ref 只能从元素引用表选择，禁止编造；"
-            "同时仍需提供 target（语义回退，执行时用 target 定位）。"
+            "target_ref 的 obs 前缀必须与 observation_ref 一致；"
         )
     else:
         grounded_prompt = explore_goal   # 无快照时同样用脱敏后的需求
 
     t_planner = perf_counter()
-    case, planner_meta = _generate_planner_case(grounded_prompt)   # ← Schema Recovery ×1
+    case, planner_meta = _generate_planner_case(
+        grounded_prompt,
+        mode="refs_only" if multi_snapshot else "legacy",
+        tables=multi_snapshot,
+    )   # ← Schema Recovery ×1（refs-only 模式含契约违规修复）
     planner_ms = int((perf_counter() - t_planner) * 1000)
     case, removed_assertions = _normalize_steps(case)   # ← 计划归一化 + 记录删除
     case = _normalize_invalid_scopes(case)   # ← 导航 scope invariant（Planner 后立即清）
@@ -1536,16 +1677,17 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             if step.observation_ref and step.observation_ref not in valid_refs:
                 step.observation_ref = None
 
-    # ← G3 State Grounding Validator（Architecture v2 首个 invariant）──
-    # 静态推导每步 expected state：跨状态 target_ref / 编造 ref 在执行前
-    # 被拒绝（milestone 只要求拒绝，不自动修复；mismatch 按转移图自动
-    # 替换是第二阶段）。图不进 DSL——校验只在生成链路运行（explore_result
-    # 在作用域内）；执行器本期不变（Runner 仍用 target 语义回放）。
+    # ← R1 LocatorSpec Compiler → G3 State Grounding Validator ──────────
+    # 有探索证据时：target_ref → target 确定性编译（Planner 只选 ref，
+    # locator 由代码从观察到的元素数据生成），然后跨状态 / 编造 ref 在
+    # 执行前被拒绝。图不进 DSL——两个阶段只在生成链路运行（explore_result
+    # 在作用域内）；执行器仍用编译后的 target 语义回放（评审既定结论）。
     # 放在 Preflight 之前：grounding 错位的计划不值得花浏览器轮次修复。
+    state_graph = None
     if explore_result is not None:
-        validate_state_grounding(
-            case, StateGraph.from_explore_result(explore_result),
-        )
+        state_graph = StateGraph.from_explore_result(explore_result)
+        case = compile_targets(case, state_graph)          # ← R1 编译
+        validate_state_grounding(case, state_graph)        # ← G3 拒绝
 
     meta = {
         "snapshot_used": bool(multi_snapshot),
@@ -1561,10 +1703,13 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             "transitions": (explore_result or {}).get("transitions", []),   # G2：状态转移边
         } if explore_result else None,
         "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）
-        # G3：target_ref grounding 校验覆盖（ROADMAP §8 指标 target_ref
-        # grounding validity 的分母；被拒绝的计划不会走到这里）
+        # G3/R1 指标（ROADMAP §8）：ref 校验覆盖 + 确定性编译产出
+        # （被拒绝的计划不会走到这里）
         "grounding": {
             "ref_steps_checked": sum(1 for s in case.steps if s.target_ref),
+            "compiled_targets": sum(
+                1 for s in case.steps if s.target_ref and s.target is not None
+            ),
         },
     }
 

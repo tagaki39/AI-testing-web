@@ -601,6 +601,23 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
 
 # ── 执行入口 ────────────────────────────────────────────────────────────────────
 
+def ensure_executable_targets(case: DSLCase) -> None:
+    """执行前防线：ref-only 步骤（有 target_ref 无 target）拒绝执行。
+
+    G3/R1 架构约定：target 由生成链路的 Compiler 确定性编译——
+    用户手改 DSL 后若删掉 target 只留 target_ref，执行器无法解析
+    （Runner 用 target 语义回放，不读 target_ref）。这类步骤在执行前
+    给出明确错误，而不是等到浏览器里报"target 无法解析: None"。
+    """
+    for index, step in enumerate(case.steps, start=1):
+        if step.target is None and step.target_ref is not None:
+            raise ValueError(
+                f"步骤 {index}: 仅有 target_ref 未编译 target——"
+                "请使用 AI 生成链路（/api/generate）产出的 DSL，"
+                "或手工补全该步骤的 target 定位字段"
+            )
+
+
 def execute_case(
     case: DSLCase,
     variables: dict[str, str] | None = None,
@@ -622,6 +639,7 @@ def execute_case(
     sync_playwright() 上下文管理器：自动管理浏览器生命周期。
     headless=True：无头模式（不弹窗口），服务器环境必须用这个。
     """
+    ensure_executable_targets(case)   # ← 执行前防线（ref-only 步骤拒绝，浏览器启动前）
     variables = dict(variables or {})
     # 把 input_contract 里的默认值合并进来（DSL 声明的变量默认值）
     # 兼容：模型实例（v2 schema，default 字段）与旧 dict（value 字段）
