@@ -45,7 +45,9 @@ _MAX_TEXT_ELEMENTS = 20      # 文本节点最多注入 20 个（防上下文膨
 _MAX_TEXT_LINES = 25         # 智能裁剪：text 行限量
 _MAX_OTHER_LINES = 40        # 智能裁剪：非交互语义行（heading/banner 等容器）限量
 _MAX_OBSERVATIONS = 12       # 总 observation 上限（防膨胀）
-_MAX_OBSERVATIONS_PER_URL = 3   # 同 URL 最多 3 个状态（SPA 状态变化）
+_MAX_OBSERVATIONS_PER_URL = 5   # 同 URL 最多 5 个状态（登录表单 fill 的
+                                # value 变化即产生新状态，3 不够：空表单/
+                                # 填 email/填 password/登录后回跳都需要槽位）
 
 # 可交互元素角色（element ref 表只收录这些——LLM 只能操作这些）
 _INTERACTIVE_ROLES = {
@@ -60,6 +62,47 @@ _TEXT_RE = re.compile(r'-\s+text:\s*(.+)')                  # - text: Products
 # ── 探索安全保护（第 6 项：代码层二次拦截，不只靠 Prompt）──────────────
 # press 允许的按键（枚举，防止 LLM 输出"按下回车"/"return" 等让执行器猜）
 _PRESS_KEYS = {"Enter", "Escape", "Tab", "ArrowDown", "ArrowUp"}
+
+# Data Grounding：fill 的 value 必须是 ${key} 占位符（key 白名单见
+# state.input_keys）——模型不能输出真实值、不能创造变量名
+_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+# 认证失败信号（精确整句匹配——死胡同要明确停止，不能原地循环）
+_AUTH_FAILURE_MARKERS = (
+    "your email or password is incorrect",
+    "email or password is incorrect",
+    "is not registered",
+    "invalid email or password",
+    "incorrect email or password",
+    "email address does not exist",
+    "账号或密码错误",
+    "邮箱或密码不正确",
+)
+
+
+def _detect_auth_failure(snapshot: str) -> bool:
+    """页面是否出现认证失败证据（登录被拒 → 目标无法继续 → 明确停止）。"""
+    low = snapshot.lower()
+    return any(m in low for m in _AUTH_FAILURE_MARKERS)
+
+
+def _is_repeated_no_progress(state: "ExploreState", action: str, ref: str) -> bool:
+    """同一状态 + 同一动作 + 同一 ref 连续重复且上一次无进展 → True。
+
+    评审收紧：Action 成功 ≠ Business transition 成功——点击 Login
+    成功但页面没变（auth 被拒）时，模型可能原地重复点击。这是
+    Transition/Progress Validation，不是 locator 问题：
+      - 上一次 transition 是 self-loop（from == to，无状态变化）
+      - 当前仍处于该 obs
+      - 新决策是同一动作 + 同一 ref
+    → 代码确定性拒绝，不依赖 LLM 记忆。
+    """
+    prev = state.transitions[-1] if state.transitions else None
+    if prev is None or prev["from"] != prev["to"]:
+        return False
+    if not state.observations or state.observations[-1]["id"] != prev["to"]:
+        return False
+    return prev["action"] == action and prev["target_ref"] == ref
 
 # ── GQ：目标动作表（保守 allowlist，人为维护）──────────────────────────
 # 用于两处：① 探索完成性校验（goal 要求操作时，0/1 步宣告完成无效）
@@ -130,6 +173,7 @@ class ExploreState:
     history: list[dict] = field(default_factory=list)       # 操作历史
     observations: list[dict] = field(default_factory=list)  # 页面状态观察（含 state_hash）
     transitions: list[dict] = field(default_factory=list)   # G2：状态转移边（obs3 --click e17--> obs4）
+    input_keys: set = field(default_factory=set)   # Data Grounding：允许的 ${key} 白名单
     step_count: int = 0                # 已执行动作数
     llm_calls: int = 0                 # 已用 LLM 调用数
     done: bool = False                 # 探索是否完成
@@ -202,7 +246,9 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
 
 当前状态：
 - 用户目标: {goal}
+- 当前页面状态: {current_obs}（元素表属于此状态）
 - 当前 URL: {url}
+- 可用 Runtime Input Keys: {input_keys}
 - 当前页面可操作元素（ref 表）:
 {elements}
 
@@ -215,11 +261,14 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
   "exploration_complete": false,
   "action": "click | fill | press | back | finish",
   "target_ref": "obs1:e1",
-  "value": "fill 的 value 必须使用 ${{var}} 占位符（如 ${{username}}）；不得输出真实敏感值，真实值由执行器本地注入"
+  "value": "fill 的 value 必须是 ${{input_key}} 占位符，input_key 严格取自『可用 Runtime Input Keys』；禁止创造不存在的变量名，禁止输出任何真实值"
 }}
 
 规则：
-1. target_ref 必须来自上面的元素表，不得编造（ref 带 obs 前缀，如 obs1:e1——照抄表里的完整格式，不要省略 obs 前缀）
+1. target_ref 必须来自【当前】元素表（表头 {current_obs} 标明了当前状态），不得编造
+   - ref 带 obs 前缀（如 obs1:e1）——照抄表里完整格式，不要省略 obs 前缀
+   - 页面状态变化后元素表会换新——历史中的旧 ref 属于旧状态，当前表中不存在即已失效，
+     禁止沿用旧 ref；先用当前表的新 ref 重新执行动作
 2. action 只能从上面 5 种选（wait 已移除，点击后执行器自动等待页面加载）
 3. press 的 value 只能是: Enter, Escape, Tab, ArrowDown, ArrowUp
 4. 每一步只做一个动作
@@ -285,29 +334,49 @@ def _record_page(state: ExploreState, page) -> None:
     """
     url = page.url
     state.current_url = url
-    state.snapshot = _observe(page)
-    state.elements = _parse_elements(state.snapshot)   # ← ref 表（页面级 e1/e2）
+    snapshot = _observe(page)
+    elements = _parse_elements(snapshot)   # ← ref 表（页面级 e1/e2，局部变量）
 
     # 状态哈希：snapshot 变化 = 页面状态变化（即使 URL 相同）
-    state_hash = hashlib.sha256(state.snapshot.encode()).hexdigest()[:10]
+    state_hash = hashlib.sha256(snapshot.encode()).hexdigest()[:10]
+
+    # 当前 snapshot 命中已有 observation → 恢复该状态的 state-scoped
+    # 元素表。修复：此前已存在路径会先污染 state.elements（无 obs 前缀
+    # 新表）——决策校验拿 obs2:e10 对表校验全被拒（8 连拒）。
+    # 注意必须是"命中哪个 obs 就恢复哪个"——A→B→A 场景恢复 obs1
+    # 的元素表，而不是上一次的 state.elements（可能是 obs2）。
+    matched = next((
+        o for o in state.observations
+        if o["url"] == url and o.get("state_hash") == state_hash
+    ), None)
+    if matched is not None:
+        state.elements = matched["elements"]
+        return
+
     same_url_count = sum(1 for o in state.observations if o["url"] == url)
+    if (len(state.observations) >= _MAX_OBSERVATIONS
+            or same_url_count >= _MAX_OBSERVATIONS_PER_URL):
+        # 观察预算满：不给当前状态一个"裸元素表"（无 state owner）。
+        # 停止探索（主循环检测 done），比带着无主元素继续决策安全。
+        state.history.append({
+            "url": url,
+            "action": "observation_cap",
+            "error": "观察预算已满（total/per-url 上限），停止探索",
+        })
+        state.done = True
+        return
 
-    already = any(
-        o["url"] == url and o.get("state_hash") == state_hash
-        for o in state.observations
-    )
-    if already:
-        return
-    if len(state.observations) >= _MAX_OBSERVATIONS:
-        return
-    if same_url_count >= _MAX_OBSERVATIONS_PER_URL:
-        return
-
+    state.snapshot = snapshot
+    state.elements = elements
     obs_id = f"obs{len(state.observations) + 1}"
     # G1：state-scoped ref——元素 ref 从页面级 "e1" 升级为状态级 "obs3:e1"。
     # Planner 引用 obs3:e17 时，系统知道 belongs_to=obs3（state identity）。
     for element in state.elements:
         element["ref"] = f"{obs_id}:{element['ref']}"
+
+    # I1：同名重复元素采集容器文本锚点（只处理重复，非重复零开销）——
+    # 先 enrich 再持久化，元素表与 observation 共享同一对象
+    _attach_scope_context(state, page)
 
     state.observations.append({
         "id": obs_id,
@@ -318,8 +387,10 @@ def _record_page(state: ExploreState, page) -> None:
         "elements": state.elements,   # G1：observations 携带 state-scoped refs
     })
 
-    # I1：同名重复元素采集容器文本锚点（只处理重复，非重复零开销）
-    _attach_scope_context(state, page)
+    # invariant：state.elements 的每个 ref 都必须有明确 state identity
+    #（obsN:eM 格式）。裸 e1/e2 意味着状态所有权丢失——决策校验将失效。
+    assert all(":" in e["ref"] for e in state.elements), (
+        f"_record_page 后存在无 state 前缀的 ref: {state.elements[:5]}")
 
 
 def _safe_title(page) -> str:
@@ -421,12 +492,15 @@ def _decide(state: ExploreState, llm_call) -> tuple[dict | None, str | None]:
     """
     history_text = "\n".join(
         f"- {h.get('action')} {h.get('target_ref')} {h.get('value') or ''} @ {h.get('url')}"
+        + (f" → 失败: {h['error'][:80]}" if h.get("error") else "")
         for h in state.history[-_MAX_HISTORY:]
     ) or "- (无)"
 
     prompt = DECIDE_PROMPT.format(
         goal=state.goal,
+        current_obs=state.observations[-1]["id"] if state.observations else "?",
         url=state.current_url,
+        input_keys=", ".join(sorted(state.input_keys)) if state.input_keys else "(无)",
         elements=_elements_to_prompt(state.elements),
         history=history_text,
     )
@@ -450,6 +524,25 @@ def _decide(state: ExploreState, llm_call) -> tuple[dict | None, str | None]:
             if ref is None or not any(e["ref"] == ref for e in state.elements):
                 return None, (f"target_ref {ref!r} 不在当前元素表——"
                               "ref 带 obs 前缀，照抄表内完整格式（如 obs1:e1）")
+            # no-progress guard：同一状态同一动作同一 ref 重复且上次无进展
+            if _is_repeated_no_progress(state, action, ref):
+                return None, ("NO_PROGRESS: 同一元素上的同一动作上一次执行"
+                              "未产生状态变化（self-loop）——禁止原地重复，"
+                              "请选择其他动作或输出 finish 宣告失败")
+        if action == "fill":
+            # Data Grounding 强校验（评审收紧：不只靠 prompt）：
+            # fill 的 value 必须是 ${key} 占位符，且 key 必须在
+            # Runtime Input Keys 白名单内——模型不能创造变量名，
+            # 更不能直接输出真实值（如 test123@example.com）。
+            value = decision.get("value") or ""
+            m = _PLACEHOLDER_RE.fullmatch(value.strip())
+            if not m:
+                return None, ("fill 的 value 必须是 ${key} 占位符形式"
+                              "（禁止输出真实值）")
+            key = m.group(1)
+            if key not in state.input_keys:
+                return None, (f"未知 runtime input key {key!r}——"
+                              f"允许的 keys: {', '.join(sorted(state.input_keys)) or '(无)'}")
         return decision, None
     except Exception as exc:
         return None, f"决策解析失败: {str(exc)[:120]}"
@@ -477,7 +570,9 @@ def _act(page, decision: dict, elements: list[dict], runtime_inputs: dict) -> st
         raise ValueError(f"未知 target_ref: {ref}")
     target = {"role": element["role"], "name": element["name"]} if "role" in element \
         else {"text": element["text"]}
-    _, locator = _resolve_locator(page, target)
+    # I1：同名重复元素带上 scope_has_text 锚点消歧（_attach_scope_context 采集）
+    scope = {"has_text": element["scope_has_text"]} if element.get("scope_has_text") else None
+    _, locator = _resolve_locator(page, target, scope=scope)
     # I1：身份证据前移——探索时 count==1 命中即标 verified
     #（证据不是豁免，运行时仍过三分法 + 评分；供 Compiler/metrics 使用）
     for e in elements:
@@ -527,7 +622,12 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         page = browser.new_page()
         page.set_default_timeout(15000)
 
-        state = ExploreState(goal=goal, entry_url=entry_url)
+        state = ExploreState(
+            goal=goal,
+            entry_url=entry_url,
+            # Data Grounding：模型只能引用这些 ${key}（keys 不含真实值）
+            input_keys=set(runtime_inputs) if runtime_inputs else set(),
+        )
         t0 = perf_counter()
         page.goto(entry_url, wait_until="domcontentloaded")
         state.timings["browser_action_ms"] += int((perf_counter() - t0) * 1000)
@@ -607,8 +707,26 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             state.timings["fixed_wait_ms"] += int((perf_counter() - wait_start) * 1000)
 
             t0 = perf_counter()
-            _record_page(state, page)    # observe 新页面状态
+            if action_done != "fill":
+                # observe 新页面状态。fill 不创建 persistent observation：
+                # 表单填充只改 input value（ephemeral），不产生新 graph node
+                #（评审收紧：fill 一次 = 一个 obs 会让登录页吃掉 4 个槽位）。
+                _record_page(state, page)
+            else:
+                state.current_url = page.url   # fill 不改页面结构，只同步 URL
             state.timings["observation_ms"] += int((perf_counter() - t0) * 1000)
+
+            # 认证失败 evidence（死胡同要明确停止，不能原地循环）：
+            # 页面出现 "email or password is incorrect" 等信号 → 目标无法
+            # 继续 → 记录原因并停止（done），比重复点击 Login 诚实。
+            if _detect_auth_failure(state.snapshot):
+                state.history.append({
+                    "url": state.current_url,
+                    "action": "auth_rejected",
+                    "error": "页面出现认证失败提示，测试目标无法继续——停止探索",
+                })
+                state.done = True
+                break
 
             # G2：记录状态转移边（obs3 --click e17--> obs4）。
             # 动作成功（action_done 非 None）才记录；from/to 为动作前后的
