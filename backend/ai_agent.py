@@ -121,12 +121,25 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
    - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
    - 单一最终目标默认生成恰好 1 个最终验证
    - 如果用户明确要求多个独立验证结果，则保留这些明确要求的验证
-8. 验证策略：
+8. Wait after state-changing actions（等待修改动作的 postcondition）：
+   - 当 click / submit / select 会触发异步页面状态变化、且后续步骤依赖
+     该变化时，必须等待一个能证明变化已经完成的新状态元素（postcondition），
+     再继续下一步
+   - 正确：click "Add to cart" → wait_for 加购后的 "Added!" 弹窗 或
+     按钮变 "Remove" → 再 click "Cart"
+   - 错误：click "Add to cart" → wait_for "Cart"——Cart 链接在动作前就
+     一直存在，它不能证明加购完成
+   - 禁止机械地在每个 click 前生成 wait_for——Playwright 已自动等待目标
+     可操作；wait_for 只用于等待业务状态变化（postcondition）
+9. Modify-then-assert（修改后先等再断言）：
+   - 修改值（fill/select/check）后，先 wait_for 更新生效，再断言新值
+   - 不得在修改生效前断言新值（竞态：断言可能读到旧状态）
+10. 验证策略：
    - 登录/页面跳转 → 优先 assert_url 或目标页面关键元素 assert_visible
    - 元素出现、按钮状态变化 → assert_visible
    - 文本、价格、数量变化 → assert_text
    - 用户未明确验证方式时，选择与最终动作因果关系最直接的可观察结果
-9. 只输出 JSON，不要输出任何解释或代码块标记"""
+11. 只输出 JSON，不要输出任何解释或代码块标记"""
 
 # G3 refs-only 模式：grounded 生成（有探索元素表）时使用。
 # 与 SYSTEM_PROMPT（legacy 模式，无探索降级路径）的区别只有定位方式：
@@ -185,12 +198,28 @@ SYSTEM_PROMPT_REFS_ONLY = """你是 Web UI 自动化测试的 DSL 生成器（re
    - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
    - 单一最终目标默认生成恰好 1 个最终验证
    - 如果用户明确要求多个独立验证结果，则保留这些明确要求的验证
-8. 验证策略：
+8. Wait after state-changing actions（等待修改动作的 postcondition）：
+   - 当 click / submit / select 会触发异步页面状态变化、且后续步骤依赖
+     该变化时，必须等待一个能证明变化已经完成的新状态元素（postcondition），
+     再继续下一步
+   - 正确：click "Add to cart" → wait_for 加购后的 "Added!" 弹窗 或
+     按钮变 "Remove" → 再 click "Cart"
+   - 错误：click "Add to cart" → wait_for "Cart"——Cart 链接在动作前就
+     一直存在，它不能证明加购完成
+   - 禁止机械地在每个 click 前生成 wait_for——Playwright 已自动等待目标
+     可操作；wait_for 只用于等待业务状态变化（postcondition）
+   - postcondition 元素必须来自元素表（target_ref 引用新状态中的元素，
+     如 obs6 的 "Remove"；引用表中没有可靠 postcondition 时，宁可不加
+     wait_for 也不编造 ref）
+9. Modify-then-assert（修改后先等再断言）：
+   - 修改值（fill/select/check）后，先 wait_for 更新生效，再断言新值
+   - 不得在修改生效前断言新值（竞态：断言可能读到旧状态）
+10. 验证策略：
    - 登录/页面跳转 → 优先 assert_url 或目标页面关键元素 assert_visible
    - 元素出现、按钮状态变化 → assert_visible
    - 文本、价格、数量变化 → assert_text
    - 用户未明确验证方式时，选择与最终动作因果关系最直接的可观察结果
-9. 只输出 JSON，不要输出任何解释或代码块标记"""
+11. 只输出 JSON，不要输出任何解释或代码块标记"""
 
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
@@ -549,6 +578,41 @@ def _check_goal_coverage(goal: str, case: DSLCase) -> list[str]:
         if not covered:
             missing.append(label)
     return missing
+
+
+# ── missing_wait_for 检测（对齐参考项目 taxonomy：断言前必须等 postcondition）──
+
+_MODIFY_ACTIONS = {"click", "fill", "input", "select", "check"}
+
+
+def detect_missing_wait_for(case: DSLCase) -> list[str]:
+    """检测"断言直接依赖前一修改动作、中间无 postcondition 等待"的计划。
+
+    missing_wait_for 语义（对齐参考项目 dsl_generator 的
+    Wait-after-state-changing-actions）：
+      断言（assert_text/assert_url）紧跟在 state-changing 动作之后，
+      且该动作不是导航 click（导航由执行器自动等待页面加载）——
+      → 断言可能读到异步更新前的旧状态（如加购后立即验证购物车为空）。
+
+    只报最确定的模式（紧邻两步 + 非导航），不深挖多步链——
+    保守防假阳性：goto→assert_url、click Login→assert_url 等
+    导航类模式天然安全，不报。
+    """
+    issues: list[str] = []
+    steps = case.steps
+    for i in range(len(steps) - 1):
+        cur, nxt = steps[i], steps[i + 1]
+        if nxt.action not in {"assert_text", "assert_url"}:
+            continue
+        if cur.action not in _MODIFY_ACTIONS:
+            continue
+        if cur.action == "click" and is_navigation_target(cur.target):
+            continue   # 导航 click：Playwright 自动等待加载，无竞态风险
+        issues.append(
+            f"{cur.action}({_brief_target(cur.target) or cur.target_ref or '-'}) → "
+            f"{nxt.action} 缺少 postcondition 等待（异步状态可能未生效）"
+        )
+    return issues
 
 
 # ── GQ2：生成期质量门异常 + 自愈重生辅助 ──────────────────────────────────────
@@ -1751,12 +1815,13 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     preflight_ms = int((perf_counter() - t_preflight) * 1000)
 
     # ── GQ：生成期目标覆盖警告（fail-open，只提示不硬失败）───────────
-    # 探索不完整 / 目标动作缺失 → 前端醒目提示，避免"看似能跑"的静默
-    # 不完整计划（9/10 案例：断言了可见性却漏点击）。
+    # 探索不完整 / 目标动作缺失 / 断言前缺等待 → 前端醒目提示，
+    # 避免"看似能跑"的静默不完整计划（9/10 案例：断言了可见性却漏点击）。
     meta["goal_coverage"] = {
         "exploration_incomplete": bool(pages)
         and not (explore_result or {}).get("done", False),
         "missing_actions": _check_goal_coverage(explore_goal, case) or None,
+        "missing_wait_for": detect_missing_wait_for(case) or None,
     }
 
     # Speed v1：生成链路计时（定位耗时构成，决定下一刀砍哪）

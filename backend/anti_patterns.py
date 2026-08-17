@@ -34,7 +34,7 @@ MAX_PER_CODE = 5   # 每个原因码保留的负例上限（防上下文膨胀�
 
 class AntiPattern(DSLModel):
     """一条生成失败反模式。"""
-    reason_code: str    # missing_step / invalid_ref / invalid_structure
+    reason_code: str    # missing_step / invalid_ref / invalid_structure / missing_wait_for
     summary: str        # 行为摘要（脱敏）
     created_at: str
 
