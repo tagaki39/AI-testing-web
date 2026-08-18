@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 from pydantic import ValidationError   # noqa: E402
 
 from ai_agent import (
-    SYSTEM_PROMPT, SYSTEM_PROMPT_REFS_ONLY, detect_missing_wait_for,
+    SYSTEM_PROMPT, SYSTEM_PROMPT_REFS_ONLY, detect_missing_postconditions,
 )   # noqa: E402
 from dsl import DSLCase, DSLStep   # noqa: E402
 from explore_flow import DECIDE_PROMPT   # noqa: E402
@@ -87,31 +87,43 @@ def test_wait_rule_not_legacy_only() -> None:
         assert "机械" in prompt
 
 
-# ── detect_missing_wait_for 真检测器（确定性模式，非文档）──────────────────────
+# ── detect_missing_postconditions 真检测器（graph-aware，确定性模式）───────────
 
 def _case(steps: list[dict]) -> DSLCase:
     return DSLCase(name="t", steps=[DSLStep(**s) for s in steps])
 
 
-def test_detect_modify_then_assert_without_wait() -> None:
-    """加购（非导航 click）后立即断言 → 检出。"""
+def test_detect_click_chain_without_postcondition() -> None:
+    """加购 → 进购物车 → 断言：Add to cart 无显式 postcondition 且
+    无转移证据 → 报（最初 bug 模式：异步加购未确认就继续）。"""
+    c = _case([
+        {"action": "click", "target": {"role": "button", "name": "Add to cart"}},
+        {"action": "click", "target": {"role": "link", "name": "Cart"}},
+        {"action": "assert_text", "value": "Blue Top"},
+    ])
+    issues = detect_missing_postconditions(c)
+    assert len(issues) == 1   # 只报 Add to cart（Cart 的下一步是断言）
+    assert "postcondition" in issues[0]
+
+
+def test_assert_is_explicit_postcondition() -> None:
+    """click → assert_text 紧邻：断言本身就是 postcondition 验证
+    （Playwright 断言自动轮询）→ 不报。"""
     c = _case([
         {"action": "click", "target": {"role": "button", "name": "Add to cart"}},
         {"action": "assert_text", "value": "Blue Top"},
     ])
-    issues = detect_missing_wait_for(c)
-    assert len(issues) == 1
-    assert "postcondition" in issues[0]
+    assert detect_missing_postconditions(c) == []
 
 
-def test_detect_fill_then_assert() -> None:
-    """fill 后立即断言 → 检出。"""
+def test_detect_fill_then_unverified_next() -> None:
+    """fill 后下一步无验证（goto）→ 检出。"""
     c = _case([
         {"action": "fill", "target": {"role": "textbox", "name": "Email"},
          "value": "${email}"},
-        {"action": "assert_text", "value": "welcome"},
+        {"action": "goto", "value": "https://x.com/cart"},
     ])
-    assert len(detect_missing_wait_for(c)) == 1
+    assert len(detect_missing_postconditions(c)) == 1
 
 
 def test_no_detect_navigation_click_then_assert_url() -> None:
@@ -120,7 +132,7 @@ def test_no_detect_navigation_click_then_assert_url() -> None:
         {"action": "click", "target": {"role": "link", "name": "Login"}},
         {"action": "assert_url", "value": "/login"},
     ])
-    assert detect_missing_wait_for(c) == []
+    assert detect_missing_postconditions(c) == []
 
 
 def test_no_detect_wait_between_modify_and_assert() -> None:
@@ -130,7 +142,7 @@ def test_no_detect_wait_between_modify_and_assert() -> None:
         {"action": "wait_for", "target": {"role": "button", "name": "Remove"}},
         {"action": "assert_text", "value": "Blue Top"},
     ])
-    assert detect_missing_wait_for(c) == []
+    assert detect_missing_postconditions(c) == []
 
 
 def test_no_detect_goto_then_assert() -> None:
@@ -139,19 +151,39 @@ def test_no_detect_goto_then_assert() -> None:
         {"action": "goto", "value": "https://x.com"},
         {"action": "assert_url", "value": "x.com"},
     ])
-    assert detect_missing_wait_for(c) == []
+    assert detect_missing_postconditions(c) == []
 
 
-def test_detect_assert_after_multi_modify_chain() -> None:
-    """加购 → 进购物车 → 断言：链尾断言前一步是 click Cart（导航）
-    → 不报；但链中 click 非导航（Add to cart）不接断言 → 不报。
-    全链安全模式不误报。"""
+def test_graph_evidence_suppresses_report() -> None:
+    """已观察转移（obs3--click e22-->obs4）→ postcondition evidence 存在，
+    refs-only click 无 target 也不报（graph-aware 替代导航判定）。"""
+    tr = [{"from": "obs3", "action": "click", "target_ref": "obs3:e22", "to": "obs4"}]
     c = _case([
-        {"action": "click", "target": {"role": "button", "name": "Add to cart"}},
-        {"action": "click", "target": {"role": "link", "name": "Cart"}},
-        {"action": "assert_text", "value": "Blue Top"},
+        {"action": "click", "target_ref": "obs3:e22", "observation_ref": "obs3"},
+        {"action": "wait_for", "target_ref": "obs4:e30", "observation_ref": "obs4"},
     ])
-    assert detect_missing_wait_for(c) == []
+    assert detect_missing_postconditions(c, transitions=tr) == []
+
+
+def test_refs_only_no_evidence_reports() -> None:
+    """refs-only click 无转移证据、下一步无显式 postcondition → 报
+    （之前 target=None 时导航判定失效会漏报——graph-aware 补上）。"""
+    c = _case([
+        {"action": "click", "target_ref": "obs3:e22", "observation_ref": "obs3"},
+        {"action": "click", "target_ref": "obs3:e23", "observation_ref": "obs3"},
+    ])
+    issues = detect_missing_postconditions(c)
+    assert len(issues) == 1   # 只报第一个 click（第二个的下一步是 click 非显式 postcondition）
+
+
+def test_self_loop_transition_not_evidence() -> None:
+    """转移是 self-loop（obs3→obs3）→ 不算 evidence → 报。"""
+    tr = [{"from": "obs3", "action": "click", "target_ref": "obs3:e22", "to": "obs3"}]
+    c = _case([
+        {"action": "click", "target_ref": "obs3:e22", "observation_ref": "obs3"},
+        {"action": "click", "target_ref": "obs3:e23", "observation_ref": "obs3"},
+    ])
+    assert len(detect_missing_postconditions(c, transitions=tr)) == 1
 
 
 def test_decide_prompt_has_state_awareness() -> None:

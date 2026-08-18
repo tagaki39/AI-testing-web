@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from explore_flow import (   # noqa: E402
     ExploreState, _decide, _detect_auth_failure,
-    _is_repeated_no_progress, _record_page,
+    _is_repeated_no_progress, _record_page, _validate_action_target,
+    validate_actionability,
 )
 
 
@@ -142,6 +143,134 @@ def test_c2_known_key_passes() -> None:
     decision, err = _decide(_decide_state(), llm)
     assert decision is not None, f"合法占位符被误拒: {err}"
     assert decision["value"] == "${email}"
+
+
+# ── H：动作能力矩阵（P0-1：LLM 提议，代码裁决结构合法性）─────────────────────
+
+def test_h_text_element_not_clickable() -> None:
+    """text 元素（无 role）不可作为 click 目标（E2E：模型乱点 Blue Top 文本）。"""
+    ok, reason = _validate_action_target("click", {"type": "text", "text": "Blue Top"})
+    assert not ok and reason == "NON_ACTIONABLE_REF"
+
+
+def test_h2_role_action_matrix() -> None:
+    """role 能力矩阵：button 可 click 不可 fill；textbox 可 fill 可 click。"""
+    assert _validate_action_target("click", {"role": "button", "name": "Login"}) == (True, None)
+    assert _validate_action_target("fill", {"role": "button", "name": "Login"})[0] is False
+    assert _validate_action_target("fill", {"role": "textbox", "name": "Email"}) == (True, None)
+    assert _validate_action_target("click", {"role": "textbox", "name": "Email"}) == (True, None)
+    assert _validate_action_target("press", {"role": "link", "name": "Cart"}) == (True, None)
+
+
+def test_h3_text_click_rejected_in_decide() -> None:
+    """完整路径：模型决策 click text 元素 → _decide 拒绝（确定性）。"""
+    state = ExploreState(goal="buy", entry_url="https://x.com")
+    state.elements = [
+        {"ref": "obs1:e1", "type": "text", "text": "Blue Top"},
+        {"ref": "obs1:e2", "role": "button", "name": "Add to cart"},
+    ]
+    state.observations = [{
+        "id": "obs1", "url": "https://x.com", "state_hash": "h",
+        "elements": state.elements,
+    }]
+    def llm(prompt, system_prompt=None):
+        return '{"action": "click", "target_ref": "obs1:e1"}'
+    decision, err = _decide(state, llm)
+    assert decision is None, "click text 必须被拒"
+    assert "NON_ACTIONABLE_REF" in (err or "")
+
+
+def test_h4_button_click_passes() -> None:
+    """点击真按钮 → 通过（对照）。"""
+    state = ExploreState(goal="buy", entry_url="https://x.com")
+    state.elements = [{"ref": "obs1:e2", "role": "button", "name": "Add to cart"}]
+    state.observations = [{
+        "id": "obs1", "url": "https://x.com", "state_hash": "h",
+        "elements": state.elements,
+    }]
+    def llm(prompt, system_prompt=None):
+        return '{"action": "click", "target_ref": "obs1:e2"}'
+    decision, err = _decide(state, llm)
+    assert decision is not None, f"合法点击被误拒: {err}"
+
+
+# ── I：E1 Runtime Actionability Guard（A11y 存在 ≠ 当前可操作）───────────────
+
+class _MockLocator2:
+    """可操作性校验用 locator mock（trial click 行为可控）。"""
+    def __init__(self, visible=True, enabled=True, obscured=False):
+        self._visible = visible
+        self._enabled = enabled
+        self._obscured = obscured
+        self.click_calls = 0
+
+    def is_visible(self):
+        return self._visible
+
+    def is_enabled(self):
+        return self._enabled
+
+    def click(self, trial=False, timeout=None):
+        self.click_calls += 1
+        if trial and self._obscured:
+            from playwright.sync_api import TimeoutError as PWTimeoutError
+            raise PWTimeoutError("element intercepted by modal")   # Playwright 语义
+        return None
+
+
+def test_i1_obscured_link_rejected() -> None:
+    """模态框打开后底层 Add to cart：可见/可用但被遮挡 → TARGET_OBSCURED。"""
+    loc = _MockLocator2(visible=True, enabled=True, obscured=True)
+    ok, reason = validate_actionability(loc, "click")
+    assert not ok and reason == "TARGET_OBSCURED"
+
+
+def test_i2_actionable_button_passes() -> None:
+    """Continue Shopping（无遮挡）→ 通过。"""
+    loc = _MockLocator2(visible=True, enabled=True, obscured=False)
+    ok, reason = validate_actionability(loc, "click")
+    assert ok and reason == ""
+
+
+def test_i3_not_visible_rejected() -> None:
+    """不可见 → TARGET_NOT_VISIBLE。"""
+    loc = _MockLocator2(visible=False)
+    ok, reason = validate_actionability(loc, "click")
+    assert not ok and reason == "TARGET_NOT_VISIBLE"
+
+
+def test_i4_blacklist_blocks_repeat() -> None:
+    """同一状态同一 ref 失败一次后 → 再选被确定性拒绝（REPEATED_FAILED_ACTION），
+    不再进入浏览器。"""
+    state = ExploreState(goal="buy", entry_url="https://x.com")
+    state.elements = [{"ref": "obs4:e25", "role": "link", "name": "Add to cart"}]
+    state.observations = [{
+        "id": "obs4", "url": "https://x.com", "state_hash": "h",
+        "elements": state.elements,
+    }]
+    state.failed_actions.add(("obs4", "click", "obs4:e25"))
+    def llm(prompt, system_prompt=None):
+        return '{"action": "click", "target_ref": "obs4:e25"}'
+    decision, err = _decide(state, llm)
+    assert decision is None, "黑名单 ref 必须被拒"
+    assert "REPEATED_FAILED_ACTION" in (err or "")
+
+
+def test_i5_blacklist_other_ref_passes() -> None:
+    """黑名单只挡 (obs, action, ref) 精确三元组——其他 ref 照常通过。"""
+    state = ExploreState(goal="buy", entry_url="https://x.com")
+    state.elements = [
+        {"ref": "obs4:e24", "role": "button", "name": "Continue Shopping"},
+    ]
+    state.observations = [{
+        "id": "obs4", "url": "https://x.com", "state_hash": "h",
+        "elements": state.elements,
+    }]
+    state.failed_actions.add(("obs4", "click", "obs4:e25"))   # 另一个 ref
+    def llm(prompt, system_prompt=None):
+        return '{"action": "click", "target_ref": "obs4:e24"}'
+    decision, err = _decide(state, llm)
+    assert decision is not None, f"未黑名单 ref 被误拒: {err}"
 
 
 # ── F/G：no-progress guard + auth failure（Transition/Progress Validation）────

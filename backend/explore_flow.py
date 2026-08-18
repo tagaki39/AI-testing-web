@@ -30,15 +30,20 @@ from dataclasses import dataclass, field
 from time import perf_counter
 from urllib.parse import urlparse
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from resolver import PRICE_RE, _strip_leading_decoration, choose_scope_text
+from resolver import (
+    PRICE_RE, _strip_leading_decoration, choose_scope_text,
+    LocatorNotFoundError, LocatorAmbiguousError,
+)
 from runner import _resolve_locator, _substitute
 
 # ── 预算（bounded：探索必须有限）───────────────────────────────────────────────
-MAX_STEPS = 8        # 最多执行 8 个动作
-MAX_LLM_CALLS = 10   # 最多 10 次 LLM 决策调用（登录→商品→购物车流程实测 8 次
-                     # 才够，且坏决策自纠也消耗预算——留 2 次余量）
+MAX_STEPS = 12       # 最多执行 12 个动作（BFC 场景需要 7 个成功动作：
+                     # 首页→Products→Polo→加购×2→Continue Shopping→View Cart，
+                     # 8 步上限会让购物车页探索不到）
+MAX_LLM_CALLS = 16   # 最多 16 次 LLM 决策调用（BFC 实测 8 步探索耗 8-10 次，
+                     # 含决策自纠；12 步动作 + 自纠余量）
 _MAX_SNAPSHOT_CHARS = 6000   # 裁剪后快照的最终兜底上限（重组后仍超限才截断）
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
 _MAX_TEXT_ELEMENTS = 20      # 文本节点最多注入 20 个（防上下文膨胀）
@@ -67,6 +72,38 @@ _PRESS_KEYS = {"Enter", "Escape", "Tab", "ArrowDown", "ArrowUp"}
 # state.input_keys）——模型不能输出真实值、不能创造变量名
 _PLACEHOLDER_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
+# 动作能力矩阵（评审 P0-1）：LLM 提议动作，确定性代码决定该动作
+# 对该元素是否结构合法。text 元素（无 role）不在矩阵内 → 任何动作
+# 都被拒（只做 evidence/context，不可作为动作目标——E2E 暴露模型
+# 乱点商品名文本 "Blue Top" 导致 get_by_text 15s 超时）。
+ACTION_CAPABILITIES = {
+    "button": {"click", "press"},
+    "link": {"click", "press"},
+    "textbox": {"click", "fill", "press"},
+    "searchbox": {"click", "fill", "press"},
+    "combobox": {"click", "press"},
+    "checkbox": {"click"},
+    "radio": {"click"},
+    "menuitem": {"click"},
+    "tab": {"click"},
+    "option": {"click"},
+}
+
+
+def _validate_action_target(action: str, element: dict | None) -> tuple[bool, str | None]:
+    """动作-元素结构合法性。返回 (是否合法, 拒绝原因码)。"""
+    if element is None or "role" not in element:
+        return False, "NON_ACTIONABLE_REF"
+    allowed = ACTION_CAPABILITIES.get(element.get("role"), set())
+    if action not in allowed:
+        return False, "ACTION_NOT_SUPPORTED_BY_ROLE"
+    return True, None
+
+# 确定性永久失败（评审收紧）：这些原因证明"该动作在该状态不应再执行"，
+# 进入 failed_actions 黑名单。TARGET_NOT_FOUND/AMBIGUOUS/CHECK_ERROR
+# 可能是 Resolver/locator 自身问题——不 blacklist（避免毒死正常 ref）。
+_PERMANENT_ACTION_FAILURES = {"TARGET_OBSCURED", "TARGET_DISABLED", "NON_ACTIONABLE_REF"}
+
 # 认证失败信号（精确整句匹配——死胡同要明确停止，不能原地循环）
 _AUTH_FAILURE_MARKERS = (
     "your email or password is incorrect",
@@ -84,6 +121,32 @@ def _detect_auth_failure(snapshot: str) -> bool:
     """页面是否出现认证失败证据（登录被拒 → 目标无法继续 → 明确停止）。"""
     low = snapshot.lower()
     return any(m in low for m in _AUTH_FAILURE_MARKERS)
+
+
+def _observe_until_stable(page, timeout_ms: int = 3000) -> str:
+    """轮询页面 snapshot 直到状态稳定（等状态证据，不等固定时间）。
+
+    评审 P0-2：点击后固定 300ms 等待不够——模态框/SPA 延迟渲染时
+    观察还是旧状态 → 图里记 self-loop，新状态被归到下一次错误动作
+    （BFC 场景：Add to cart 后 modal 未渲染，obs3→obs3，modal 状态
+    被错误归因到下一次 text 点击的超时窗口）。
+    轮询：snapshot hash 变化后连续两次相同 → 认为稳定。
+    """
+    deadline = perf_counter() + timeout_ms / 1000
+    last_hash: str | None = None
+    stable_count = 0
+    latest = ""
+    while perf_counter() < deadline:
+        latest = _observe(page)
+        h = hashlib.sha256(latest.encode()).hexdigest()[:10]
+        if h == last_hash:
+            stable_count += 1
+            if stable_count >= 2 and last_hash is not None:
+                return latest
+        else:
+            last_hash, stable_count = h, 0
+        page.wait_for_timeout(150)
+    return latest
 
 
 def _is_repeated_no_progress(state: "ExploreState", action: str, ref: str) -> bool:
@@ -174,6 +237,8 @@ class ExploreState:
     observations: list[dict] = field(default_factory=list)  # 页面状态观察（含 state_hash）
     transitions: list[dict] = field(default_factory=list)   # G2：状态转移边（obs3 --click e17--> obs4）
     input_keys: set = field(default_factory=set)   # Data Grounding：允许的 ${key} 白名单
+    failed_actions: set = field(default_factory=set)  # E1：{(obs_id, action, ref)} 失败黑名单
+    consecutive_rejections: int = 0    # E1：连续拒绝计数（≥3 视为卡死停止）
     step_count: int = 0                # 已执行动作数
     llm_calls: int = 0                 # 已用 LLM 调用数
     done: bool = False                 # 探索是否完成
@@ -224,10 +289,19 @@ def _parse_elements(snapshot: str) -> list[dict]:
     return elements
 
 
-def _elements_to_prompt(elements: list[dict]) -> str:
-    """元素表 → 决策上下文（紧凑格式）。"""
+def _elements_to_prompt(elements: list[dict], state: "ExploreState | None" = None) -> str:
+    """元素表 → 决策上下文（紧凑格式）。
+
+    E1（评审收紧）：blacklist 后从模型 action space 删除失败 ref——
+    比"告诉 LLM 别选它"强：确定性约束缩小输入空间，而不是靠提示词
+    让模型记住约束。被黑名单的 ref 直接从元素表消失。
+    """
     lines = []
     for e in elements:
+        if state is not None and state.observations:
+            key = (state.observations[-1]["id"], "click", e["ref"])
+            if key in state.failed_actions:
+                continue   # 已确定性失败的 ref 不出现在候选表
         if "role" in e:
             lines.append(f'{e["ref"]}: {e["role"]} "{e["name"]}"')
         else:
@@ -325,16 +399,20 @@ def _smart_truncate(snapshot: str) -> str:
     return result[:_MAX_SNAPSHOT_CHARS] if len(result) > _MAX_SNAPSHOT_CHARS else result
 
 
-def _record_page(state: ExploreState, page) -> None:
+def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None:
     """记录当前页面状态为 observation（升级：URL + state_hash 去重）。
 
     Observation = URL + 页面状态 + ARIA 证据——
     同 URL 不同状态（如 Add to cart 点击后按钮变 Remove）也保存，
     解决 SPA 状态丢失（此前只按 URL 去重）。
+
+    snapshot 可外部传入（P0-2：_observe_until_stable 的稳定快照），
+    避免重复抓取 aria_snapshot。
     """
     url = page.url
     state.current_url = url
-    snapshot = _observe(page)
+    if snapshot is None:
+        snapshot = _observe(page)
     elements = _parse_elements(snapshot)   # ← ref 表（页面级 e1/e2，局部变量）
 
     # 状态哈希：snapshot 变化 = 页面状态变化（即使 URL 相同）
@@ -351,7 +429,7 @@ def _record_page(state: ExploreState, page) -> None:
     ), None)
     if matched is not None:
         state.elements = matched["elements"]
-        return
+        return matched["id"]   # E1：transition 的 to 用实际所在状态
 
     same_url_count = sum(1 for o in state.observations if o["url"] == url)
     if (len(state.observations) >= _MAX_OBSERVATIONS
@@ -364,7 +442,7 @@ def _record_page(state: ExploreState, page) -> None:
             "error": "观察预算已满（total/per-url 上限），停止探索",
         })
         state.done = True
-        return
+        return None
 
     state.snapshot = snapshot
     state.elements = elements
@@ -391,6 +469,7 @@ def _record_page(state: ExploreState, page) -> None:
     #（obsN:eM 格式）。裸 e1/e2 意味着状态所有权丢失——决策校验将失效。
     assert all(":" in e["ref"] for e in state.elements), (
         f"_record_page 后存在无 state 前缀的 ref: {state.elements[:5]}")
+    return obs_id
 
 
 def _safe_title(page) -> str:
@@ -501,7 +580,7 @@ def _decide(state: ExploreState, llm_call) -> tuple[dict | None, str | None]:
         current_obs=state.observations[-1]["id"] if state.observations else "?",
         url=state.current_url,
         input_keys=", ".join(sorted(state.input_keys)) if state.input_keys else "(无)",
-        elements=_elements_to_prompt(state.elements),
+        elements=_elements_to_prompt(state.elements, state),
         history=history_text,
     )
     try:
@@ -529,6 +608,25 @@ def _decide(state: ExploreState, llm_call) -> tuple[dict | None, str | None]:
                 return None, ("NO_PROGRESS: 同一元素上的同一动作上一次执行"
                               "未产生状态变化（self-loop）——禁止原地重复，"
                               "请选择其他动作或输出 finish 宣告失败")
+            # 动作-元素结构合法性（评审 P0-1：text 元素不可点击等）。
+            # 确定性拒绝 → 反馈历史让模型自纠（llm+1，step+0）。
+            el = next((e for e in state.elements if e["ref"] == ref), None)
+            ok, reason = _validate_action_target(action, el)
+            if not ok:
+                desc = el.get("text", "")[:30] if el else ""
+                label = f"text {desc!r}" if el and "role" not in el \
+                    else (el.get("role") if el else "?")
+                return None, (f"{reason}: 目标 {ref!r}（{label}）不支持动作"
+                              f" {action!r}——text 元素仅作证据不可点击，"
+                              "请选当前表中的可交互控件 ref")
+            # E1：state-scoped failed-action blacklist——同一 observation 内
+            # 一次确定性失败（遮挡/不可见/不可用）就禁止原样重试：
+            # 状态没变，重试没有新信息价值，只会再花 15s 撞墙。
+            if state.observations and (
+                    state.observations[-1]["id"], action, ref) in state.failed_actions:
+                return None, (f"REPEATED_FAILED_ACTION: ({state.observations[-1]['id']}, "
+                              f"{action}, {ref}) 已确定性失败过——该 ref 在此状态下"
+                              "禁止再次选择，请换用其他可操作元素")
         if action == "fill":
             # Data Grounding 强校验（评审收紧：不只靠 prompt）：
             # fill 的 value 必须是 ${key} 占位符，且 key 必须在
@@ -550,6 +648,45 @@ def _decide(state: ExploreState, llm_call) -> tuple[dict | None, str | None]:
 
 # ── act：ref → locator → 执行（LLM=Planner，这里=Executor）────────────────────
 
+def _locator_for_element(page, element: dict) -> tuple[dict, dict | None, object]:
+    """element → (target, scope, locator)。
+
+    E1：_act 与 validate_actionability 共用的定位构建——
+    I1 同名重复元素带 scope_has_text 锚点消歧。
+    """
+    target = {"role": element["role"], "name": element["name"]} if "role" in element \
+        else {"text": element["text"]}
+    scope = {"has_text": element["scope_has_text"]} if element.get("scope_has_text") else None
+    _, locator = _resolve_locator(page, target, scope=scope)
+    return target, scope, locator
+
+
+def validate_actionability(locator, action: str) -> tuple[bool, str]:
+    """E1：执行前可操作性校验（A11y 存在 ≠ 当前可操作）。
+
+    评审：模态框打开后底层 Add to cart 在 A11y 树里存在但被遮罩
+    遮挡——直接 click 要等 15s 超时才知道。执行前确定性检查：
+      - 可见性 / 可用性（is_visible / is_enabled）
+      - click：Playwright 官方 actionability 检查（click(trial=True)
+        自动滚动 + 完整判定 visible/stable/接收事件/不被遮挡），
+        超时 → TARGET_OBSCURED。不用手写 elementFromPoint：
+        命中点落在父容器空白区会误判遮挡（父元素 contains 判定反了）。
+
+    返回 (是否可操作, 拒绝原因码)。bounded：trial 3s 上限。
+    """
+    try:
+        if not locator.is_visible():
+            return False, "TARGET_NOT_VISIBLE"
+        if not locator.is_enabled():
+            return False, "TARGET_DISABLED"
+        if action == "click":
+            locator.click(trial=True, timeout=3000)   # 不实际点击，只检查
+        return True, ""
+    except PlaywrightTimeoutError:
+        return False, "TARGET_OBSCURED"
+    except Exception:
+        return False, "ACTIONABILITY_CHECK_ERROR"
+
 def _act(page, decision: dict, elements: list[dict], runtime_inputs: dict) -> str:
     """执行 LLM 决策的动作，返回动作名。定位失败/执行失败抛异常。
 
@@ -568,11 +705,7 @@ def _act(page, decision: dict, elements: list[dict], runtime_inputs: dict) -> st
     element = next((e for e in elements if e["ref"] == ref), None)
     if element is None:
         raise ValueError(f"未知 target_ref: {ref}")
-    target = {"role": element["role"], "name": element["name"]} if "role" in element \
-        else {"text": element["text"]}
-    # I1：同名重复元素带上 scope_has_text 锚点消歧（_attach_scope_context 采集）
-    scope = {"has_text": element["scope_has_text"]} if element.get("scope_has_text") else None
-    _, locator = _resolve_locator(page, target, scope=scope)
+    target, scope, locator = _locator_for_element(page, element)
     # I1：身份证据前移——探索时 count==1 命中即标 verified
     #（证据不是豁免，运行时仍过三分法 + 评分；供 Compiler/metrics 使用）
     for e in elements:
@@ -652,6 +785,18 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                     "action": "decision_rejected",
                     "error": decision_error,
                 })
+                # E1：连续拒绝 ≥3 次 = 卡死（黑名单/元素表已过滤，模型仍
+                # 无有效动作可选）→ 明确停止，不无限消耗 LLM 预算。
+                state.consecutive_rejections += 1
+                if state.consecutive_rejections >= 3:
+                    state.history.append({
+                        "url": state.current_url,
+                        "action": "exploration_stalled",
+                        "error": "连续 3 次决策被确定性拒绝——当前状态无有效"
+                                 "动作可选（candidate 已过滤），停止探索",
+                    })
+                    state.done = True
+                    break
                 continue
 
             if decision.get("exploration_complete") or decision.get("action") == "finish":
@@ -676,6 +821,50 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                 else ({"text": element["text"]} if element else None)
             # G2：动作前状态（transition 的 from）
             from_obs = state.observations[-1]["id"] if state.observations else None
+
+            # E1：执行前可操作性校验（A11y 存在 ≠ 当前可操作）。
+            # 模态框遮挡的 Add to cart 直接 click 会 15s 超时——
+            # 这里确定性拦截 + 黑名单，模型必须换可操作元素。
+            act_name = decision["action"]   # _decide 已保证白名单内
+            if act_name in {"click", "press"} and element is not None:
+                try:
+                    _, _, act_locator = _locator_for_element(page, element)
+                    act_ok, act_reason = validate_actionability(act_locator, act_name)
+                except LocatorNotFoundError as exc:
+                    # 语义定位失败（元素运行时不可解析）——不 blacklist：
+                    # 可能是 Resolver/locator 自身问题，不是动作确定性失败
+                    act_ok, act_reason, act_detail = False, "TARGET_NOT_FOUND", str(exc)
+                except LocatorAmbiguousError as exc:
+                    act_ok, act_reason, act_detail = False, "TARGET_AMBIGUOUS", str(exc)
+                except Exception as exc:
+                    act_ok, act_reason = False, "ACTIONABILITY_CHECK_ERROR"
+                    act_detail = f"{type(exc).__name__}: {exc}"
+                if not act_ok:
+                    # 只有确定性永久失败才 blacklist（评审收紧）——
+                    # TARGET_NOT_FOUND/AMBIGUOUS/CHECK_ERROR 可能是
+                    # resolver 自身问题，不毒死 ref。
+                    if act_reason in _PERMANENT_ACTION_FAILURES and from_obs:
+                        state.failed_actions.add((from_obs, act_name, ref))
+                    state.history.append({
+                        "url": state.current_url,
+                        "action": "decision_rejected",
+                        "target_ref": ref,
+                        "error": (f"{act_reason}: 目标 {ref!r} 当前不可"
+                                  f"{'点击' if act_name == 'click' else '按键'}"
+                                  "（可能被 dialog/modal/overlay 遮挡）——"
+                                  "请选择当前状态下可操作的元素"),
+                    })
+                    state.consecutive_rejections += 1
+                    if state.consecutive_rejections >= 3:
+                        state.history.append({
+                            "url": state.current_url,
+                            "action": "exploration_stalled",
+                            "error": "连续 3 次拒绝（可操作性校验）——停止探索",
+                        })
+                        state.done = True
+                        break
+                    continue
+
             t0 = perf_counter()
             try:
                 action_done = _act(page, decision, state.elements, runtime_inputs or {})
@@ -688,6 +877,9 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                 })
             except Exception as exc:
                 action_done = None
+                # E1：执行失败也进黑名单（同状态同 ref 不再重试撞墙）
+                if from_obs:
+                    state.failed_actions.add((from_obs, decision.get("action"), ref))
                 state.history.append({
                     "url": state.current_url,
                     "action": decision.get("action"),
@@ -698,6 +890,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             state.timings["browser_action_ms"] += int((perf_counter() - t0) * 1000)
 
             state.step_count += 1
+            state.consecutive_rejections = 0   # E1：成功动作重置连续拒绝
             # 按动作类型决定等待（修复：固定 800ms 浪费——fill 基本无需等待，
             # 点击/导航需要渲染时间）：
             wait_start = perf_counter()
@@ -707,14 +900,25 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             state.timings["fixed_wait_ms"] += int((perf_counter() - wait_start) * 1000)
 
             t0 = perf_counter()
+            if action_done in {"click", "press", "back"}:
+                # P0-2：等状态证据而非固定时间——点击后模态框/SPA 延迟
+                # 渲染时，固定 300ms 观察会错位（旧状态 → self-loop 归因错）
+                snapshot = _observe_until_stable(page)
+            else:
+                snapshot = _observe(page)
+            state.timings["observation_ms"] += int((perf_counter() - t0) * 1000)
+
             if action_done != "fill":
                 # observe 新页面状态。fill 不创建 persistent observation：
                 # 表单填充只改 input value（ephemeral），不产生新 graph node
                 #（评审收紧：fill 一次 = 一个 obs 会让登录页吃掉 4 个槽位）。
-                _record_page(state, page)
+                # 返回动作后实际所处 observation id（matched 或新建）——
+                # E1：transition 的 to 必须用真实状态，不能是 observations[-1]
+                #（Continue Shopping 关闭模态框回到旧状态 → to=旧 obs）。
+                to_obs = _record_page(state, page, snapshot=snapshot)
             else:
                 state.current_url = page.url   # fill 不改页面结构，只同步 URL
-            state.timings["observation_ms"] += int((perf_counter() - t0) * 1000)
+                to_obs = state.observations[-1]["id"] if state.observations else None
 
             # 认证失败 evidence（死胡同要明确停止，不能原地循环）：
             # 页面出现 "email or password is incorrect" 等信号 → 目标无法
@@ -729,10 +933,11 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                 break
 
             # G2：记录状态转移边（obs3 --click e17--> obs4）。
-            # 动作成功（action_done 非 None）才记录；from/to 为动作前后的
-            # observation id（同状态变化也会形成新 obs → 自转移边）。
-            if action_done is not None and from_obs:
-                to_obs = state.observations[-1]["id"] if state.observations else from_obs
+            # 动作成功（action_done 非 None）才记录；to = 动作后实际所处
+            # observation（_record_page 返回值——matched 或新建）。
+            # E1：不能取 observations[-1]——Continue Shopping 关闭模态框
+            # 回到旧状态时，[-1] 还是模态框 obs，会记成错误 self-loop。
+            if action_done is not None and from_obs and to_obs:
                 state.transitions.append({
                     "from": from_obs,
                     "action": decision["action"],

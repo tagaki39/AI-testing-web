@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from grounding import (   # noqa: E402
+    UnreachableObservationError,
     GraphElement, GraphObservation, GraphTransition, StateGraph,
     StateGroundingMismatchError, UnknownTargetRefError,
     validate_state_grounding,
@@ -284,6 +285,59 @@ def test_from_explore_result_roundtrip():
         {"action": "click", "target_ref": "obs1:e99", "target": {"role": "link", "name": "Buy"}},
     ])
     _expect_unknown_ref(bad_case, graph, step_index=2, ref="obs1:e99")
+
+
+def test_orphan_observation_unreachable_rejected():
+    """孤儿状态（obs5 被观察到但无 incoming 转移边）→ 引用被拒。
+
+    评审收紧（BFC 实测）：obs5 无入边——若把"入度为零"当入口会被误判
+    为可达 → 悬空引用放行。入口必须是探索起点（observations[0]）。
+    """
+    graph = StateGraph(
+        observations=[
+            GraphObservation(id="obs1", url="https://x.com", state_hash="h1",
+                             elements=[GraphElement(ref="obs1:e1", role="link", name="Buy")]),
+            GraphObservation(id="obs2", url="https://x.com/detail", state_hash="h2",
+                             elements=[GraphElement(ref="obs2:e1", role="button", name="Buy")]),
+            GraphObservation(id="obs5", url="https://x.com/detail", state_hash="h5",
+                             elements=[GraphElement(ref="obs5:e30", role="button", name="View Cart")]),
+        ],
+        transitions=[
+            GraphTransition(from_="obs1", action="click", target_ref="obs1:e1", to="obs2"),
+        ],
+    )
+    case = _case([
+        {"action": "goto", "value": "https://x.com"},
+        {"action": "click", "target_ref": "obs1:e1", "target": {"role": "link", "name": "Buy"}},
+        {"action": "wait_for", "target_ref": "obs5:e30",
+         "target": {"role": "button", "name": "View Cart"}},
+    ])
+    try:
+        validate_state_grounding(case, graph)
+        raise AssertionError("孤儿状态引用必须被拒")
+    except UnreachableObservationError as exc:
+        assert exc.step_index == 3 and exc.obs_id == "obs5"
+
+
+def test_reachable_chain_passes():
+    """入口 → 转移链上的状态全部可达 → 不误拒。"""
+    graph = StateGraph(
+        observations=[
+            GraphObservation(id="obs1", url="https://x.com", state_hash="h1",
+                             elements=[GraphElement(ref="obs1:e1", role="link", name="Buy")]),
+            GraphObservation(id="obs2", url="https://x.com/detail", state_hash="h2",
+                             elements=[GraphElement(ref="obs2:e1", role="button", name="Buy")]),
+        ],
+        transitions=[
+            GraphTransition(from_="obs1", action="click", target_ref="obs1:e1", to="obs2"),
+        ],
+    )
+    case = _case([
+        {"action": "goto", "value": "https://x.com"},
+        {"action": "click", "target_ref": "obs1:e1", "target": {"role": "link", "name": "Buy"}},
+        {"action": "click", "target_ref": "obs2:e1", "target": {"role": "button", "name": "Buy"}},
+    ])
+    validate_state_grounding(case, graph)   # 不抛
 
 
 def test_graph_models_extra_forbid():

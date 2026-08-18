@@ -173,6 +173,48 @@ class UnknownTargetRefError(Exception):
         )
 
 
+class UnreachableObservationError(Exception):
+    """悬空引用：ref 所属 observation 在状态图中不可达（无入口路径）。
+
+    评审收紧（BFC 场景）：obs5 被观察到但没有 incoming transition 边
+    （动作失败后页面自己变化产生的孤儿状态）——G3 的 fail-open
+    （转移断链 current=None）会放行它的引用。invariant 强化：
+    计划引用的每个 observation 必须从入口可达（goto URL 匹配或沿
+    转移边到达）——不可达 = 探索未建立合法路径，引用 = 悬空。
+    """
+    def __init__(self, step_index: int, ref: str, obs_id: str):
+        self.step_index = step_index
+        self.ref = ref
+        self.obs_id = obs_id
+        super().__init__(
+            f"步骤 {step_index}: 引用的状态 {obs_id} 在 State Graph 中不可达"
+            f"（ref {ref}）——探索未建立到达该状态的转移路径，"
+            "不可引用于测试计划"
+        )
+
+
+def _reachable_observations(graph: "StateGraph") -> set[str]:
+    """从入口出发可达的 observation 集合。
+
+    入口 = 探索起点（observations[0]，explore 总是从 entry_url 开始）。
+    沿转移边 BFS。孤儿状态（被观察到但无 incoming 路径）不可达。
+
+    注意：不能把"入度为零"当入口——孤儿状态同样无入边，
+    会被误判为源点（BFC 实测：obs5 无入边 → 全部"可达"→ 悬空放行）。
+    """
+    if not graph.observations:
+        return set()
+    reachable = {graph.observations[0].id}
+    stack = list(reachable)
+    while stack:
+        oid = stack.pop()
+        for t in graph.transitions:
+            if t.from_ == oid and t.to not in reachable:
+                reachable.add(t.to)
+                stack.append(t.to)
+    return reachable
+
+
 # ── Validator 主入口 ───────────────────────────────────────────────────────────
 
 def _match_observation_url(value: str | None, observations: list[GraphObservation]) -> str | None:
@@ -214,6 +256,10 @@ def validate_state_grounding(case: DSLCase, graph: StateGraph | None) -> None:
     for t in graph.transitions:
         edges.setdefault((t.from_, t.action, t.target_ref), set()).add(t.to)
 
+    # 可达性 invariant：计划引用的每个 observation 必须从入口可达
+    #（评审收紧：孤儿状态无 incoming edge，G3 fail-open 会放行悬空引用）
+    reachable = _reachable_observations(graph)
+
     current: str | None = None   # expected state（None = 不可追踪，fail-open）
 
     for index, step in enumerate(case.steps, start=1):
@@ -229,6 +275,10 @@ def validate_state_grounding(case: DSLCase, graph: StateGraph | None) -> None:
                 raise UnknownTargetRefError(index, ref)
 
             belongs = ref_map[ref]
+            # ①.5 可达性 invariant：所属 observation 必须从入口可达
+            #（孤儿状态无路径 → 悬空引用，即使 ref 存在也拒绝）
+            if belongs not in reachable:
+                raise UnreachableObservationError(index, ref, belongs)
             # ② invariant：ref 必须属于当前 expected state
             if current is not None and belongs != current:
                 raise StateGroundingMismatchError(
@@ -246,6 +296,13 @@ def validate_state_grounding(case: DSLCase, graph: StateGraph | None) -> None:
                 # 无转移边 / 多边指向不同 to → 不可追踪，fail-open
                 current = next(iter(tos)) if len(tos) == 1 else None
             # fill/check/wait_for/assert 不改变页面状态 → current 不变
+
+        elif step.observation_ref and step.observation_ref not in reachable:
+            # 无 ref 步骤声明的 observation 也不可指向孤儿状态
+            raise UnreachableObservationError(
+                index, f"(observation_ref={step.observation_ref})",
+                step.observation_ref,
+            )
 
         elif step.observation_ref and current is not None \
                 and step.observation_ref != current:

@@ -44,6 +44,7 @@ from explore_flow import GOAL_ACTION_PATTERNS, explore
 import anti_patterns
 from grounding import (
     StateGraph, StateGroundingMismatchError, UnknownTargetRefError,
+    UnreachableObservationError, _reachable_observations,
     validate_state_grounding,
 )
 from resolver import (
@@ -580,37 +581,60 @@ def _check_goal_coverage(goal: str, case: DSLCase) -> list[str]:
     return missing
 
 
-# ── missing_wait_for 检测（对齐参考项目 taxonomy：断言前必须等 postcondition）──
+# ── postcondition 覆盖检测（graph-aware：有已观察转移即视为有证据）─────────────
 
 _MODIFY_ACTIONS = {"click", "fill", "input", "select", "check"}
+_EXPLICIT_POSTCONDITION = {"wait_for", "assert_visible", "assert_url", "assert_text"}
 
 
-def detect_missing_wait_for(case: DSLCase) -> list[str]:
-    """检测"断言直接依赖前一修改动作、中间无 postcondition 等待"的计划。
+def detect_missing_postconditions(
+    case: DSLCase,
+    observations: list | None = None,
+    transitions: list | None = None,
+) -> list[str]:
+    """检测"state-changing 动作缺少可验证 postcondition"（graph-aware）。
 
-    missing_wait_for 语义（对齐参考项目 dsl_generator 的
-    Wait-after-state-changing-actions）：
-      断言（assert_text/assert_url）紧跟在 state-changing 动作之后，
-      且该动作不是导航 click（导航由执行器自动等待页面加载）——
-      → 断言可能读到异步更新前的旧状态（如加购后立即验证购物车为空）。
+    评审收紧（升级 missing_wait_for）：refs-only 架构下 step.target 为
+    None，无法靠 target 判断导航——改用 Observation State Graph 判断：
 
-    只报最确定的模式（紧邻两步 + 非导航），不深挖多步链——
-    保守防假阳性：goto→assert_url、click Login→assert_url 等
-    导航类模式天然安全，不报。
+      - 转移图里存在 (from, action, ref) → to（to != from）：
+        该动作在探索期被观察到产生状态转换 = postcondition evidence
+        已存在 → 不报（比 wait_for 更强的证据）
+      - DSL 中该动作的下一步显式提供 wait_for / assert_visible /
+        assert_url / assert_text：显式 postcondition → 不报
+      - 否则 → UNVERIFIED_POSTCONDITION（报）
+
+    只检查 state-changing 动作（click/fill/select/check）；
+    goto 天然安全（执行器等待页面加载）不检查。
     """
+    transition_index = {
+        (t["from"], t["action"], t["target_ref"]): t["to"]
+        for t in (transitions or [])
+        if t.get("from") and t.get("to") and t.get("target_ref")
+    }
     issues: list[str] = []
     steps = case.steps
     for i in range(len(steps) - 1):
-        cur, nxt = steps[i], steps[i + 1]
-        if nxt.action not in {"assert_text", "assert_url"}:
-            continue
+        cur = steps[i]
         if cur.action not in _MODIFY_ACTIONS:
             continue
-        if cur.action == "click" and is_navigation_target(cur.target):
-            continue   # 导航 click：Playwright 自动等待加载，无竞态风险
+        # ① 已观察转移 = grounded postcondition evidence（graph-aware）
+        if cur.target_ref and cur.observation_ref:
+            to = transition_index.get(
+                (cur.observation_ref, cur.action, cur.target_ref),
+            )
+            if to and to != cur.observation_ref:
+                continue
+        # ② 显式 postcondition（下一步是等待/验证）
+        if steps[i + 1].action in _EXPLICIT_POSTCONDITION:
+            continue
+        # ③ 导航 click（target 可用时判定；refs-only 时靠 ①② 兜底）
+        if cur.action == "click" and cur.target is not None \
+                and is_navigation_target(cur.target):
+            continue
         issues.append(
-            f"{cur.action}({_brief_target(cur.target) or cur.target_ref or '-'}) → "
-            f"{nxt.action} 缺少 postcondition 等待（异步状态可能未生效）"
+            f"{cur.action}({_brief_target(cur.target) or cur.target_ref or '-'}) "
+            "无已观察转移也无显式 postcondition——异步状态可能未生效"
         )
     return issues
 
@@ -631,7 +655,8 @@ def _failure_reason_code(exc: Exception) -> str:
     """失败 → 反模式原因码（missing_step / invalid_ref / invalid_structure）。"""
     if isinstance(exc, GoalCoverageError):
         return "missing_step"
-    if isinstance(exc, (UnknownTargetRefError, StateGroundingMismatchError)):
+    if isinstance(exc, (UnknownTargetRefError, StateGroundingMismatchError,
+                        UnreachableObservationError)):
         return "invalid_ref"
     return "invalid_structure"
 
@@ -1690,19 +1715,48 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 explore_result = None   # 探索异常 → 降级无快照生成
     explore_ms = int((perf_counter() - t_explore) * 1000)
 
+    # E1（评审收紧）：探索异常不得静默冒充 grounded 成功——显式暴露
+    # degraded 标记与错误，前端/诊断能区分"真 grounded"与"legacy 降级"。
+    # （降级仍保留：探索失败不阻断生成主链路，但 meta 必须说明。）
+    explore_error: str | None = None
+    if entry_url and explore_result is None and pages:
+        explore_error = "explore 未执行（缓存为空且入口缺失）"
+    elif entry_url and explore_result is None:
+        explore_error = "探索异常（已降级 legacy 生成，见 server log）"
+
     # ── 阶段 3：组装 prompt（多页面结构 + 探索路径）→ Planner 生成 ──
+    # E1：Planner 永远只看 reachable observations（孤儿状态只留诊断，
+    # 不进 Planner evidence——refs-only 定义：Planner 只能引用成功
+    # 转移图可证明的状态。之前 retry 时才过滤，首次生成也能引用孤儿）。
+    if explore_result is not None:
+        sg = StateGraph.from_explore_result(explore_result)
+        reach = _reachable_observations(sg)
+        if reach:
+            pages = [p for p in pages if p["id"] in reach]
     multi_snapshot = _pages_to_text(pages) if pages else None
     if multi_snapshot:
-        # 把探索路径也注入：Planner 能看到"怎么走到每个页面"
+        # P0-3：canonical path 只来自成功转移边（State Graph transitions），
+        # 失败动作单独标注为负例——Planner 不会学到"点击文本超时 →
+        # 进入 obs4"的错误因果（temporal attribution bug：失败动作的
+        # 15s 超时窗口恰好吞掉了前一个动作的延迟状态）。
+        tr = (explore_result or {}).get("transitions") or []
         path_lines = [
-            f"- {h.get('action')} {json.dumps(h.get('target'), ensure_ascii=False) if h.get('target') else ''} "
-            f"{h.get('value') or ''} @ {h.get('url')}"
+            f"- {t['from']} --{t['action']} {t['target_ref']}--> {t['to']}"
+            for t in tr
+            if t.get("from") and t.get("to") and t.get("from") != t.get("to")
+        ]
+        fail_lines = [
+            f"- {h.get('action')} {h.get('target_ref')} 失败:"
+            f" {(h.get('error') or '')[:70]}"
             for h in (explore_result or {}).get("history", [])
+            if h.get("error") and h.get("action") != "decision_rejected"
         ]
         grounded_prompt = (
             f"目标页面入口: {entry_url}\n\n"
-            f"探索路径（已按此流程访问过以下页面）:\n"
-            + "\n".join(path_lines)
+            f"已验证状态转移（State Graph 成功边，规划路径只能沿这些边）:\n"
+            + ("\n".join(path_lines) if path_lines else "- (无)")
+            + ("\n\n失败动作（不要模仿，这些动作未产生有效状态变化）:\n"
+               + "\n".join(fail_lines) if fail_lines else "")
             + "\n\n各页面真实结构（ARIA snapshot）：\n\n"
             + multi_snapshot
             + "\n\n用户测试需求（已脱敏，密码等敏感信息已替换为 ${var} 占位符）: "
@@ -1733,9 +1787,9 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     # grounding → 目标覆盖质量门。有探索证据时：target_ref → target
     # 确定性编译，跨状态/编造 ref 执行前拒绝（放在 Preflight 之前：
     # grounding 错位的计划不值得花浏览器轮次修复）。
-    def attempt(prompt: str):
+    def attempt(prompt: str, tables: str | None = None):
         case, planner_meta = _generate_planner_case(
-            prompt, mode=planner_mode, tables=multi_snapshot,
+            prompt, mode=planner_mode, tables=tables or multi_snapshot,
         )   # ← Schema Recovery ×1（refs-only 模式含契约违规修复）
         case, removed = _normalize_steps(case)   # ← 计划归一化 + 记录删除
         case = _normalize_invalid_scopes(case)   # ← 导航 scope invariant
@@ -1761,19 +1815,42 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     try:
         case, planner_meta, removed_assertions, compile_stats = attempt(grounded_prompt)
     except (GoalCoverageError, UnknownTargetRefError, StateGroundingMismatchError,
-            ValueError, ValidationError) as exc:
+            UnreachableObservationError, ValueError, ValidationError) as exc:
         reason = _failure_reason_code(exc)
         failed_case = exc.case if isinstance(exc, GoalCoverageError) else None
         anti_patterns.record(reason, _plan_summary(failed_case, str(exc)))
         patterns = anti_patterns.list_for(reason)
         anti_pattern_used = len(patterns)
         generation_retries = 1
+        # P0-4：grounding 错位时告诉重生 Planner"当前推导状态 + 允许引用
+        # 哪个状态"——Planner 在 expected 状态内重选 ref（不跨状态/不编造）。
+        # 不自动改 target_ref：换 ref 是语义决策，不是字符串替换。
+        extra = ""
+        retry_tables = None
+        if isinstance(exc, (StateGroundingMismatchError, UnreachableObservationError)):
+            extra = (
+                f"\n- 该步骤执行时应处于状态 {exc.expected if isinstance(exc, StateGroundingMismatchError) else exc.obs_id}："
+                "target_ref 只能引用可达状态（入口沿转移边可到达）的元素，"
+                "不可引用孤儿/已离开状态；若目标元素在这些状态中不存在，"
+                "请调整步骤设计"
+            )
+            # 关键：重生时只提供可达 observation 的快照——Planner 看不到
+            # 不可达状态（如孤儿 obs5），物理上无法引用它（BFC 实测：
+            # 只靠 prompt 提示不够，Planner 会因目标完整性压力继续引用）。
+            if explore_result is not None:
+                sg = StateGraph.from_explore_result(explore_result)
+                reach = _reachable_observations(sg)
+                retry_pages = [p for p in pages if p["id"] in reach]
+                retry_tables = _pages_to_text(retry_pages) if retry_pages else None
         case, planner_meta, removed_assertions, compile_stats = attempt(
-            grounded_prompt + _build_retry_hint(str(exc), patterns),
+            grounded_prompt + _build_retry_hint(str(exc), patterns) + extra,
+            tables=retry_tables,
         )
     planner_ms = int((perf_counter() - t_planner) * 1000)
 
     meta = {
+        "generation_mode": "refs_only" if explore_result is not None else "legacy_fallback",
+        "explore_error": explore_error,
         "snapshot_used": bool(multi_snapshot),
         "entry_url": entry_url,
         "cache_hit": cache_hit,      # Speed v1：探索结果是否命中缓存
@@ -1821,7 +1898,9 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         "exploration_incomplete": bool(pages)
         and not (explore_result or {}).get("done", False),
         "missing_actions": _check_goal_coverage(explore_goal, case) or None,
-        "missing_wait_for": detect_missing_wait_for(case) or None,
+        "unverified_postconditions": detect_missing_postconditions(
+            case, pages, (explore_result or {}).get("transitions", []),
+        ) or None,
     }
 
     # Speed v1：生成链路计时（定位耗时构成，决定下一刀砍哪）
