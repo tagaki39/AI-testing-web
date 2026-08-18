@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
-from explore_flow import (   # noqa: E402
+from explore import (   # noqa: E402
     ExploreState, _decide, _detect_auth_failure,
     _is_repeated_no_progress, _record_page, _validate_action_target,
     _validate_completion, validate_actionability,
@@ -250,7 +250,7 @@ def test_i3_not_visible_rejected() -> None:
 def test_i4_blacklist_removed_from_action_space() -> None:
     """R3（评审瘦身）：失败 ref 从 ActionSpace 候选消失（Restrict——
     模型没权限选择错误动作），而非"选后再拒"。"""
-    from explore_flow import _build_action_space
+    from explore import _build_action_space
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
         {"ref": "obs4:e25", "role": "link", "name": "Add to cart", "actionable": True},

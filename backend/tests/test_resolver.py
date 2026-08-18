@@ -371,7 +371,7 @@ def test_snapshot_match_decorated_leading_icon():
 
 def test_attach_scope_context_duplicates_only():
     """I1 采集：同名重复按钮获容器锚点（跳过价格行）；唯一元素零采集。"""
-    from explore_flow import ExploreState, _attach_scope_context, _observe, _parse_elements
+    from explore import ExploreState, _attach_scope_context, _observe, _parse_elements
     pw, browser, page = _launch()
     try:
         page.set_content(
@@ -444,7 +444,7 @@ def test_text_node_scope_resolution():
 
 def test_capture_anchors_text_nodes():
     """采集：重复文本节点（无 role）同样获得容器锚点。"""
-    from explore_flow import ExploreState, _attach_scope_context
+    from explore import ExploreState, _attach_scope_context
     pw, browser, page = _launch()
     try:
         page.set_content(

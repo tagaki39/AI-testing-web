@@ -285,7 +285,7 @@ def test_explore_prompt_example_ref_is_state_scoped():
     真实 E2E 踩坑：示例写页面级 e1，探索决策全部被 _decide 严格校验
     拒绝（元素表里是 obs1:e1）→ 探索 0 步夭折，Planner 只看得到首页。
     """
-    from explore_flow import DECIDE_PROMPT
+    from explore import DECIDE_PROMPT
     assert '"target_ref": "obs1:e1"' in DECIDE_PROMPT
 
 
@@ -311,7 +311,7 @@ def test_origin_guard_tolerates_www_redirect():
     真实 E2E：入口 saucedemo.com 302 → www.saucedemo.com，严格 netloc
     相等把初始重定向当跨域 → go_back 落在 about:blank → 探索彻底失效。
     """
-    from explore_flow import _within_origin
+    from explore import _within_origin
     assert _within_origin("https://www.saucedemo.com/", "https://saucedemo.com")
     assert _within_origin("https://saucedemo.com/", "https://www.saucedemo.com")
     assert _within_origin("https://www.saucedemo.com/inventory.html", "https://saucedemo.com")
@@ -412,7 +412,7 @@ def test_compile_verified_is_not_a_bypass():
 
 def test_goal_requires_actions():
     """动作表命中判定（中文/英文/大小写）。"""
-    from explore_flow import goal_requires_actions
+    from explore import goal_requires_actions
     assert goal_requires_actions("把第一个商品加入购物车") is True
     assert goal_requires_actions("Add to Cart and verify") is True
     assert goal_requires_actions("用 x / y 登录后验证") is True
@@ -421,7 +421,7 @@ def test_goal_requires_actions():
 
 def test_validate_completion_exemption_and_gate():
     """完成校验：无操作目标豁免；有操作目标 <2 步或目标动作未探索 → 拒绝。"""
-    from explore_flow import ExploreState, _validate_completion
+    from explore import ExploreState, _validate_completion
     s = ExploreState(goal="验证页面包含文字 Example Domain", entry_url="https://x.com")
     assert _validate_completion(s) is None          # example.com 单页 0 步豁免
     s = ExploreState(goal="加入购物车", entry_url="https://x.com")

@@ -35,7 +35,7 @@ from ai_agent import (
     SYSTEM_PROMPT, SYSTEM_PROMPT_REFS_ONLY, detect_missing_postconditions,
 )   # noqa: E402
 from dsl import DSLCase, DSLStep   # noqa: E402
-from explore_flow import DECIDE_PROMPT   # noqa: E402
+from explore import DECIDE_PROMPT   # noqa: E402
 
 LEGACY_KEYWORDS = [
     "Wait after state-changing actions",
@@ -199,8 +199,8 @@ def test_decide_prompt_has_state_awareness() -> None:
 def test_decide_history_carries_error() -> None:
     """history 渲染必须带失败原因（error），否则模型无法自纠。"""
     import re
-    # 从 explore_flow 取 history 渲染逻辑做轻量断言：render 里含 "失败"
-    src = open(Path(__file__).resolve().parents[1] / "explore_flow.py",
+    # 从 explore/policy.py 取 history 渲染逻辑做轻量断言：render 里含 "失败"
+    src = open(Path(__file__).resolve().parents[1] / "explore" / "policy.py",
                encoding="utf-8").read()
     assert "失败: {h['error'][:80]}" in src
 

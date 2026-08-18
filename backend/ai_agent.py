@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field, ValidationError
 from compiler import compile_targets
 from dsl import DSLCase, Locator, Scope, validate_case
 from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
-from explore_flow import (
+from explore import (
     GOAL_ACTION_PATTERNS, _ACTION_KEYWORDS, explore,
 )
 import anti_patterns

@@ -1,0 +1,31 @@
+"""
+explore/ — bounded exploration 包（R3 拆分自 explore_flow.py）
+  职责分离：
+    observation.py   状态观察（ARIA → canonical obs id）
+    action_space.py  可操作性候选过滤（Restrict）
+    policy.py        LLM 决策 + 确定性校验
+    explorer.py      主循环（observe → choose → execute → transition）
+"""
+from .observation import (
+    ExploreState, _parse_elements, _record_page, _observe, _safe_title,
+    _attach_scope_context, _observe_until_stable,
+)
+from .action_space import (
+    ACTION_CAPABILITIES, _build_action_space, _locator_for_element,
+    validate_actionability, _validate_action_target,
+    EXPLORE_ACTION_TIMEOUT_MS,
+)
+from .policy import (
+    GOAL_ACTION_PATTERNS, _ACTION_KEYWORDS, goal_requires_actions,
+    _decide, _detect_auth_failure, _is_repeated_no_progress,
+    _validate_completion, DECIDE_PROMPT, EXPLORE_SYSTEM_PROMPT,
+    _elements_to_prompt,
+)
+from .explorer import explore, _act, _within_origin
+
+__all__ = [
+    "ExploreState", "explore", "_decide", "_record_page", "_observe",
+    "_build_action_space", "validate_actionability", "_validate_action_target",
+    "_validate_completion", "_detect_auth_failure", "_is_repeated_no_progress",
+    "GOAL_ACTION_PATTERNS", "_ACTION_KEYWORDS", "DECIDE_PROMPT",
+]
