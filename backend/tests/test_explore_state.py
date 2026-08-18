@@ -197,11 +197,12 @@ def test_h4_button_click_passes() -> None:
 # ── I：E1 Runtime Actionability Guard（A11y 存在 ≠ 当前可操作）───────────────
 
 class _MockLocator2:
-    """可操作性校验用 locator mock（trial click 行为可控）。"""
-    def __init__(self, visible=True, enabled=True, obscured=False):
+    """可操作性校验用 locator mock（elementFromPoint 判定可控）。"""
+    def __init__(self, visible=True, enabled=True, obscured=False, box=None):
         self._visible = visible
         self._enabled = enabled
         self._obscured = obscured
+        self._box = box or {"x": 0, "y": 0, "width": 100, "height": 20}
         self.click_calls = 0
 
     def is_visible(self):
@@ -210,67 +211,83 @@ class _MockLocator2:
     def is_enabled(self):
         return self._enabled
 
-    def click(self, trial=False, timeout=None):
-        self.click_calls += 1
-        if trial and self._obscured:
-            from playwright.sync_api import TimeoutError as PWTimeoutError
-            raise PWTimeoutError("element intercepted by modal")   # Playwright 语义
-        return None
+    def bounding_box(self):
+        return self._box
+
+    def element_handle(self):
+        return object()
+
+
+class _MockPage3:
+    def __init__(self, obscured):
+        self._obscured = obscured
+
+    def evaluate(self, js, arg):
+        return self._obscured
 
 
 def test_i1_obscured_link_rejected() -> None:
     """模态框打开后底层 Add to cart：可见/可用但被遮挡 → TARGET_OBSCURED。"""
     loc = _MockLocator2(visible=True, enabled=True, obscured=True)
-    ok, reason = validate_actionability(loc, "click")
+    ok, reason = validate_actionability(_MockPage3(True), loc, "click")
     assert not ok and reason == "TARGET_OBSCURED"
 
 
 def test_i2_actionable_button_passes() -> None:
     """Continue Shopping（无遮挡）→ 通过。"""
     loc = _MockLocator2(visible=True, enabled=True, obscured=False)
-    ok, reason = validate_actionability(loc, "click")
+    ok, reason = validate_actionability(_MockPage3(False), loc, "click")
     assert ok and reason == ""
 
 
 def test_i3_not_visible_rejected() -> None:
     """不可见 → TARGET_NOT_VISIBLE。"""
     loc = _MockLocator2(visible=False)
-    ok, reason = validate_actionability(loc, "click")
+    ok, reason = validate_actionability(_MockPage3(False), loc, "click")
     assert not ok and reason == "TARGET_NOT_VISIBLE"
 
 
-def test_i4_blacklist_blocks_repeat() -> None:
-    """同一状态同一 ref 失败一次后 → 再选被确定性拒绝（REPEATED_FAILED_ACTION），
-    不再进入浏览器。"""
-    state = ExploreState(goal="buy", entry_url="https://x.com")
-    state.elements = [{"ref": "obs4:e25", "role": "link", "name": "Add to cart"}]
-    state.observations = [{
-        "id": "obs4", "url": "https://x.com", "state_hash": "h",
-        "elements": state.elements,
-    }]
-    state.failed_actions.add(("obs4", "click", "obs4:e25"))
-    def llm(prompt, system_prompt=None):
-        return '{"action": "click", "target_ref": "obs4:e25"}'
-    decision, err = _decide(state, llm)
-    assert decision is None, "黑名单 ref 必须被拒"
-    assert "REPEATED_FAILED_ACTION" in (err or "")
-
-
-def test_i5_blacklist_other_ref_passes() -> None:
-    """黑名单只挡 (obs, action, ref) 精确三元组——其他 ref 照常通过。"""
+def test_i4_blacklist_removed_from_action_space() -> None:
+    """R3（评审瘦身）：失败 ref 从 ActionSpace 候选消失（Restrict——
+    模型没权限选择错误动作），而非"选后再拒"。"""
+    from explore_flow import _build_action_space
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
-        {"ref": "obs4:e24", "role": "button", "name": "Continue Shopping"},
+        {"ref": "obs4:e25", "role": "link", "name": "Add to cart", "actionable": True},
+        {"ref": "obs4:e24", "role": "button", "name": "Continue Shopping", "actionable": True},
     ]
     state.observations = [{
         "id": "obs4", "url": "https://x.com", "state_hash": "h",
         "elements": state.elements,
     }]
-    state.failed_actions.add(("obs4", "click", "obs4:e25"))   # 另一个 ref
+    state.failed_actions.add(("obs4", "click", "obs4:e25"))
+    state.current_obs = "obs4"
+    space = _build_action_space(state)
+    refs = [e["ref"] for e in space]
+    assert "obs4:e25" not in refs, "黑名单 ref 必须从候选消失"
+    assert "obs4:e24" in refs, "未黑名单 ref 保留"
+
+
+def test_i5_blacklisted_ref_rejected_by_validator() -> None:
+    """防御兜底：模型仍输出黑名单 ref → ref 校验拒绝（不在候选表内）。"""
+    state = ExploreState(goal="buy", entry_url="https://x.com")
+    state.elements = [
+        {"ref": "obs4:e25", "role": "link", "name": "Add to cart", "actionable": True},
+        {"ref": "obs4:e24", "role": "button", "name": "Continue Shopping", "actionable": True},
+    ]
+    state.observations = [{
+        "id": "obs4", "url": "https://x.com", "state_hash": "h",
+        "elements": state.elements,
+    }]
+    state.failed_actions.add(("obs4", "click", "obs4:e25"))
+    state.current_obs = "obs4"
     def llm(prompt, system_prompt=None):
-        return '{"action": "click", "target_ref": "obs4:e24"}'
-    decision, err = _decide(state, llm)
-    assert decision is not None, f"未黑名单 ref 被误拒: {err}"
+        return '{"action": "click", "target_ref": "obs4:e25"}'
+    decision, err = _decide(state, llm, elements=[
+        e for e in state.elements if (state.current_obs, "click", e["ref"])
+        not in state.failed_actions])
+    assert decision is None, "黑名单 ref 必须被拒"
+    assert "不在当前元素表" in (err or "")
 
 
 # ── F/G：no-progress guard + auth failure（Transition/Progress Validation）────
@@ -283,6 +300,7 @@ def _progress_state() -> ExploreState:
         "id": "obs2", "url": "https://x.com/login",
         "state_hash": "h", "elements": state.elements,
     }]
+    state.current_obs = "obs2"
     return state
 
 
