@@ -1,0 +1,718 @@
+对，根本上要做的不是“删几个函数”，而是**把现在的“防御式架构”改成“工具式架构”**。
+
+你现在复杂的根源是：
+
+> 一个 LLM 决策错误，会同时触发 actionability、blacklist、rejection、stalled、reachable、G3、regeneration 等多套机制。
+
+而参考项目更接近：
+
+> **Agent 调有限工具 → 工具返回结构化结果 → Agent 再决策；执行可靠性由 Runner / Preflight / Postcondition 负责。**
+
+参考项目的 Planning Agent 本身主要靠 ReAct + tool call，并且只有统一的 `safety_cap` 和重复调用签名防循环；页面探索则独立提供 A11y node、稳定性分数和 verified 标记。
+执行阶段再统一通过 `click_preprocessor`、`PostconditionVerifier` 和 locator confidence 处理浏览器可靠性，而不是把这些东西全部塞进 Explorer。
+
+所以我建议你做 **5 个根本性改变**。
+
+---
+
+## 1. 把 Exploration 从“规则状态机”改成“4 个工具的 ReAct Loop”
+
+现在你的 `explore_flow.py` 越来越像：
+
+```text
+LLM decision
+→ ref validator
+→ capability validator
+→ actionability
+→ blacklist
+→ repeated rejection
+→ no progress
+→ modal
+→ auth
+→ origin
+→ state stabilization
+→ transition
+→ stalled
+```
+
+这条路一定越来越重。
+
+改成只有：
+
+```text
+Planner
+  ↓
+observe()
+act(ref)
+back()
+finish()
+```
+
+核心循环甚至应该只有：
+
+```python
+while budget.ok():
+    observation = explorer.observe()
+
+    decision = planner.choose(
+        goal=goal,
+        observation=observation,
+        last_result=last_result,
+    )
+
+    result = tools.execute(decision)
+
+    if result.done:
+        break
+```
+
+所有工具统一返回：
+
+```python
+class ToolResult:
+    ok: bool
+    code: str | None
+    message: str | None
+    observation_id: str
+```
+
+比如被 modal 挡住：
+
+```json
+{
+  "ok": false,
+  "code": "ACTION_FAILED",
+  "observation_id": "obs4"
+}
+```
+
+就够了。
+
+**不要再发明：**
+
+```text
+TARGET_OBSCURED
+REPEATED_FAILED_ACTION
+MODAL_HINT
+ACTIONABILITY_CHECK_ERROR
+...
+```
+
+至少不要让这些成为主控制流。
+
+参考项目 Agent 的核心也就是 ReAct + planning tools + safety cap，而不是几十种 exploration guard。
+
+---
+
+## 2. 把 Actionability 从 Explorer 移到统一的 Browser Action Executor
+
+这是最值得砍的一块。
+
+你现在：
+
+```text
+Explorer
+→ validate_actionability()
+→ locator
+→ trial
+→ classify
+→ blacklist
+→ _act()
+```
+
+实际上做了两遍执行逻辑。
+
+参考项目这里的思路更合理：
+
+```text
+Agent
+    ↓
+Browser Action Tool
+    ↓
+click_preprocessor
+    ↓
+Playwright click
+```
+
+`click_preprocessor` 统一处理滚动、等待可操作等问题。
+
+你的项目也应该变成：
+
+```python
+result = action_executor.click(ref, timeout=1500)
+```
+
+里面自己：
+
+```python
+locator = resolve(ref)
+
+try:
+    locator.click(timeout=1500)
+    return ToolResult(ok=True)
+except Exception as exc:
+    return ToolResult(
+        ok=False,
+        code="ACTION_FAILED",
+        message=summarize(exc),
+    )
+```
+
+Explorer 不应该知道：
+
+```text
+visible?
+enabled?
+overlay?
+pointer event?
+modal?
+```
+
+这些都是 Browser Action 层的责任。
+
+### 这一步能删掉很多东西
+
+大概率可以逐步删：
+
+```text
+validate_actionability
+_detect_modal_hint
+TARGET_OBSCURED 主流程
+TARGET_DISABLED 主流程
+ACTIONABILITY_CHECK_ERROR
+复杂 blacklist 分类
+```
+
+---
+
+## 3. State Graph 保留，但从“控制系统”降级成“事实记录”
+
+这是最关键的减复杂度措施。
+
+你现在 Graph 被赋予太多职责：
+
+```text
+记录状态
+决定 current state
+决定 Planner 可见状态
+决定 ref 合法性
+决定 reachability
+决定 retry snapshot
+决定 regeneration
+决定 no-progress
+```
+
+所以一次：
+
+```text
+obs6 → obs6
+```
+
+写错，就引爆整个系统。
+
+### 应该改成
+
+**当前状态唯一由 ObservationStore 决定。**
+
+```python
+current_obs = store.observe(page)
+```
+
+Action：
+
+```python
+from_obs = store.current_id
+
+result = action_executor.execute(...)
+
+to_obs = store.observe(page)
+
+if result.ok:
+    graph.record(
+        from_obs,
+        action,
+        to_obs,
+    )
+```
+
+Graph 只回答：
+
+> “历史上确认发生过什么？”
+
+而不是：
+
+> “现在系统必须认为自己在哪里？”
+
+也就是说：
+
+```text
+ObservationStore = runtime truth
+StateGraph       = historical truth
+```
+
+这两个必须分开。
+
+你刚修的：
+
+> `to_obs` 不能用 `observations[-1]`，必须使用 matched observation id
+
+其实已经证明了这个需求。
+
+---
+
+## 4. G3 保留，但从“恢复系统”退回成 Validator
+
+这个我不建议删，因为它是你真正的差异化。
+
+参考项目自己也没有你的 State Grounding Validator；你上传的对照里明确把 State Graph、State Grounding、refs-only Planner 列成你项目独有的部分。
+
+但是现在：
+
+```text
+G3 fail
+→ reachable filtering
+→ special regeneration
+→ repair
+→ G3 again
+```
+
+开始膨胀了。
+
+应该收缩成：
+
+```text
+Planner
+   ↓
+G3
+ ├─ PASS → Compiler
+ └─ FAIL → 整体 Planner retry 一次
+                ↓
+             G3 again
+                ↓
+             fail closed
+```
+
+就这样。
+
+不要：
+
+```text
+StateGroundingMismatchRepairer
+ReachabilityPromptRepair
+special snapshot retry
+```
+
+G3 应该是：
+
+> **assertion/invariant**
+
+不是 Agent。
+
+---
+
+## 5. 把所有 retry 合成一个统一的 `SafetyController`
+
+你现在实际上有很多 retry：
+
+```text
+decision retry
+action retry
+blacklist
+repeated-action rejection
+stalled
+no-progress
+G3 retry
+anti-pattern retry
+repair retry
+```
+
+这才是最深层的复杂度来源。
+
+参考项目在 Agent 层用的反而是很简单的：
+
+> `safety_cap` + tool-call signature 去重。
+
+你完全可以借鉴成：
+
+```python
+class SafetyController:
+    max_llm_calls = 10
+    max_actions = 8
+    max_plan_attempts = 2
+
+    seen_tool_calls: set[str]
+```
+
+signature：
+
+```python
+signature = (
+    current_obs,
+    action,
+    target_ref,
+    value_ref,
+)
+```
+
+如果同一个状态下完全一样的调用出现第二次：
+
+```text
+直接不给执行
+```
+
+但不用再专门发明：
+
+```text
+REPEATED_FAILED_ACTION
+```
+
+Planner 下一次只收到：
+
+```text
+previous tool call failed
+available actions = ...
+```
+
+统一 budget 控制所有错误。
+
+---
+
+# 更重要的一刀：把 Planner 的输入从“元素全集”改成“Page Explorer 输出”
+
+这个会让效果明显更接近参考项目。
+
+参考项目 `page_explorer` 的核心输出不是一坨 DOM，而是：
+
+```text
+A11y node
+node_id
+stable score
+verified
+```
+
+
+
+你现在可以输出：
+
+```json
+{
+  "observation_id": "obs4",
+  "nodes": [
+    {
+      "ref": "obs4:e35",
+      "role": "link",
+      "name": "View Cart",
+      "verified": true
+    },
+    {
+      "ref": "obs4:e36",
+      "role": "button",
+      "name": "Continue Shopping",
+      "verified": true
+    }
+  ]
+}
+```
+
+同时可以有：
+
+```json
+{
+  "role": "link",
+  "name": "Add to cart",
+  "verified": false
+}
+```
+
+或者干脆不进入 Agent action candidates。
+
+### 这比 modal hint 高一个抽象层
+
+不要：
+
+```text
+if modal:
+    tell LLM use Continue Shopping
+```
+
+而是：
+
+```text
+Page Explorer
+→ 只暴露当前 verified/actionable nodes
+```
+
+于是 modal case 自然变成：
+
+```text
+View Cart
+Continue Shopping
+```
+
+LLM 根本看不到被遮挡的 Add to cart。
+
+---
+
+# 最终架构我建议直接向参考项目靠成这样
+
+```text
+                    User Goal
+                        ↓
+               Planning Service
+                        ↓
+          ┌──────── ReAct Agent ────────┐
+          │                             │
+          │  observe_page()             │
+          │  browser_action(ref)        │
+          │  finish()                   │
+          │                             │
+          └─────────────┬───────────────┘
+                        ↓
+                 Exploration Trace
+                        +
+                   State Graph
+                        ↓
+                  DSL Generator
+                        ↓
+              State Grounding G3
+                        ↓
+                    Compiler
+                        ↓
+                 Locator Preflight
+                        ↓
+                     Runner
+              ┌─────────┴─────────┐
+              ↓                   ↓
+       click_preprocessor    Resolver
+              ↓
+           Action
+              ↓
+      PostconditionVerifier
+              ↓
+            Evidence
+```
+
+这其实就是：
+
+**参考项目的结构化分层 + 你的 State Grounding 优势。**
+
+参考项目本身也是把 AI、Explorer、DSL、Runner、Locator 分开的。
+
+---
+
+# 哪些现有模块应该留下
+
+保留：
+
+```text
+Observation State Graph
+State-scoped refs
+State Grounding Validator
+Compiler
+Semantic Resolver
+Corrections
+Metrics
+Data Grounding
+```
+
+这些是项目核心。
+
+收缩：
+
+```text
+explore_flow
+ai_agent
+preflight repair
+```
+
+删除或合并：
+
+```text
+modal hint
+repeated-failed-action 主流程
+复杂 actionability taxonomy
+多个 retry controller
+G3 专用 repair
+各种局部 recovery prompt
+```
+
+暂缓：
+
+```text
+VLM
+SSE
+DB
+Auth
+React
+Postcondition 丰富 schema
+```
+
+不过 **简单版 PostconditionVerifier** 后面值得做，因为参考项目把“动作成功”和“状态真正生效”明确分开，这是执行可靠性里很重要的一层。
+
+---
+
+## `ai_agent.py` 也应该直接拆
+
+这个是代码层第二个根本措施。
+
+参考项目明确：
+
+```text
+services/
+ai/
+runners/
+locators/
+```
+
+职责独立。
+
+你不需要照搬 15 个 route 和 SQLAlchemy，但可以至少变成：
+
+```text
+backend/
+  planning/
+    service.py
+    planner.py
+
+  exploration/
+    explorer.py
+    page_explorer.py
+    observation_store.py
+
+  grounding/
+    validator.py
+    compiler.py
+
+  locators/
+    resolver.py
+    corrections.py
+
+  execution/
+    action_executor.py
+    runner.py
+
+  quality/
+    preflight.py
+```
+
+顶层最终只应该：
+
+```python
+exploration = explorer.run(goal)
+
+plan = planner.generate(
+    goal,
+    exploration,
+)
+
+validate_state_grounding(
+    plan,
+    exploration.graph,
+)
+
+case = compiler.compile(plan)
+
+preflight.validate(case)
+
+return case
+```
+
+如果顶层 orchestration 超过几十行，还在做 candidate extraction、retry、prompt repair，那就是责任又开始泄漏。
+
+---
+
+# 最根本的三个设计原则
+
+如果只记三个，我建议就是这三个：
+
+### ① Restrict, don't repair
+
+不要：
+
+```text
+模型选错
+→ 修复模型输出
+```
+
+而要：
+
+```text
+模型只看到合法选择
+```
+
+---
+
+### ② Execute, don't predict actionability
+
+不要：
+
+```text
+先预测元素能不能点击
+→ 再点击
+```
+
+Explorer 直接短 timeout 执行即可。
+
+可靠的 click preprocessing 放到底层 Browser Action Executor。
+
+---
+
+### ③ One source of truth per concept
+
+严格做到：
+
+```text
+当前页面状态
+→ ObservationStore
+
+历史状态转移
+→ StateGraph
+
+允许的动作
+→ PageExplorer / ActionSpace
+
+定位
+→ Resolver
+
+重试预算
+→ SafetyController
+
+浏览器执行
+→ Runner / ActionExecutor
+```
+
+**任何概念只能有一个模块负责。**
+
+你现在的复杂度主要就是违反了这一条。
+
+---
+
+所以如果让我给你一个真正根本性的重构目标，我会定义成：
+
+> **从 Guard-driven Agent 重构为 Tool-driven Agent。**
+
+当前：
+
+```text
+LLM
+↓
+很多 guard 修正 LLM
+↓
+browser
+```
+
+目标：
+
+```text
+LLM
+↓
+少量、强约束工具
+↓
+每个工具自己保证确定性
+↓
+结构化 ToolResult
+↓
+LLM 再决策
+```
+
+这既能显著降低复杂度，**又会让整体形态更接近你这个参考项目**，同时不需要牺牲你目前最有价值的 `State Graph + State Grounding + refs-only` 三件套。
