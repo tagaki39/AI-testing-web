@@ -420,7 +420,7 @@ def test_goal_requires_actions():
 
 
 def test_validate_completion_exemption_and_gate():
-    """完成校验：无操作目标豁免；有操作目标 <2 步宣告被拒。"""
+    """完成校验：无操作目标豁免；有操作目标 <2 步或目标动作未探索 → 拒绝。"""
     from explore_flow import ExploreState, _validate_completion
     s = ExploreState(goal="验证页面包含文字 Example Domain", entry_url="https://x.com")
     assert _validate_completion(s) is None          # example.com 单页 0 步豁免
@@ -428,7 +428,10 @@ def test_validate_completion_exemption_and_gate():
     s.step_count = 1
     assert _validate_completion(s) is not None      # 1 步宣告 → 拒绝
     s.step_count = 2
-    assert _validate_completion(s) is None          # ≥2 步 → 通过
+    assert _validate_completion(s) is not None      # ≥2 步但 Add to cart 未探索 → 拒绝
+    s.history = [{"action": "click", "target_ref": "obs3:e22",
+                  "target": {"role": "link", "name": "Add to cart"}}]
+    assert _validate_completion(s) is None          # 目标动作已探索 → 通过
 
 
 def test_check_goal_coverage_detects_missing_click():

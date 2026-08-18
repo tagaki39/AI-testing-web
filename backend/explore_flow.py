@@ -180,6 +180,13 @@ GOAL_ACTION_PATTERNS: dict[str, "re.Pattern"] = {
     "checkout": re.compile(r"(结算|下单|checkout)", re.IGNORECASE),
 }
 
+# 动作 label → 探索 history 中必须出现的关键词（target name，casefold 匹配）
+_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "add_to_cart": ("add to cart",),
+    "login": ("login", "sign in"),
+    "checkout": ("checkout",),
+}
+
 
 def goal_requires_actions(goal: str) -> bool:
     """goal 是否要求页面操作（命中动作表任一 pattern）。"""
@@ -197,10 +204,25 @@ def _validate_completion(state: "ExploreState") -> str | None:
     """
     if not goal_requires_actions(state.goal):
         return None
-    if state.step_count >= 2:
-        return None
-    return (f"探索不充分：仅执行 {state.step_count} 步就宣告完成"
-            "（用户目标要求页面操作），请继续探索目标流程")
+    if state.step_count < 2:
+        return (f"探索不充分：仅执行 {state.step_count} 步就宣告完成"
+                "（用户目标要求页面操作），请继续探索目标流程")
+    # R3（BFC 实测）：目标要求的动作类型必须已探索过——模型 3 步
+    # （Products/Polo）就宣告完成，加购/购物车流程全没探索，Planner
+    # 无从生成完整 DSL。goal 命中动作表 → 必须存在对应 click 的证据。
+    for label, pattern in GOAL_ACTION_PATTERNS.items():
+        if not pattern.search(state.goal):
+            continue
+        keywords = _ACTION_KEYWORDS[label]
+        covered = any(
+            h.get("action") == "click" and h.get("target")
+            and any(k in str(h.get("target", {})).lower() for k in keywords)
+            for h in state.history
+        )
+        if not covered:
+            return (f"探索不充分：目标要求 {label} 动作，但探索未执行过"
+                    f"（history 无 {keywords[0]} 的 click）——请继续探索该流程")
+    return None
 
 # 不可逆/危险操作关键词（点击前拦截：删除/支付/提交订单等）
 _DESTRUCTIVE_PATTERNS = (

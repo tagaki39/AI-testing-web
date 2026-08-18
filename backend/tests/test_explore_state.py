@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 from explore_flow import (   # noqa: E402
     ExploreState, _decide, _detect_auth_failure,
     _is_repeated_no_progress, _record_page, _validate_action_target,
-    validate_actionability,
+    _validate_completion, validate_actionability,
 )
 
 
@@ -288,6 +288,42 @@ def test_i5_blacklisted_ref_rejected_by_validator() -> None:
         not in state.failed_actions])
     assert decision is None, "黑名单 ref 必须被拒"
     assert "不在当前元素表" in (err or "")
+
+
+# ── J：完成宣告的完整性校验（BFC 实测：3 步宣告完成，目标动作未探索）─────────
+
+def test_j_completion_rejected_when_action_not_explored() -> None:
+    """goal 要求 add to cart，但 history 无相关 click → 完成宣告被拒。"""
+    state = ExploreState(
+        goal="add to cart the first two products", entry_url="https://x.com",
+    )
+    state.step_count = 3   # 步数够但动作类型没覆盖
+    state.history = [
+        {"action": "click", "target_ref": "obs1:e3", "target": {"role": "link", "name": "Products"}},
+        {"action": "click", "target_ref": "obs2:e15", "target": {"role": "link", "name": "Polo"}},
+    ]
+    err = _validate_completion(state)
+    assert err is not None and "add to cart" in err
+
+
+def test_j2_completion_passes_when_action_explored() -> None:
+    """history 已有 Add to cart click → 完成宣告通过。"""
+    state = ExploreState(
+        goal="add two products to cart", entry_url="https://x.com",
+    )
+    state.step_count = 4
+    state.history = [
+        {"action": "click", "target_ref": "obs1:e3", "target": {"role": "link", "name": "Products"}},
+        {"action": "click", "target_ref": "obs3:e22", "target": {"role": "link", "name": "Add to cart"}},
+    ]
+    assert _validate_completion(state) is None
+
+
+def test_j3_no_action_goal_exempt() -> None:
+    """goal 无操作要求（验证页面文字）→ 豁免。"""
+    state = ExploreState(goal="verify page contains welcome", entry_url="https://x.com")
+    state.step_count = 0
+    assert _validate_completion(state) is None
 
 
 # ── F/G：no-progress guard + auth failure（Transition/Progress Validation）────

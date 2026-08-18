@@ -40,7 +40,9 @@ from pydantic import BaseModel, Field, ValidationError
 from compiler import compile_targets
 from dsl import DSLCase, Locator, Scope, validate_case
 from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
-from explore_flow import GOAL_ACTION_PATTERNS, explore
+from explore_flow import (
+    GOAL_ACTION_PATTERNS, _ACTION_KEYWORDS, explore,
+)
 import anti_patterns
 from grounding import (
     StateGraph, StateGroundingMismatchError, UnknownTargetRefError,
@@ -542,14 +544,6 @@ def check_refs_only(case: DSLCase) -> None:
 
 
 # ── GQ：生成期目标覆盖检查（保守 allowlist，fail-open 只警告）────────────────
-
-# 动作 label → 步骤中必须出现的关键词（target 的 name/text，casefold 匹配）
-_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "add_to_cart": ("add to cart",),
-    "login": ("login", "sign in"),
-    "checkout": ("checkout",),
-}
-
 
 def _check_goal_coverage(goal: str, case: DSLCase) -> list[str]:
     """检查计划是否覆盖 goal 明确要求的动作（GQ 决策 3，可单测）。
