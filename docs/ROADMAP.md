@@ -242,6 +242,35 @@ prompt；summary 为失败计划的行为摘要（actions+targets，脱敏）。
 
 **明确不做**：生成期读修正库提示 Planner；多轮重规划。
 
+### R3 决策记录（Tool-driven 重构，来源 docs/优化.txt 架构评审）
+
+**目标**：从 Guard-driven Agent 重构为 Tool-driven Agent——
+LLM 决策 → 少量强约束工具 → 结构化 ToolResult → LLM 再决策；
+执行可靠性由 Runner/Preflight/Postcondition 负责，不塞进 Explorer。
+
+**三条设计原则（冻结）**：
+1. Restrict, don't repair——模型只看到合法选择，不修模型输出
+2. Execute, don't predict actionability——不预测能否点击，短超时执行，
+   可靠性下沉 Browser Action 层
+3. One source of truth per concept——当前状态→ObservationStore /
+   历史转移→StateGraph / 允许动作→ActionSpace / 定位→Resolver /
+   预算→SafetyController / 浏览器执行→Runner
+
+**里程碑（按序）**：
+| 阶段 | 内容 | 验收 |
+|------|------|------|
+| R3.1 | Actionability 下沉 Browser Action Executor | 探索器不再做 visible/enabled/modal 预测；点击由 executor 短超时执行并返回结构化 ToolResult（✅ 已完成：`backend/execution/action_executor.py`——ToolResult + click_preprocessor + 危险操作闸口；explorer 循环消费结构化结果；顺带修复拆分遗漏的惰性 import bug——NameError 被静默吞掉导致全部元素误标 actionable=False、探索残废；测试 123/123） |
+| R3.2 | SafetyController 统一预算 | 所有 retry（decision/action/G3/anti-pattern）汇入单一预算控制器 + tool-call 签名去重；删除分散的 retry 计数 |
+| R3.3 | G3 纯 Validator 化 | PASS→Compiler / FAIL→整体 Planner retry ×1→fail closed；删除 repair 特例 |
+| R3.4 | ai_agent 拆包 | planning/exploration/grounding/locators/execution/quality 分层；顶层 orchestration ≤ 几十行 |
+| R3.5 | PostconditionVerifier（简单版） | 动作成功与状态生效分离（wait_for 业务 postcondition 的确定性验证） |
+
+**保留（核心，不动）**：Observation State Graph / State-scoped refs /
+State Grounding Validator / Compiler / Semantic Resolver / Corrections /
+Metrics / Data Grounding。
+
+**暂缓**：VLM / SSE / DB / Auth / React / Postcondition 丰富 schema。
+
 ---
 
 ## 6. Demo Feature Backlog（按依赖顺序）

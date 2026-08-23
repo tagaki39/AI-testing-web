@@ -9,9 +9,6 @@ from resolver import LocatorNotFoundError, LocatorAmbiguousError
 from runner import _resolve_locator
 from .observation import ExploreState   # 类型注解（observation 只在函数内 import 本模块，无循环）
 
-# R3（评审"Execute, don't predict"）：探索是快速试错——短超时执行，
-# 失败即记录；正式 Executor 才用长超时严格等待。
-EXPLORE_ACTION_TIMEOUT_MS = 1500
 # 动作能力矩阵（评审 P0-1）：LLM 提议动作，确定性代码决定该动作
 # 对该元素是否结构合法。text 元素（无 role）不在矩阵内 → 任何动作
 # 都被拒（只做 evidence/context，不可作为动作目标——E2E 暴露模型

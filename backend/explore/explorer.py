@@ -8,10 +8,11 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
+from execution.action_executor import execute_action
 from .observation import (
     ExploreState, _observe, _observe_until_stable, _record_page,
 )
-from .action_space import _build_action_space
+from .action_space import _build_action_space, _locator_for_element
 from .policy import (
     _decide, _detect_auth_failure, _is_repeated_no_progress,
     _validate_completion,
@@ -45,49 +46,6 @@ def _within_origin(url: str, entry_url: str) -> bool:
         return host_a == host_b
     except Exception:
         return False
-
-
-def _act(page, decision: dict, elements: list[dict], runtime_inputs: dict) -> str:
-    """执行 LLM 决策的动作，返回动作名。定位失败/执行失败抛异常。
-
-    fill 的值支持 ${var} 占位：LLM 上下文里只有占位符，
-    真实值由 runtime_inputs 在本地注入（敏感信息不进 LLM）。
-    """
-    action = decision.get("action")
-    value = decision.get("value") or ""
-
-    if action == "back":
-        page.go_back()
-        return action
-
-    # ref → 元素信息 → 语义定位器
-    ref = decision.get("target_ref")
-    element = next((e for e in elements if e["ref"] == ref), None)
-    if element is None:
-        raise ValueError(f"未知 target_ref: {ref}")
-    target, scope, locator = _locator_for_element(page, element)
-    # I1：身份证据前移——探索时 count==1 命中即标 verified
-    #（证据不是豁免，运行时仍过三分法 + 评分；供 Compiler/metrics 使用）
-    for e in elements:
-        if e["ref"] == ref:
-            e["verified"] = True
-            break
-
-    if action == "click":
-        # 危险操作二次拦截（第 6 项：代码层，不只靠 Prompt）——
-        # 目标名称含删除/支付/提交订单等关键词 → 拒绝执行
-        name = element.get("name", "") if element else ""
-        if any(p in name.lower() for p in _DESTRUCTIVE_PATTERNS):
-            raise ValueError(f"危险操作被拦截: {name!r}")
-        locator.click(timeout=EXPLORE_ACTION_TIMEOUT_MS)   # 探索短超时快速试错
-    elif action == "fill":
-        locator.fill(_substitute(value, runtime_inputs) or "")
-    elif action == "press":
-        locator.press(_substitute(value, runtime_inputs) or "Enter",
-                      timeout=EXPLORE_ACTION_TIMEOUT_MS)
-    else:
-        raise ValueError(f"不支持的探索动作: {action}")
-    return action
 
 
 # ── 主入口 ──────────────────────────────────────────────────────────────────────
@@ -177,31 +135,58 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             # G2：动作前状态（transition 的 from）
             from_obs = state.current_obs
 
-            # R3（评审 "Execute, don't predict"）：不做执行前可操作性
-            # 预测——ActionSpace 已在决策候选层用观察期 actionable 标记
-            # 过滤（Restrict）。这里直接短超时执行，失败即记录黑名单。
+            # R3.1：Browser Action Executor——locator 由调用方（Resolver）
+            # 解析，执行层返回结构化 ToolResult（不抛异常）；
+            # 失败统一黑名单化（同状态同 ref 不再重试撞墙）。
             t0 = perf_counter()
-            try:
-                action_done = _act(page, decision, state.elements, runtime_inputs or {})
-                state.history.append({
-                    "url": state.current_url,
-                    "action": decision["action"],
-                    "target_ref": ref,
-                    "target": target,          # 解析后的 target（Planner 可读）
-                    "value": decision.get("value"),
-                })
-            except Exception as exc:
-                action_done = None
-                # E1：执行失败也进黑名单（同状态同 ref 不再重试撞墙）
-                if from_obs:
-                    state.failed_actions.add((from_obs, decision.get("action"), ref))
-                state.history.append({
-                    "url": state.current_url,
-                    "action": decision.get("action"),
-                    "target_ref": ref,
-                    "target": target,
-                    "error": str(exc)[:100],
-                })
+            locator = None
+            action_done = None
+            if element is not None:
+                try:
+                    _, _, locator = _locator_for_element(page, element)
+                    # I1：身份证据前移——探索时 count==1 命中即标 verified
+                    for e in state.elements:
+                        if e["ref"] == ref:
+                            e["verified"] = True
+                            break
+                except Exception as exc:
+                    # 定位解析失败与执行失败同口径：黑名单 + 历史记录
+                    if from_obs:
+                        state.failed_actions.add((from_obs, decision.get("action"), ref))
+                    state.history.append({
+                        "url": state.current_url,
+                        "action": decision.get("action"),
+                        "target_ref": ref,
+                        "target": target,
+                        "error": f"LOCATOR_FAILED: {str(exc)[:100]}",
+                    })
+            if decision.get("action") == "back" or locator is not None:
+                result = execute_action(
+                    page, action=decision["action"], locator=locator,
+                    value=decision.get("value"),
+                    element_name=(element or {}).get("name", "") if element else "",
+                    runtime_inputs=runtime_inputs or {},
+                )
+                if result.ok:
+                    action_done = decision["action"]
+                    state.history.append({
+                        "url": state.current_url,
+                        "action": decision["action"],
+                        "target_ref": ref,
+                        "target": target,          # 解析后的 target（Planner 可读）
+                        "value": decision.get("value"),
+                    })
+                else:
+                    if from_obs:
+                        state.failed_actions.add((from_obs, decision.get("action"), ref))
+                    state.history.append({
+                        "url": state.current_url,
+                        "action": decision.get("action"),
+                        "target_ref": ref,
+                        "target": target,
+                        "error": (f"{result.code}: {result.message}"
+                                  if result.code else (result.message or "")),
+                    })
             state.timings["browser_action_ms"] += int((perf_counter() - t0) * 1000)
 
             state.step_count += 1

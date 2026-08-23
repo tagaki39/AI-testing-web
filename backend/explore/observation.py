@@ -234,6 +234,11 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     # 只做 elementFromPoint 毫秒级判断，绝不 trial（全量 trial 会
     # 被遮挡元素拖到秒级）。允许 false positive（执行失败再删 candidate）。
     t_as = perf_counter()
+    # 惰性导入（R3.1 修复）：action_space 依赖本模块的 ExploreState
+    #（类型注解），模块级导入会成环。拆分时漏掉的 import 导致 NameError
+    # 被 except 静默吞掉——全部元素被误标 actionable=False，
+    # ActionSpace 过滤所有 role 元素 → 探索残废（实测 actionable=True: 0）。
+    from .action_space import _locator_for_element, validate_actionability
     for e in state.elements:
         if "role" in e:
             try:
