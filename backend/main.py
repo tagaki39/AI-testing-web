@@ -47,10 +47,10 @@ from pydantic import BaseModel
 
 # 本项目模块（注意：现在才 import，.env 已加载完毕）
 from ai_agent import generate_dsl
-from corrections import list_all, upsert
+from locator.corrections import list_all, upsert
 from dsl import DSLCase, Locator, validate_case
-from resolver import target_key
-from runner import execute_case
+from locator.resolver import target_key
+from execution.runner import execute_case
 
 # ── App ────────────────────────────────────────────────────────────────────────
 

@@ -5,8 +5,8 @@ action_space.py — 可操作性候选过滤（R3 拆分自 explore_flow）
   决策候选直接过滤。cheap filter should be cheap, not perfect——
   执行失败再删 candidate（failed_actions）。
 """
-from resolver import LocatorNotFoundError, LocatorAmbiguousError
-from runner import _resolve_locator
+from locator.resolver import LocatorNotFoundError, LocatorAmbiguousError
+from execution.runner import _resolve_locator
 from .observation import ExploreState   # 类型注解（observation 只在函数内 import 本模块，无循环）
 
 # 动作能力矩阵（评审 P0-1）：LLM 提议动作，确定性代码决定该动作

@@ -30,7 +30,7 @@ action_executor.py — Browser Action Executor（R3.1：统一浏览器动作执
 
 from dataclasses import dataclass
 
-from runner import _substitute
+from execution.runner import _substitute
 
 # 探索动作短超时（快速试错：失败即黑名单化，不长时间等待）
 EXPLORE_ACTION_TIMEOUT_MS = 1500

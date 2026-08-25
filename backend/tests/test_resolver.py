@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
-from resolver import (   # noqa: E402
+from locator.resolver import (   # noqa: E402
     LowConfidenceError, ParsedTarget, build_locator_candidates,
     build_locator_exact_first, build_locator_for_count,
     decorated_name_pattern, is_navigation_name, parse_target, snapshot_match,
@@ -227,8 +227,8 @@ def test_resolve_locator_ambiguous_not_notfound():
     真实 E2E：products 页 N 个 View Product 链接，Runner 报
     "所有定位策略均未命中"——元素明明存在，错误语义误导排查。
     """
-    from runner import _resolve_locator
-    from resolver import LocatorAmbiguousError
+    from execution.runner import _resolve_locator
+    from locator.resolver import LocatorAmbiguousError
     pw, browser, page = _launch()
     try:
         page.set_content('<button>Add to cart</button>\n<button>Add to cart</button>')
@@ -251,7 +251,7 @@ def test_resolve_locator_ambiguous_not_notfound():
 
 def test_scoring_stronger_strategy_wins():
     """test_id(100) 命中 + text(60) 命中不同元素 → margin 40 → 接受 test_id。"""
-    from runner import _resolve_locator
+    from execution.runner import _resolve_locator
     pw, browser, page = _launch()
     try:
         page.set_content(
@@ -269,7 +269,7 @@ def test_scoring_stronger_strategy_wins():
 
 def test_margin_gate_rejects():
     """test_id + test_id_attr 各命中不同元素 → margin 5 < 20 → LowConfidence。"""
-    from runner import _resolve_locator
+    from execution.runner import _resolve_locator
     pw, browser, page = _launch()
     try:
         page.set_content(
@@ -288,7 +288,7 @@ def test_margin_gate_rejects():
 
 def test_weak_winner_rejected():
     """css(30) 命中 + text(60) ×2 → 弱胜强证据存在 → LowConfidence。"""
-    from runner import _resolve_locator
+    from execution.runner import _resolve_locator
     pw, browser, page = _launch()
     try:
         page.set_content(
@@ -307,7 +307,7 @@ def test_weak_winner_rejected():
 
 def test_fuzzy_commonality_does_not_block_exact():
     """role(90) 命中 + role_fuzzy(50) ×2 → margin 40 → 接受 exact。"""
-    from runner import _resolve_locator
+    from execution.runner import _resolve_locator
     pw, browser, page = _launch()
     try:
         page.set_content(
@@ -325,7 +325,7 @@ def test_fuzzy_commonality_does_not_block_exact():
 
 def test_same_element_dedup_preserved():
     """scope 多容器同策略命中 → 仍走 dedup 消歧（R2 不破坏既有行为）。"""
-    from runner import _resolve_locator
+    from execution.runner import _resolve_locator
     pw, browser, page = _launch()
     try:
         page.set_content(
@@ -346,7 +346,7 @@ def test_same_element_dedup_preserved():
 
 def test_low_confidence_is_ambiguous_subclass():
     """LowConfidenceError 继承 LocatorAmbiguousError（既有 catch 兼容）。"""
-    from resolver import LocatorAmbiguousError
+    from locator.resolver import LocatorAmbiguousError
     assert issubclass(LowConfidenceError, LocatorAmbiguousError)
 
 
@@ -399,7 +399,7 @@ def test_attach_scope_context_duplicates_only():
 
 def test_text_candidates_strip_icon_prefix():
     """图标前缀文本：候选含 text_clean 变体（PUA 在 CSS 伪元素，DOM 无）。"""
-    from resolver import RELAXATION_GROUP_OF, STRATEGY_SCORES
+    from locator.resolver import RELAXATION_GROUP_OF, STRATEGY_SCORES
     pw, browser, page = _launch()
     try:
         page.set_content('<a class="add">Add to cart</a>\n<a class="add">Add to cart</a>')
@@ -420,7 +420,7 @@ def test_text_candidates_strip_icon_prefix():
 
 def test_text_node_scope_resolution():
     """文本节点 + 编译 scope：图标前缀文本在容器内唯一命中（I1 完整闭环）。"""
-    from runner import _resolve_locator
+    from execution.runner import _resolve_locator
     pw, browser, page = _launch()
     try:
         page.set_content(

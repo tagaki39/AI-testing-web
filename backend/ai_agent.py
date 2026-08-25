@@ -49,7 +49,7 @@ from grounding import (
     UnreachableObservationError, _reachable_observations,
     validate_state_grounding,
 )
-from resolver import (
+from locator.resolver import (
     PRICE_RE, build_locator_exact_first, build_locator_for_count,
     choose_scope_text, is_navigation_target, parse_target, snapshot_match,
 )

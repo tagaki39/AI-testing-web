@@ -35,7 +35,7 @@ from grounding import (   # noqa: E402
     GraphElement, GraphObservation, GraphTransition, StateGraph,
     UnknownTargetRefError, validate_state_grounding,
 )
-from runner import ensure_executable_targets   # noqa: E402
+from execution.runner import ensure_executable_targets   # noqa: E402
 
 
 # ── 夹具（与 test_grounding.py 同形的最小图）───────────────────────────────────

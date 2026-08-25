@@ -42,9 +42,9 @@ from uuid import uuid4
 
 from playwright.sync_api import sync_playwright, expect
 
-from corrections import find_enabled, record_failure, record_success
+from locator.corrections import find_enabled, record_failure, record_success
 from dsl import DSLCase, DSLStep
-from resolver import (
+from locator.resolver import (
     LocatorAmbiguousError, LocatorNotFoundError, LowConfidenceError,
     ParsedTarget, build_locator_candidates, build_locator_for_count,
     business_identity, decide_resolution, parse_target, target_key,

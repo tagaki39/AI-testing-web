@@ -8,8 +8,8 @@ import re
 from dataclasses import dataclass, field
 from time import perf_counter
 
-from resolver import PRICE_RE, _strip_leading_decoration, choose_scope_text
-from runner import _resolve_locator
+from locator.resolver import PRICE_RE, _strip_leading_decoration, choose_scope_text
+from execution.runner import _resolve_locator
 
 _MAX_SNAPSHOT_CHARS = 6000   # 裁剪后快照的最终兜底上限（重组后仍超限才截断）
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史

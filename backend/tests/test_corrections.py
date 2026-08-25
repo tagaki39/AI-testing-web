@@ -24,9 +24,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
-import corrections as store   # noqa: E402
+from locator import corrections as store   # noqa: E402
 from dsl import Locator, validate_case   # noqa: E402
-from resolver import target_key   # noqa: E402
+from locator.resolver import target_key   # noqa: E402
 
 
 # ── 夹具：把 store 重定向到临时文件 ──────────────────────────────────────────
@@ -138,7 +138,7 @@ def _launch():
 
 def test_correction_candidate_resolves():
     """correction 唯一命中 → resolved_by=correction（不绕过：仍走统一裁决）。"""
-    from runner import _resolve_locator
+    from execution.runner import _resolve_locator
     tmp = _tmpdir()
     _reset_store(tmp)
     pw, browser, page = _launch()
@@ -154,8 +154,8 @@ def test_correction_candidate_resolves():
 
 def test_correction_stale_falls_back():
     """correction 过期（0 命中）→ 落回标准候选 → NotFound（中性 miss）。"""
-    from runner import _resolve_locator
-    from resolver import LocatorNotFoundError
+    from execution.runner import _resolve_locator
+    from locator.resolver import LocatorNotFoundError
     tmp = _tmpdir()
     _reset_store(tmp)
     pw, browser, page = _launch()
@@ -174,8 +174,8 @@ def test_correction_stale_falls_back():
 
 def test_correction_ambiguous_is_neutral_miss():
     """correction 歧义（2 命中）→ 自然跳过，报 Ambiguous（与普通歧义一致）。"""
-    from runner import _resolve_locator
-    from resolver import LocatorAmbiguousError
+    from execution.runner import _resolve_locator
+    from locator.resolver import LocatorAmbiguousError
     tmp = _tmpdir()
     _reset_store(tmp)
     pw, browser, page = _launch()
