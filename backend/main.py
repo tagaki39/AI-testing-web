@@ -102,6 +102,7 @@ def api_generate(req: GenerateRequest):
     meta.snapshot_used 表示 AI 是否参考了真实页面结构（ARIA 快照）。
     AI 生成失败（网络/校验）→ HTTP 400 + 错误信息。
     """
+    meta: dict | None = None
     try:
         case, meta = generate_dsl(req.prompt)
         pf = meta.get("preflight") or {}
@@ -124,6 +125,14 @@ def api_generate(req: GenerateRequest):
         })
         return _json_utf8({"ok": True, "case": case.model_dump(), "meta": meta})   # 模型 → dict → JSON
     except Exception as exc:
+        # 失败轮次也要记录（可观测性：异常路径不记录 = 失败无数据，
+        # 无法分析失败成本/耗时构成——之前 400 轮次全部丢失）
+        _append_timing({
+            "type": "generate",
+            "error": str(exc)[:200],
+            "timings": meta.get("timings") if meta else None,
+            "explore": meta.get("explore") if meta else None,
+        })
         raise HTTPException(status_code=400, detail=f"AI 生成失败: {str(exc)[:300]}")
 
 
