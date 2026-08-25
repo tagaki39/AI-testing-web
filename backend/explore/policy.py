@@ -68,10 +68,11 @@ GOAL_ACTION_PATTERNS: dict[str, "re.Pattern"] = {
 }
 
 # 动作 label → 探索 history 中必须出现的关键词（target name，casefold 匹配）
+# 真实网站验证（xywhaigc 登录页按钮是中文"登录"）：必须覆盖中英文。
 _ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "add_to_cart": ("add to cart",),
-    "login": ("login", "sign in"),
-    "checkout": ("checkout",),
+    "add_to_cart": ("add to cart", "加入购物车", "加入購物車"),
+    "login": ("login", "sign in", "登录", "登陆", "登入"),
+    "checkout": ("checkout", "结算", "结账", "去结算"),
 }
 
 
@@ -103,7 +104,11 @@ def _validate_completion(state: "ExploreState") -> str | None:
         keywords = _ACTION_KEYWORDS[label]
         covered = any(
             h.get("action") == "click" and h.get("target")
-            and any(k in str(h.get("target", {})).lower() for k in keywords)
+            # 两边去空白后匹配（真实网站验证：登录按钮 name 是 "登 录"、
+            # "Add to cart" 关键词自身含空格——只去一侧会漏配）
+            and any(k.replace(" ", "")
+                    in str(h.get("target", {})).lower().replace(" ", "")
+                    for k in keywords)
             for h in state.history
         )
         if not covered:
@@ -111,7 +116,6 @@ def _validate_completion(state: "ExploreState") -> str | None:
                     f"（history 无 {keywords[0]} 的 click）——请继续探索该流程")
     return None
 
-# 不可逆/危险操作关键词（点击前拦截：删除/支付/提交订单等）
 def _elements_to_prompt(elements: list[dict], state: "ExploreState | None" = None) -> str:
     """元素表 → 决策上下文（紧凑格式）。
 
