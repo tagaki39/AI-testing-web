@@ -1706,7 +1706,11 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 if explore_result.get("done") or explore_result.get("steps_used", 0) >= 2:
                     cache_save(entry_url, auth_profile, _sanitize_for_cache(explore_result, runtime_inputs))
             except Exception:
-                explore_result = None   # 探索异常 → 降级无快照生成
+                # R4（评审）：探索失败不再静默降级 legacy——Grounded mode
+                # 下 Explore fail → generate fail（fail honestly）。
+                # 维护两条生成路径（grounded/legacy）的隐形复杂度大于
+                # 降级带来的可用性；无 entry_url 的 legacy 在上层显式处理。
+                raise
     explore_ms = int((perf_counter() - t_explore) * 1000)
 
     # E1（评审收紧）：探索异常不得静默冒充 grounded 成功——显式暴露
