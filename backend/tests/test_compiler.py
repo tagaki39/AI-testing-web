@@ -492,13 +492,11 @@ def test_anti_patterns_store():
 
 
 def test_build_retry_hint():
-    """重生提示包含失败原因 + 负例；无负例时有"暂无"。"""
+    """重生提示只带失败原因（R4：不做负例 few-shot 注入）。"""
     from ai_agent import _build_retry_hint
-    hint = _build_retry_hint("目标要求 add_to_cart 动作", ["计划: click(Cart)"])
-    assert "add_to_cart" in hint and "计划: click(Cart)" in hint
+    hint = _build_retry_hint("目标要求 add_to_cart 动作")
+    assert "add_to_cart" in hint
     assert "重新规划提示" in hint and "完整修正后的 JSON" in hint
-    empty = _build_retry_hint("x", [])
-    assert "（暂无）" in empty
 
 
 def test_goal_coverage_error_and_reason_mapping():

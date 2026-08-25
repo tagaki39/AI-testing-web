@@ -62,6 +62,10 @@ API_KEY = os.getenv("AI_API_KEY", "")
 BASE_URL = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1")
 MODEL = os.getenv("AI_MODEL", "deepseek-chat")
 
+# R4（评审）：Preflight 从 hard gate 降级为 optional diagnostics——
+# 运行时 Resolver 才是定位权威；默认关闭，调试时临时开启。
+GENERATE_PREFLIGHT = False
+
 # ── Prompt（约束 LLM 输出符合格式的 JSON）──────────────────────────────────────
 # 这段提示词是"AI 生成质量的第一个保障"：
 #   - 给出完整的 JSON 示例（few-shot 示范）
@@ -677,16 +681,14 @@ def _plan_summary(case: DSLCase | None, error_info: str) -> str:
     return f"计划: {steps} | 错误: {error_info[:160]}"
 
 
-def _build_retry_hint(error_info: str, patterns: list[str]) -> str:
-    """重生提示：上次失败原因 + 反模式负例（可单测）。"""
-    lines = [
-        "\n\n【重新规划提示】上一次生成失败，必须修正：",
-        f"- {error_info}",
-        "同类失败案例（不得重复犯）：",
-    ]
-    lines += [f"- {p}" for p in patterns] if patterns else ["- （暂无）"]
-    lines.append("请重新输出完整修正后的 JSON。")
-    return "\n".join(lines)
+def _build_retry_hint(error_info: str) -> str:
+    """重生提示：上次失败原因（R4：不做负例 few-shot 注入——
+    格式错 retry、grounding 错 replan、仍错 fail honestly）。"""
+    return (
+        "\n\n【重新规划提示】上一次生成失败，必须修正：\n"
+        f"- {error_info}\n"
+        "请重新输出完整修正后的 JSON。"
+    )
 
 
 def _generate_planner_case(
@@ -1806,8 +1808,10 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         return case, planner_meta, removed, compile_stats
 
     # ── GQ2 自愈重生（bounded ×1；网络异常不捕获，仍 fail safely）──────
-    # 失败 → 记录反模式 → 负例 few-shot + 上次错误注入重生 prompt
+    # R4（评审）：失败 → 记录反模式（诊断）→ 上次错误注入重生 prompt
     # （复用探索结果，不重新探索）→ 二次失败 → 异常冒出 → api 400。
+    # 不做负例 few-shot 注入——格式错 retry、grounding 错 replan、
+    # 仍错 fail honestly，三层结果就够（反模式库保留作 diagnostics）。
     generation_retries = 0
     anti_pattern_used = 0
     try:
@@ -1817,8 +1821,6 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         reason = _failure_reason_code(exc)
         failed_case = exc.case if isinstance(exc, GoalCoverageError) else None
         anti_patterns.record(reason, _plan_summary(failed_case, str(exc)))
-        patterns = anti_patterns.list_for(reason)
-        anti_pattern_used = len(patterns)
         generation_retries = 1
         # P0-4：grounding 错位时告诉重生 Planner"当前推导状态 + 允许引用
         # 哪个状态"——Planner 在 expected 状态内重选 ref（不跨状态/不编造）。
@@ -1841,7 +1843,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 retry_pages = [p for p in pages if p["id"] in reach]
                 retry_tables = _pages_to_text(retry_pages) if retry_pages else None
         case, planner_meta, removed_assertions, compile_stats = attempt(
-            grounded_prompt + _build_retry_hint(str(exc), patterns) + extra,
+            grounded_prompt + _build_retry_hint(str(exc)) + extra,
             tables=retry_tables,
         )
     planner_ms = int((perf_counter() - t_planner) * 1000)
@@ -1879,8 +1881,12 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     }
 
     # ── 阶段 4：Page-aware Preflight（按 observation_ref 验证 + 分层修复）─
+    # R4（评审）：Preflight 从 hard gate 降级为 optional diagnostics——
+    # 运行时 Resolver 才是定位权威（0/1/N + confidence）；探索快照模拟
+    # runtime locator 曾多次制造假阳性 bug。正式主链：G3 → Compiler →
+    # Runner/Resolver。调试时可临时开 GENERATE_PREFLIGHT。
     t_preflight = perf_counter()
-    if pages:
+    if pages and GENERATE_PREFLIGHT:
         urls = [p["url"] for p in pages]
         # 只要跑了 Preflight 就始终返回 stats（修复：不再按条件访问
         # 可能不存在的 key——避免 repairs=0 时 KeyError）
