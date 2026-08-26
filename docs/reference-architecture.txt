@@ -1,0 +1,150 @@
+══════════════════════════════════════════════════════════════════════
+AI 驱动 Web UI 测试平台——完整架构文字版说明
+══════════════════════════════════════════════════════════════════════
+说明: 仓库为前后端分离结构 —— FastAPI + SQLAlchemy + Alembic + Playwright Runner 后端，
+      React + TypeScript + Vite 前端，docs 承载产品/设计/执行/缺陷文档。
+
+──────────────────────────────────────────────────────────────────────
+一、端到端流水线（总览图）
+──────────────────────────────────────────────────────────────────────
+
+用户输入（自然语言测试需求，前端 PlanningPage）
+   ↓  POST /api/v1/ai-planning/sessions（SSE 流式）
+AI Planning Session（多轮会话，可追问"第 6 项"）
+   │
+   ├─ test_planning_agent（ReAct 循环：Reason → Act → Observe）
+   │    ├─ 工具调用（planning_tools：探索/生成/校验工具）
+   │    ├─ 会话记忆（ai_planning_message 持久化）
+   │    ├─ safety_cap（工具调用轮次上限，去重签名防重复调用）
+   │    └─ 产出 scenarios（测试场景列表）→ 用户确认选择
+   │
+   ├─ page_explorer（按需探索被测页面）
+   │    ├─ CDP Accessibility Tree（a11y_nodes）—— v2 主线
+   │    ├─ 元素稳定性评分（stable=0.xx，低分标记）
+   │    ├─ node_id 引用 + verified 标记
+   │    └─ 探索缓存（多页面快照复用）
+   │
+   └─ dsl_generator（NL → 结构化 DSL）
+        ├─ 上下文注入（页面快照 + 测试数据 + 变量契约）
+        ├─ governance 规则（action 白名单 / 字段约束 / 反模式）
+        ├─ 修复轮（anti-pattern 分类：missing_wait_for / wrong_page_state / ...）
+        └─ Pydantic 强校验 + 归一化（target↔value 错位自动修正等）
+   ↓
+DSL 草案 → 前端审阅（可人工编辑）→ 保存为 TestCase（DB）
+   ↓  用户点击执行（SSE 流式进度）
+Playwright Runner（执行引擎，sync + streaming 双模式）
+   │
+   ├─ click_preprocessor（点击预处理：滚动/等待可操作）
+   ├─ PostconditionVerifier（动作前捕获 url/dom_hash/input_values，
+   │    动作后验证声明式 Postcondition）
+   ├─ locator_confidence（候选定位器置信度评分）
+   └─ 5-Tier Locator Fallback（逐级降级）：
+        T0  locators/corrections —— 历史人工修正优先匹配
+        T1  locators/semantic   —— A11y 候选（role/name）+ DOM 语义
+              （text_parent_chain / element_id / CSS / XPath）
+        T2  （T1 的 DOM 语义扩展层）
+        T3  locators/ai_visual  —— VLM 视觉定位（默认禁用，opt-in）
+        T4  locators/fallback   —— 抛 InterventionNeededError + 采集 DOM 快照
+   ↓
+Evidence 收集（每步：截图 / console / network）
+   ↓
+TestCaseRun 持久化（SQLAlchemy）+ JSON 报告（reporters/json_report）
+   ↓
+前端 ReportPage / ExecutionDetailPage 展示（每步状态 + 截图 + 耗时）
+   ↓
+用户反馈 → 失败步骤 → 人工提交修正 → LocatorCorrection 入库
+   ↓
+（闭环）下次执行 Tier 0 优先命中该修正
+
+──────────────────────────────────────────────────────────────────────
+二、分层详细说明
+──────────────────────────────────────────────────────────────────────
+
+【前端层】frontend/（React + TS + Vite + Ant Design + TanStack Query）
+  app/AppRouter.tsx      路由（懒加载）
+  pages/                 PlanningPage / CasesPage / ReportPage /
+                         ExecutionDetailPage / CaseEditPage
+  components/            AITestPlanningPanel / ChatInput / StepList / InterventionPanel
+  services/api.ts        REST 客户端（fetch 封装）
+  services/sseClient.ts  SSE 客户端（POST + ReadableStream + AbortSignal）
+  layouts/               AppLayout / NotebookLMLayout（三栏布局）
+  注意：前端不含任何测试执行逻辑——后端是结果的唯一事实源。
+
+【API 层】backend/app/api/（15 个路由模块，薄路由）
+  auth / cases / executions / corrections / dsl / ai-planning /
+  projects / reports / artifacts / health ...
+  全部为薄处理：参数校验 → 服务层 → 响应。执行逻辑不在路由层。
+
+【服务层】backend/app/services/（业务逻辑）
+  ai_planning.py             AI 规划核心（最大服务）
+  ai_planning_streaming.py   SSE 流式（CancellationManager、事件格式化）
+  executions.py              执行编排（提交/取消/状态）
+  dsl.py / cases.py          用例 CRUD + DSL 校验边界
+  corrections.py             人工定位修正（Tier 0 数据源）
+  auth.py                    会话认证
+  project_management.py      多项目隔离
+  report_preferences.py      报告偏好
+  settings.py                环境配置（.env，lru_cache）
+  sse_event_log.py           SSE 事件日志
+
+【AI 层】backend/app/ai/（生成智能）
+  test_planning_agent.py     ReAct 会话式规划 agent（工具调用循环）
+  planning_tools.py          工具实现（探索/生成/校验）
+  dsl_generator.py           NL→DSL 生成（governance + 修复轮 + 归一化）
+  page_explorer.py           页面结构探索（A11y 树 + 稳定性评分 + 探索缓存）
+  locator_preflight.py       执行前定位验证（候选提取 + 稳定性 + 修复）
+
+【执行层】backend/app/runners/
+  playwright_runner.py       执行引擎（同步 + 流式，证据收集）
+  click_preprocessor.py      点击预处理
+  postcondition_verifier.py  动作后状态验证（Postcondition 声明）
+  locator_confidence.py      定位置信度评分（分档 + 阈值）
+
+【定位层】backend/app/locators/（5 层混合定位）
+  corrections.py   T0：历史人工修正（优先级匹配，业务知识沉淀）
+  semantic.py      T1-2：A11y 候选 + DOM 语义（text_parent_chain /
+                   element_id / CSS / XPath；input 无名时 a11y_label_sibling）
+  ai_visual.py     T3：VLM 视觉定位（默认关闭）
+  fallback.py      T4：抛干预异常 + 采集 DOM 快照（人工接管）
+  url_pattern.py   URL 模式匹配辅助
+
+【数据层】backend/app/models/（SQLAlchemy 2.x ORM）
+  test_case / test_case_run / locator_correction /
+  ai_planning_session / ai_planning_draft / ai_planning_message /
+  project / dsl_generation_run / dsl_anti_pattern
+  迁移：Alembic（SQLite 本地开发 / PostgreSQL 生产设计）
+
+【报告/可观测性】
+  reporters/json_report.py    JSON 报告生成
+  artifacts/                  执行截图等证据文件
+  backend_structured.log      JSONL 结构化日志（4 类：
+                              ai_thinking / tool_call / dsl_execution / locator_fallback）
+                              可用 jq 过滤查询
+
+──────────────────────────────────────────────────────────────────────
+三、关键机制
+──────────────────────────────────────────────────────────────────────
+
+1. SSE 流式（非 WebSocket）：所有 AI 规划操作 POST + text/event-stream；
+   前端 AbortController 取消 → POST .../cancel → CancellationManager。
+
+2. A11y 树驱动（v2 主线）：DOM 元素路径全部封杀——AI 只见
+   role="name" 格式的 a11y 节点；快照 7-26kB（DOM 的 1/22-1/38），
+   探索 19-61ms（DOM 的 1/100-1/250）。
+
+3. 5 层定位降级：T0 人工修正（学习历史）→ T1-2 语义 → T3 视觉（可选）
+   → T4 干预（诚实失败 + DOM 快照给人工）。
+
+4. Postcondition 验证：动作执行前捕获 url/dom_hash/visible_texts/
+   input_values，执行后验证声明的 Postcondition——动作成功 ≠ 状态生效。
+
+5. 修复轮（anti-pattern 分类）：DSL 生成失败按
+   missing_navigation / missing_wait_for / missing_input_before_assert /
+   missing_capture_text / target_not_found / missing_step / wrong_page_state
+   分类注入修复提示，带教训重来。
+
+6. Governance：AI 生成不能绕过 DSL 校验；输出 metadata
+   （warnings / normalization_notes / generation_meta）全程可审计。
+
+7. 变量契约（input_contract）：所有可变输入 ${var} 声明化；
+   secret 值执行时本地注入，LLM 上下文只见占位符。
