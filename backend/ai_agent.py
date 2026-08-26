@@ -382,6 +382,10 @@ def _resolve_url_by_regex(prompt: str) -> str | None:
         return None
 
     value = match.group(0).strip()
+    # 真实网站验证（xywhaigc）："login," 尾随逗号被当路径——
+    # goto 到非标准路径触发 SPA guard 异常重定向 → redirect=/login →
+    # 登录成功 push 回 /login → 404。提取后清理尾随标点。
+    value = value.rstrip(" ,.;:，。；：")
     if not value.startswith(("http://", "https://")):
         value = "https://" + value
 
@@ -563,7 +567,8 @@ def _check_goal_coverage(goal: str, case: DSLCase) -> list[str]:
         parsed = parse_target(step.target)
         if parsed is None:
             return ""
-        return f"{parsed.name or ''} {parsed.text or ''}".strip().casefold()
+        # 去空白（与完成性校验同口径：真实网站"登 录"按钮 name 带 CSS 间距）
+        return f"{parsed.name or ''} {parsed.text or ''}".strip().casefold().replace(" ", "")
 
     for label, pattern in GOAL_ACTION_PATTERNS.items():
         if not pattern.search(goal):
@@ -571,7 +576,7 @@ def _check_goal_coverage(goal: str, case: DSLCase) -> list[str]:
         keywords = _ACTION_KEYWORDS[label]
         covered = any(
             step.action == "click" and step.target is not None
-            and any(k in _step_text(step) for k in keywords)
+            and any(k.replace(" ", "") in _step_text(step) for k in keywords)
             for step in case.steps
         )
         if not covered:

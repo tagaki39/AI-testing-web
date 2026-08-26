@@ -1,0 +1,50 @@
+test.xywhaigc.top 登录场景 —— 失败报告
+请求: Open https://test.xywhaigc.top/login, login with test1 / 147258, then verify login success
+
+【1. 生成响应】
+  400: AI 生成失败: 步骤 5: STATE_GROUNDING_MISMATCH — target_ref (observation_ref=obs3) 属于 obs3，但按转移图推导该步骤执行时应处于 obs2（引用已离开状态的元素）
+
+【2. 探索统计】
+  steps=5  llm_calls=6  done=True
+  timings: {"llm_ms": 7943, "browser_action_ms": 3345, "fixed_wait_ms": 1424, "observation_ms": 7, "action_space_ms": 11250, "settle_ms": 1210, "explore_total_ms": 12719}
+
+【3. 状态图（observations + transitions）】
+  obs1  url=https://test.xywhaigc.top/login?redirect=/login,  elems=10
+  obs2  url=https://test.xywhaigc.top/login,  elems=2
+  obs3  url=https://test.xywhaigc.top/index  elems=16
+  obs4  url=https://test.xywhaigc.top/index  elems=22
+  ---
+  obs1 --fill obs1:e2--> obs1
+  obs1 --fill obs1:e3--> obs1
+  obs1 --click obs1:e7--> obs2
+  obs2 --click obs2:e2--> obs3
+  obs3 --click obs3:e4--> obs4
+
+【4. 探索动作序列（history）】
+  [0] fill           obs1:e2    name='请输入账户' value=${username}
+  [1] fill           obs1:e3    name='请输入密码' value=${password}
+  [2] click          obs1:e7    name='登 录' value=
+  [3] click          obs2:e2    name='返回首页' value=
+  [4] click          obs3:e4    name='图像生成' value=
+
+【5. G3 拦截推导】
+  Planner 步骤 5 引用 obs3（index 页元素），但按转移图推导：
+    goto(obs1) -> fill x2 -> click obs1:e7(登 录) -> [转移 obs1->obs2]
+  步骤 5 执行时应处于 obs2（login 中间态），引用 obs3 = 跨状态 → STATE_GROUNDING_MISMATCH
+  重生（bounded x1）后 Planner 仍未生成含 obs2 处理的 DSL → fail honestly (400)
+
+【6. 观察点】
+  a. obs2 仅 2 个元素 —— 点击「登 录」后页面变为极简状态，随后经 obs2:e2 到 /index
+     （登录是两步：obs1 -> obs2 -> obs3；obs2 的业务含义需人工确认——
+       是登录成功确认页，还是表单校验失败页？如果是失败页，/index 是未登录首页）
+  b. action_space_ms=11.25s（探索总 12.7s 的大头）—— 元素少（10-22 个）但评估耗时长，
+     值得查：每元素 elementFromPoint 的协议往返开销
+  c. obs3 有 16 元素（/index）—— 登录链路可达，账号 test1/147258 有效
+【7. 关键修正（obs2 元素表核实后）】
+  obs2 是 404 错误页（'404错误! 找不到网页！'）——不是登录成功页！
+  点击「登 录」→ 404 → 「返回首页」→ /index（未登录首页）。
+  → 登录按钮当前不可用（测试环境登录流程问题，或需先选企业——
+     obs1 有"请选择企业"文本但元素表无企业选择控件）。
+  → test1/147258 有效性无法通过该登录页验证。
+  → G3 拦截语义正确：Planner 引用"登录后"的 /index 状态，
+     但状态图证明登录后是 404——跨状态拒绝（fail honestly）。
