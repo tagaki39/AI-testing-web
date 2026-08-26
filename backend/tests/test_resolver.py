@@ -174,15 +174,15 @@ def test_candidates_order_and_nav_guard():
             page, ParsedTarget(test_id="add-1"))]
         assert strategies[0] == "test_id"
 
-        # 非导航 button：exact → decorated → fuzzy 全都有，且 exact 在前
+        # 非导航 button：exact → decorated → fuzzy → text 兜底（S1），exact 在前
         strategies = [s for s, _ in build_locator_candidates(
             page, ParsedTarget(role="button", name="Add to cart"))]
-        assert strategies == ["role", "role_decorated", "role_fuzzy"]
+        assert strategies == ["role", "role_decorated", "role_fuzzy", "text"]
 
         # 导航 link（Cart）：禁止 fuzzy 候选（否则会命中 Add to cart / View Cart）
         strategies = [s for s, _ in build_locator_candidates(
             page, ParsedTarget(role="link", name="Cart"))]
-        assert strategies == ["role", "role_decorated"]
+        assert strategies == ["role", "role_decorated", "text"]
 
         # exact 候选只命中 "Cart" 本身（1 个）；fuzzy 本会命中 2 个
         exact_loc = build_locator_candidates(
@@ -463,6 +463,30 @@ def test_a42_identity_2_visible_ambiguous():
         except LocatorAmbiguousError:
             return
         raise AssertionError("两个可见 identity 候选未被拒绝")
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_href_less_link_text_fallback():
+    """S1：无 href 的 <a>——CDP AX 观察是 link，Playwright 语义是 text。
+    role 定位 0 命中 → text 兜底（get_by_text exact）解决，不放大歧义。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content('<a class="check_out">Proceed To Checkout</a>')
+        strategy, locator = _resolve_locator(
+            page, {"role": "link", "name": "Proceed To Checkout"})
+        assert strategy == "text"
+        assert locator.count() == 1
+        # 兜底不放大歧义：多个同名文本时仍拒绝（诚实）
+        page.set_content(
+            '<a>Proceed To Checkout</a>\n<span>Proceed To Checkout</span>')
+        try:
+            _resolve_locator(page, {"role": "link", "name": "Proceed To Checkout"})
+        except LocatorAmbiguousError:
+            return
+        raise AssertionError("多个同名文本未被拒绝")
     finally:
         browser.close()
         pw.stop()

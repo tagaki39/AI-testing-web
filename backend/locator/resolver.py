@@ -250,6 +250,11 @@ def build_locator_candidates(container, t: ParsedTarget) -> list[tuple[str, obje
         # "错误点击却看似成功"（比明确失败更危险）
         if not is_navigation_name(t.role, t.name):
             candidates.append(("role_fuzzy", container.get_by_role(t.role, name=t.name)))
+        # S1：text 兜底——CDP AX 观察（getFullAXTree）与 Playwright 执行
+        #（aria snapshot）对无 href 的 <a> role 判定不一致（CDP=link，
+        # Playwright=text）。低优先级（exact 文本），role 定位失败时
+        # 用 accessible name 文本兜底（count==1 才赢，不放大歧义）。
+        candidates.append(("text", container.get_by_text(t.name, exact=True)))
     if t.text:
         candidates.append(("text", container.get_by_text(t.text)))
         # 修复（真实 E2E）：图标前缀文本——PUA 字符来自 CSS 伪元素内容

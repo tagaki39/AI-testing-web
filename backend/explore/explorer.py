@@ -120,28 +120,41 @@ def _has_cart_entry_transition(state: "ExploreState") -> bool:
     return any(
         t.get("action") == "click"
         and t.get("from") != t.get("to")
-        and _CART_ENTRY_RE.search(str(t.get("target_name") or ""))
+        and _is_cart_entry_name(t.get("target_name"))
         for t in state.transitions
     )
 
 
-def _validate_completion(state: "ExploreState") -> str | None:
-    """探索完成宣告的完整性校验（GQ 决策 1，可单测）。
+class CompletionStatus:
+    """S1：探索完成状态（三态）。
 
-    真实 E2E 踩坑：1 步 fill 后宣告完成 → Planner 只能规划登录，
-    用户目标（加购/验证）全部落空。校验规则：
-      - goal 不要求操作（如"验证页面含文字"）→ 豁免（单页 0 步合法）
-      - 已执行动作 ≥ 2 → 通过
-      - 否则 → 返回拒绝原因（由主循环反馈进历史，预算内继续探索）
+    ready      = True  → 目标证据齐备且当前正停留在目标终态 → 程序自动收尾
+    ready      = False → 明确未完成（缺动作/数量/终态）→ LLM 不暴露 finish
+    unknown    = True  → 无法确定性判断 → 允许 LLM 语义决定 finish
+    """
+
+    def __init__(self, ready: bool, reason: str | None = None,
+                 unknown: bool = False):
+        self.ready = ready
+        self.reason = reason
+        self.unknown = unknown
+
+
+def _completion_status(state: "ExploreState") -> CompletionStatus:
+    """S1：探索完成状态（current-state anchored，确定性）。
+
+    与旧 _validate_completion 的关键区别：READY 必须满足【当前状态】条件，
+    不是"历史上发生过"——进过购物车又离开 ≠ 完成（离开后 StateGraph
+    会包含乱走边，Planner 被误导选入计划 → 断言 cursor 错位）。
     """
     if not goal_requires_actions(state.goal):
-        return None
+        return CompletionStatus(ready=True, reason="goal 无操作要求")
     if state.step_count < 2:
-        return (f"探索不充分：仅执行 {state.step_count} 步就宣告完成"
-                "（用户目标要求页面操作），请继续探索目标流程")
-    # R3（BFC 实测）：目标要求的动作类型必须已探索过——模型 3 步
-    # （Products/Polo）就宣告完成，加购/购物车流程全没探索，Planner
-    # 无从生成完整 DSL。goal 命中动作表 → 必须存在对应 click 的证据。
+        return CompletionStatus(
+            ready=False,
+            reason=(f"探索不充分：仅执行 {state.step_count} 步就宣告完成"
+                    "（用户目标要求页面操作），请继续探索目标流程"))
+    # 动作覆盖：goal 命中动作表 → 必须存在对应 click 的证据
     for label, pattern in GOAL_ACTION_PATTERNS.items():
         if not pattern.search(state.goal):
             continue
@@ -156,19 +169,46 @@ def _validate_completion(state: "ExploreState") -> str | None:
             for h in state.history
         )
         if not covered:
-            return (f"探索不充分：目标要求 {label} 动作，但探索未执行过"
-                    f"（history 无 {keywords[0]} 的 click）——请继续探索该流程")
-    # R7.2（确定性）：目标要求"验证购物车"时，StateGraph 必须存在成功的
-    # 购物车入口 transition——否则 Planner 的 verified edges 里没有
-    # View Cart 边，无法合法生成"进入购物车验证"步骤（BFC 实测：探索
-    # 在第二次加购弹窗就 finish，Planner 只能重复已有 Add 边 + 弱断言）。
-    # 判定用成功 transition 的 target_name（View Cart/查看购物车等），
-    # 不靠 URL 启发（SPA 无 URL 变化、/basket、/checkout 等场景）。
-    if _CART_VERIFY_RE.search(state.goal) and not _has_cart_entry_transition(state):
-        return ("探索不充分：目标要求在购物车中验证，但探索尚未实际执行"
-                "进入购物车（如 View Cart）并形成成功状态转移——"
-                "请点击进入购物车的入口观察后再宣告完成")
-    return None
+            return CompletionStatus(
+                ready=False,
+                reason=(f"探索不充分：目标要求 {label} 动作，但探索未执行过"
+                        f"（history 无 {keywords[0]} 的 click）——请继续探索该流程"))
+    # 数量目标：已完成 distinct 业务实体 ≥ 要求
+    required = _extract_required_count(state.goal)
+    if required is not None:
+        completed = _derive_completed_entities(state)
+        if len(completed) < required:
+            return CompletionStatus(
+                ready=False,
+                reason=(f"数量目标未完成（{len(completed)}/{required} 个不同"
+                        "业务实体）——继续选择不同商品完成目标"))
+    # 购物车验证（current-state anchored）：
+    # 必须【当前正停留】在购物车入口转移的 to 状态，且该状态有断言证据
+    if _CART_VERIFY_RE.search(state.goal):
+        cart_edges = _cart_entry_transitions(state)
+        if not cart_edges:
+            return CompletionStatus(
+                ready=False,
+                reason=("探索不充分：目标要求在购物车中验证，但探索尚未实际"
+                        "执行进入购物车（如 View Cart）并形成成功状态转移"))
+        cart_to = cart_edges[-1]["to"]
+        if state.current_obs != cart_to:
+            return CompletionStatus(
+                ready=False,
+                reason=(f"当前不在购物车终态（{state.current_obs} ≠ {cart_to}）"
+                        "——进入购物车后应立即完成，不要继续探索其他页面"))
+        cur = next((o for o in state.observations
+                    if o["id"] == state.current_obs), None)
+        if cur is None or not cur.get("elements"):
+            return CompletionStatus(
+                ready=False, reason="购物车终态缺少观察证据（elements 为空）")
+    return CompletionStatus(ready=True, reason="goal evidence collected")
+
+
+def _validate_completion(state: "ExploreState") -> str | None:
+    """薄包装：_completion_status 的 ready → None（兼容既有调用方）。"""
+    status = _completion_status(state)
+    return None if status.ready else status.reason
 
 def _elements_to_prompt(elements: list[dict], state: "ExploreState | None" = None) -> str:
     """元素表 → 决策上下文（紧凑格式）。
@@ -232,7 +272,7 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
 {{
   "reason": "为什么这么做",
   "exploration_complete": false,
-  "action": "click | fill | press | back | finish",
+  "action": "{allowed_actions}",
   "target_ref": "obs1:e1",
   "value": "fill 的 value 必须是 ${{input_key}} 占位符，input_key 严格取自『可用 Runtime Input Keys』；禁止创造不存在的变量名，禁止输出任何真实值"
 }}
@@ -270,12 +310,40 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
 _CART_VERIFY_RE = re.compile(
     r"验证.*购物车|购物车.*验证|verify.*\bcart\b|check.*\bcart\b", re.I)
 _MAX_EVIDENCE_PROMPT = 8   # R7.3：evidence 文本限量展示（无 ref）
-# 购物车入口动作（R7.2 完成校验用——按成功 transition 的 target_name 判定）
+# 购物车入口动作（R7.2 完成校验用——按成功 transition 的 target_name 判定）。
+# 正则保持语义精确：^cart$ / view cart / open cart / 中文——绝不放宽成
+# 任意包含 "cart"（"Add to cart" 会误判）。
 _CART_ENTRY_RE = re.compile(
-    r"\bview\s+cart\b|\bopen\s+(?:shopping\s+)?cart\b|^cart$|"
+    r"\bview\s+cart\b|"
+    r"\bopen\s+(?:shopping\s+)?cart\b|"
+    r"^cart$|"
     r"查看购物车|进入购物车|购物车页面",
-    re.I,
+    re.IGNORECASE,
 )
+# PUA 图标（FontAwesome 私有区）——仅语义分类时剥除（BFC 实测：
+# 导航 " Cart" 的 accessible name 带  前缀）；Observation/
+# Locator 原始名称绝不动（定位时 PUA 不能删，见 decorated pattern）。
+_PUA_RE = re.compile(r"[-]")
+
+
+def _normalize_semantic_name(name: str | None) -> str:
+    """语义分类用归一化：只剥 PUA 图标 + 折叠空白；不改原始名称。"""
+    value = _PUA_RE.sub("", name or "")
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _is_cart_entry_name(name: str | None) -> bool:
+    """名称是否为购物车入口动作（单一语义入口，供完成校验使用）。"""
+    return bool(_CART_ENTRY_RE.search(_normalize_semantic_name(name)))
+
+
+def _cart_entry_transitions(state: "ExploreState") -> list[dict]:
+    """StateGraph 中成功的购物车入口转移（共享判定，一处维护）。"""
+    return [
+        t for t in state.transitions
+        if t.get("action") == "click" and t.get("from") != t.get("to")
+        and _is_cart_entry_name(t.get("target_name"))
+    ]
 
 _CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
@@ -337,19 +405,52 @@ def _derive_completed_entities(state: "ExploreState") -> set[str]:
     return completed
 
 
+def _identity_key(e: dict) -> str | None:
+    """元素 → 业务实体键（"data-product-id=1"）；无 identity → None。"""
+    ident = e.get("identity") or {}
+    if ident.get("attr") and ident.get("value"):
+        return f"{ident['attr']}={ident['value']}"
+    return None
+
+
 def _apply_goal_constraints(goal: str, state: "ExploreState",
                             action_space: list[dict]) -> list[dict]:
-    """Policy：目标约束（interaction root 打开时生效）。
+    """Policy（全局）：数量未完成时，已完成 business identity 的 action
+    不作为剩余目标候选——任何状态生效（BFC：Add#1 后 product 1 的 Add
+    在列表页也不可选，第二次必然选不同商品；不靠 LLM 记忆）。
 
-    对称限制（完成度从 StateGraph 派生，不存第二状态源）：
+    完成度从 StateGraph 派生（不存第二状态源）。只收紧不改写：
+    过滤后无可选 action → 保持原 ActionSpace（防锁死）。
+    """
+    required = _extract_required_count(goal)
+    if required is None:
+        return action_space
+    completed = _derive_completed_entities(state)
+    if len(completed) >= required:
+        return action_space
+    filtered = []
+    for e in action_space:
+        if e.get("kind") != "action":
+            filtered.append(e)
+            continue
+        key = _identity_key(e)
+        if key and key in completed:
+            continue   # 已完成实体不再作为剩余目标候选
+        filtered.append(e)
+    if not any(e.get("kind") == "action" for e in filtered):
+        return action_space   # 收紧后无可选 action → 保持原样（防锁死）
+    return filtered
+
+
+def _apply_modal_constraints(goal: str, state: "ExploreState",
+                             action_space: list[dict]) -> list[dict]:
+    """Policy（modal 语义，interaction root 打开时生效）。
+
+    对称限制（完成度从 StateGraph 派生）：
       - 数量未完成：终态动作（View Cart 等）不暴露——LLM 只能继续完成目标
       - 数量完成 + 目标仍要求购物车验证 + 存在收尾候选：只保留收尾动作
-        （BFC 实测：第 2 次加购弹窗 LLM 仍选 Continue 绕圈，预算耗尽
-        也没进购物车）
-    两个保护（不锁死页面）：
-      - 只收紧不改写：过滤后无可选 action → 保持原 ActionSpace
-        （让 completion validator 拒绝 finish，而不是把页面锁死）
-      - 无数量要求 → 原样返回
+        （BFC 实测：第 2 次加购弹窗 LLM 仍选 Continue 绕圈）
+    保护：过滤后无可选 action → 保持原 ActionSpace（防锁死）。
     """
     required = _extract_required_count(goal)
     if required is None:
@@ -388,6 +489,11 @@ def _decide(state: ExploreState, llm_call, elements: list[dict] | None = None) -
     错误信息返回给调用方（预算内反馈进历史让 LLM 自纠，不直接夭折）。
     """
     elements = elements if elements is not None else state.elements
+    # S1：finish 动态禁用——探索完成校验不通过（目标动作/状态未覆盖）时，
+    # 决策空间不含 finish（prompt 白名单 + 代码校验双重）
+    can_finish = _validate_completion(state) is None
+    allowed_actions = ("click | fill | press | back | finish"
+                       if can_finish else "click | fill | press | back")
     history_text = "\n".join(
         f"- {h.get('action')} {h.get('target_ref')} {h.get('value') or ''} @ {h.get('url')}"
         + (f" → 失败: {h['error'][:80]}" if h.get("error") else "")
@@ -401,6 +507,7 @@ def _decide(state: ExploreState, llm_call, elements: list[dict] | None = None) -
         input_keys=", ".join(sorted(state.input_keys)) if state.input_keys else "(无)",
         elements=_elements_to_prompt(elements, state),
         history=history_text,
+        allowed_actions=allowed_actions,
     )
     try:
         t0 = perf_counter()
@@ -414,6 +521,11 @@ def _decide(state: ExploreState, llm_call, elements: list[dict] | None = None) -
         action = decision.get("action")
         if action not in {"click", "fill", "press", "back", "finish"}:
             return None, f"非法 action {action!r}（白名单: click/fill/press/back/finish）"
+        # S1：完成校验不通过时 finish 禁用（确定性拒绝，不消耗预算让
+        # LLM 反复尝试同一个确定性结论）
+        if action == "finish" and not can_finish:
+            return None, ("探索尚未完成（目标要求的动作/状态未全部覆盖）"
+                          "——finish 当前禁用，请继续探索完成目标")
         if action == "press":
             # press 按键枚举（第 6 项：不允许 LLM 自由输出按键）
             if (decision.get("value") or "") not in _PRESS_KEYS:
@@ -552,13 +664,28 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                and state.step_count < MAX_STEPS
                and state.llm_calls < MAX_LLM_CALLS
                and perf_counter() < deadline):
+            # S1：目标完成证据齐备且当前正停留在目标终态 → 程序自动收尾
+            #（不等 LLM 语义决定 finish——探索乱走会污染 StateGraph，
+            # Planner 被乱走边误导选入计划 → 断言 cursor 错位）
+            completion = _completion_status(state)
+            if completion.ready:
+                state.done = True
+                state.history.append({
+                    "action": "auto_finish",
+                    "observation_ref": state.current_obs,
+                    "reason": completion.reason,
+                })
+                break
             # R3：ActionSpace——LLM 只能从"当前可操作"的候选中选
             #（模态框遮挡的 Add to cart 不进入候选，模型没权限选错）
             action_space = _build_action_space(state)
-            # R6：Policy——目标约束叠加（数量未完成时 interaction root
-            # 内终态动作不暴露；从 StateGraph 派生，不存第二状态源）
+            # R6/S1：Policy 分层——
+            #   全局：已完成 identity 不作为剩余目标候选（任何状态生效）
+            #   modal：interaction root 打开时的终态/继续动作对称限制
+            action_space = _apply_goal_constraints(
+                state.goal, state, action_space)
             if state.interaction_root:
-                action_space = _apply_goal_constraints(
+                action_space = _apply_modal_constraints(
                     state.goal, state, action_space)
             # P0 诊断：每次决策打点（卡在 LLM vs 浏览器一目了然）
             # A4.3：interaction root source（ax dialog / dom_overlay）；
@@ -570,7 +697,21 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                   f"interaction_root={iroot} "
                   f"DECIDE_START selectable_actions={n_act} evidence={n_ev}",
                   flush=True)
-            decision, decision_error = _decide(state, llm_call, elements=action_space)
+            # S1-P0（0/1/N 决策）：单候选 → 确定性执行（不调用 LLM——
+            # 模型只解决真正存在语义选择的问题；modal 被 Policy 限制后
+            # 只剩 1 个可选动作时，让它"选择"唯一选项是纯浪费）。
+            # finish 判定不在此路径：完成校验由探索结束的
+            # _validate_completion 兜底（单候选多做一步无害）。
+            selectable = [e for e in action_space if e.get("kind") == "action"]
+            if len(selectable) == 1:
+                decision = {
+                    "action": "click",
+                    "target_ref": selectable[0]["ref"],
+                }
+                decision_error = None
+            else:
+                decision, decision_error = _decide(
+                    state, llm_call, elements=action_space)
             print(f"[EXPLORE] step={state.step_count} llm={state.llm_calls} "
                   f"DECIDE_DONE action={(decision or {}).get('action')} "
                   f"ref={(decision or {}).get('target_ref')} "

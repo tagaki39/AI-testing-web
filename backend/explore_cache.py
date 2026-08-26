@@ -19,9 +19,12 @@ explore_cache.py — 探索结果缓存（Speed v1）
 """
 
 import json
+import logging
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+
+logger = logging.getLogger("explore_cache")
 
 CACHE_DIR = Path(__file__).resolve().parents[1] / ".cache" / "explore"
 TTL_SECONDS = 3600          # 1h（比 4h 保守，配合 stale guard）
@@ -74,8 +77,24 @@ def save(entry_url: str, auth_profile: str, data: dict) -> None:
         (CACHE_DIR / f"{key}.json").write_text(
             json.dumps(entry, ensure_ascii=False), encoding="utf-8",
         )
-    except Exception:
-        pass   # 缓存写失败不影响主链路
+    except Exception as exc:
+        # S1：缓存写失败不再静默——诊断时才能区分"没保存"与"保存失败"
+        logger.warning("[CACHE] save failed key=%s err=%r", key, exc)
+
+
+def clear_all() -> None:
+    """清空全部探索缓存（内存 + 磁盘）。
+
+    S1：fresh 验证的标准手段——替代 rm json + 重启 backend
+    （save 先写内存，rm 文件后内存仍命中，会造成"假 fresh"）。
+    """
+    _memory.clear()
+    if CACHE_DIR.exists():
+        for p in CACHE_DIR.glob("*.json"):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception as exc:
+                logger.warning("[CACHE] clear failed %s err=%r", p.name, exc)
 
 
 def invalidate(entry_url: str, auth_profile: str) -> None:

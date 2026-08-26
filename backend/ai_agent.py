@@ -58,6 +58,11 @@ from locator.resolver import (
 # os.getenv("名字", 默认值)：读环境变量，没设置就用默认值。
 # .env 文件的值由 main.py 在启动时灌入 os.environ（见 main.py 顶部）。
 
+class OutputBudgetExceededError(Exception):
+    """LLM 输出超过 max_tokens 预算（finish_reason=length）——输出失控。
+    S4：safety cap，不做 schema recovery（截断 JSON 修复无意义）。"""
+
+
 API_KEY = os.getenv("AI_API_KEY", "")
 BASE_URL = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1")
 MODEL = os.getenv("AI_MODEL", "deepseek-chat")
@@ -153,96 +158,52 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
 #   Planner 只从元素引用表选 target_ref，禁止生成任何定位字段——
 #   locator 由系统确定性编译（R1 Compiler），不再信任 LLM 的 role/name/scope。
 SYSTEM_PROMPT_REFS_ONLY = """你是 Web UI 自动化测试的 DSL 生成器（refs-only 模式）。
-根据用户描述的自然语言测试需求，从系统提供的元素引用表中选择元素，输出一个 JSON 对象。示例（与最小步骤规则完全一致）：
+根据用户描述的自然语言测试需求，从系统提供的【已验证状态转移】和【元素引用表】中选择，输出一个 JSON 对象。示例：
 
 {
-  "name": "登录并进入商品页",
-  "description": "登录后验证进入商品页",
+  "name": "前两个商品加入购物车并验证",
+  "description": "筛选品牌后加购两个商品，进入购物车验证",
   "base_url": "https://xxx.com",
   "input_contract": [
-    {"key": "username", "type": "string", "required": true, "secret": false, "default": "standard_user"},
-    {"key": "password", "type": "secret", "required": true, "secret": true, "default": null}
+    {"key": "username", "type": "string", "required": true, "secret": false, "default": "standard_user"}
   ],
-  "steps": [
-    {"action": "goto", "value": "https://xxx.com", "observation_ref": "obs1"},
-    {"action": "fill", "target_ref": "obs1:e3", "value": "${username}", "observation_ref": "obs1"},
-    {"action": "fill", "target_ref": "obs1:e4", "value": "${password}", "observation_ref": "obs1"},
-    {"action": "click", "target_ref": "obs1:e5", "observation_ref": "obs1"},
-    {"action": "assert_url", "value": "/inventory.html", "observation_ref": "obs2"}
+  "transition_refs": ["t1", "t2", "t3", "t4"],
+  "assertions": [
+    {"action": "assert_visible", "target_ref": "obs3:e11"},
+    {"action": "assert_text", "value": "Blue Top"}
   ]
 }
 
 规则：
-1. action 只能是: goto, click, fill, select, check, wait_for, assert_visible, assert_text, assert_url
-2. 状态变化型步骤（click/导航）用 transition_ref（R7）：
-   - 从系统提供的"已验证状态转移"表中选择（t1/t2/...，格式 obs1 --click obs1:e29--> obs2）
-   - transition_ref 由系统确定性展开为 action/target_ref/observation_ref——
-     你不需要（也无权）推导状态机，只做语义选择
-   - 禁止生成 target、scope、role、name、text、css、test_id 等任何定位字段
-3. 非状态变化型步骤（fill/select/check/wait_for/assert_visible/assert_text）：
-   - 用 target_ref 引用元素引用表中的 ref（格式 obsN:eM）
-   - target_ref 只能从系统提供的元素引用表中选择，禁止编造
-   - 引用表中没有合适元素时，调整步骤设计（如改用 assert_text 验证页面文本）
-   - 元素级断言只能引用"当前执行位置"状态的元素（按已验证转移边
-     顺序推进理解当前状态；页面级断言可不提供 target_ref）
-4. 变量：
+1. transition_refs（状态变化步骤，最重要）：
+   - 从系统提供的"已验证状态转移"表中选择（t1/t2/...，格式 t1: obs1 --click obs1:e29--> obs2）
+   - 按执行顺序排列；系统沿已验证边确定性展开为 action/target_ref/observation_ref
+   - 你不需要（也无权）推导状态机——只做语义选择：哪些已验证转移属于用户目标
+   - 数量要求（"前两个商品"）：选择不同业务实体的转移（不同 t 对应不同目标）
+2. assertions（验证步骤）：
+   - 追加在 transition_refs 之后执行（observation_ref 由系统自动设置为当前状态）
+   - 元素级断言（assert_visible/assert_text 带 target_ref）：只能引用【当前执行位置】状态的元素
+   - 页面级断言（assert_text 整页 / assert_url）：不需要 target_ref
+   - 验证策略：登录/跳转 → assert_url 或目标页关键元素；文本/价格 → assert_text；元素出现 → assert_visible
+3. 变量：
    - 所有可变测试输入必须使用 ${var}，每个变量必须声明在 input_contract
    - secret=true → default 必须为 null（执行时本地注入）
    - 非敏感变量只有上下文明确提供 default 时才能填写；不得猜测真实值
-5. 业务动作覆盖（最重要）：
-   - 用户目标中要求的每个业务动作都必须生成对应的执行步骤——
-     目标说"加入购物车"就必须有 click 加购元素的步骤，说"登录"就必须
-     有完整的登录步骤（fill + click）
-   - 禁止只生成导航（goto）和断言而跳过目标要求的业务动作
-   - 数量要求（"前两个商品"）：点击不同业务实体（不同 transition_ref
-     对应不同目标）完成全部数量，再进入收尾步骤
-6. observation_ref（grounding 引用，R7.1）：
-   - observation_ref 由系统自动设置（状态 cursor 推进）——不要输出该字段，
-     输出也会被覆盖
-   - 元素级断言的 target_ref 由系统校验必须属于当前状态
-7. 断言动作字段约束（机械规则）：
-   - assert_text: value 必填（要验证的文本）；验证某个元素内文本时用 target_ref
-     引用该元素，验证整页文本时不提供 target_ref；
-     禁止把待验证文本只放在 target 里而省略 value（target 字段本来就被禁止）
-   - assert_visible: target_ref 必填（验证元素出现）
-   - assert_url: value 必填（URL 片段），不需要 target_ref
-7.5 输出紧凑性（硬约束）：
+4. 业务动作覆盖（最重要）：
+   - 用户目标中要求的每个业务动作都必须对应 transition_refs 中的转移——
+     目标说"加入购物车"就必须有加购元素的转移，"登录"就必须有登录转移
+   - 禁止只选导航转移而跳过目标要求的业务动作
+5. 输出紧凑性（硬约束）：
    - 输出必须是【单个 JSON 对象】本身，禁止任何前置/后置文本、代码块标记
-   - 禁止复制、引用或重述页面结构、元素引用表、ARIA snapshot 内容
-   - 输出通常 <100 行；超过 500 行视为无效（会整段重试）
-8. 最小测试原则：
-   - 仅生成完成用户需求所需的最少步骤
-   - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
-   - 单一最终目标默认生成恰好 1 个最终验证
-   - 如果用户明确要求多个独立验证结果，则保留这些明确要求的验证
-9. Wait after state-changing actions（等待修改动作的 postcondition）：
-   - 当 click / submit / select 会触发异步页面状态变化、且后续步骤依赖
-     该变化时，必须等待一个能证明变化已经完成的新状态元素（postcondition），
-     再继续下一步
-   - 正确：click "Add to cart" → wait_for 加购后的 "Added!" 弹窗 或
-     按钮变 "Remove" → 再 click "Cart"
-   - 错误：click "Add to cart" → wait_for "Cart"——Cart 链接在动作前就
-     一直存在，它不能证明加购完成
-   - 禁止机械地在每个 click 前生成 wait_for——Playwright 已自动等待目标
-     可操作；wait_for 只用于等待业务状态变化（postcondition）
-   - postcondition 元素必须来自元素表（target_ref 引用新状态中的元素，
-     如 obs6 的 "Remove"；引用表中没有可靠 postcondition 时，宁可不加
-     wait_for 也不编造 ref）
-10. Modify-then-assert（修改后先等再断言）：
-   - 修改值（fill/select/check）后，先 wait_for 更新生效，再断言新值
-   - 不得在修改生效前断言新值（竞态：断言可能读到旧状态）
-11. 验证策略：
-   - 登录/页面跳转 → 优先 assert_url 或目标页面关键元素 assert_visible
-   - 元素出现、按钮状态变化 → assert_visible
-   - 文本、价格、数量变化 → assert_text
-   - 用户未明确验证方式时，选择与最终动作因果关系最直接的可观察结果
-12. 只输出 JSON，不要输出任何解释或代码块标记"""
+   - 禁止复制、引用或重述页面结构、元素引用表、状态转移表、ARIA snapshot 内容
+   - 输出通常 <60 行；禁止输出任何 action 为 click/fill/goto 的步骤对象
+     （状态变化由 transition_refs 表达，你只输出转移编号和断言）"""
 
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
 
 def _call_llm(user_prompt: str, system_prompt: str | None = None,
-              timeout: float = 60) -> str:
+              timeout: float = 60, max_tokens: int = 1500) -> str:
     """调用 DeepSeek chat completions API，返回文本内容。
 
     这是最原始的 HTTP POST 请求，拆解每一步：
@@ -268,6 +229,7 @@ def _call_llm(user_prompt: str, system_prompt: str | None = None,
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0,   # 确定性输出（结构化生成；≠ 完全 deterministic，但显著降低波动）
+        "max_tokens": max_tokens,   # S4：safety cap（正常输出 <1KB；防 output runaway）
     }
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",            # DeepSeek 的 OpenAI 兼容端点
@@ -287,7 +249,14 @@ def _call_llm(user_prompt: str, system_prompt: str | None = None,
     print(f"[LLM] HTTP_DONE {perf_counter() - _llm_t0:.1f}s bytes={len(body)}",
           flush=True)
     data = json.loads(body.decode("utf-8"))
-    return data["choices"][0]["message"]["content"]
+    choice = data["choices"][0]
+    # S4：输出超预算（finish_reason=length）→ 明确失败（output runaway
+    # 不做 schema recovery——截断 JSON 的修复没有意义）
+    if choice.get("finish_reason") == "length":
+        raise OutputBudgetExceededError(
+            f"LLM 输出超过预算 {max_tokens} tokens（finish_reason=length）"
+            "——输出失控，不做修复，请重试")
+    return choice["message"]["content"]
 
 
 # ── 阶段 1：从用户需求中解析入口 URL（代码优先 + LLM fallback）────────────────
@@ -717,23 +686,21 @@ def _build_retry_hint(error_info: str) -> str:
     )
 
 
-def _expand_transition_refs(case_dict: dict,
-                            verified_edges: list[dict],
-                            observations: list[dict] | None = None) -> dict:
-    """R7.1：transition_ref 确定性展开 + State Cursor Grounding。
+def _expand_plan_schema(case_dict: dict,
+                        verified_edges: list[dict],
+                        observations: list[dict] | None = None,
+                        entry_url: str | None = None) -> dict:
+    """S3：Planner 输出 transition_refs + assertions → DSL steps 确定性展开。
 
-    State cursor = 唯一的"现在在哪个状态"事实源：
-      - transition_ref 推进 cursor（edge.from 必须 == cursor，否则
-        TRANSITION_OUT_OF_ORDER）
-      - 断言/其他非状态变化步骤的 observation_ref 由 cursor 自动赋值
-        （LLM 无权写——它不知道也不必推导状态机）
-      - 元素级断言 target_ref 必须属于当前 cursor 的 refs（否则
-        ASSERTION_REF_OUT_OF_CURRENT_STATE——跨状态引用结构上不可能）
-      - 页面级断言（无 target_ref）不需要元素
+    Planner 不再输出状态变化步骤的详细结构（LLM 无空间生成 28KB 回吐）：
+      - transition_refs：沿 verified edges 顺序展开（action/target_ref/
+        observation_ref 由边决定，State Cursor 推进）
+      - assertions：追加到末尾，observation_ref 由当前 cursor 自动赋值，
+        target_ref 必须属于当前状态（跨状态引用结构上不可能）
+      - goto 步骤自动注入（entry_url，observation_ref 匹配入口 obs）
 
     未知 transition_ref / cursor 错位 / 断言跨状态 → ValueError
     （schema recovery 干净重生，不靠 prompt 提醒）。
-    cursor 为 None（goto 未匹配）→ fail-open：不校验、不覆盖。
     """
     if not verified_edges:
         return case_dict
@@ -742,8 +709,6 @@ def _expand_transition_refs(case_dict: dict,
         for o in observations:
             refs_by_obs[o["id"]] = {e["ref"] for e in o.get("elements", [])}
     index = {f"t{i + 1}": t for i, t in enumerate(verified_edges)}
-    steps = case_dict.get("steps") or []
-    cursor: str | None = None
 
     def match_url(value) -> str | None:
         if not value:
@@ -754,40 +719,46 @@ def _expand_transition_refs(case_dict: dict,
                 return o["id"]
         return None
 
-    for step in steps:
-        tref = step.pop("transition_ref", None)
-        if tref:
-            edge = index.get(tref)
-            if edge is None:
-                raise ValueError(f"未知 transition_ref {tref}（verified 边外）")
-            if cursor is not None and edge["from"] != cursor:
-                raise ValueError(
-                    f"TRANSITION_OUT_OF_ORDER: {tref} 起点 {edge['from']} "
-                    f"≠ 当前状态 {cursor}（路径沿已验证转移边推进）")
-            # 确定性展开：action/target_ref/observation_ref 由已验证边决定
-            step["action"] = edge["action"]
-            step["target_ref"] = edge["target_ref"]
-            step["observation_ref"] = edge["from"]
-            cursor = edge["to"]
-            continue
-        if step.get("action") == "goto":
-            cursor = match_url(step.get("value"))
-            if cursor is not None:
-                step["observation_ref"] = cursor
-            continue
-        # 非状态变化步骤（fill/select/check/wait_for/assert_*）：
-        # observation_ref 由当前 cursor 自动赋值；元素级引用必须属于
-        # 当前状态（跨状态引用在结构上不可能）
+    steps: list[dict] = []
+    cursor: str | None = None
+    for tref in case_dict.pop("transition_refs", []):
+        edge = index.get(tref)
+        if edge is None:
+            raise ValueError(f"未知 transition_ref {tref}（verified 边外）")
+        if cursor is not None and edge["from"] != cursor:
+            raise ValueError(
+                f"TRANSITION_OUT_OF_ORDER: {tref} 起点 {edge['from']} "
+                f"≠ 当前状态 {cursor}（路径沿已验证转移边推进）")
+        steps.append({
+            "action": edge["action"],
+            "target_ref": edge["target_ref"],
+            "observation_ref": edge["from"],
+        })
+        cursor = edge["to"]
+
+    # goto 注入（入口，observation_ref 匹配入口 obs）
+    if steps and entry_url:
+        steps.insert(0, {
+            "action": "goto",
+            "value": entry_url,
+            "observation_ref": match_url(entry_url),
+        })
+
+    # assertions：observation_ref 由 cursor 自动赋值；元素级引用必须
+    # 属于当前状态（跨状态引用在结构上不可能）
+    for a in case_dict.pop("assertions", []):
         if cursor is not None:
-            step["observation_ref"] = cursor
-            tref2 = step.get("target_ref")
+            a["observation_ref"] = cursor
+            tref2 = a.get("target_ref")
             if tref2:
                 allowed = refs_by_obs.get(cursor, set())
                 if allowed and tref2 not in allowed:
                     raise ValueError(
-                        f"ASSERTION_REF_OUT_OF_CURRENT_STATE: 步骤引用 "
+                        f"ASSERTION_REF_OUT_OF_CURRENT_STATE: 断言引用 "
                         f"{tref2} 不属于当前状态 {cursor}（断言只能引用"
                         "当前状态元素；页面级断言可不提供 target_ref）")
+        steps.append(a)
+    case_dict["steps"] = steps
     return case_dict
 
 
@@ -797,6 +768,7 @@ def _generate_planner_case(
     tables: str | None = None,
     verified_edges: list[dict] | None = None,
     observations: list[dict] | None = None,
+    entry_url: str | None = None,
 ) -> tuple[DSLCase, dict]:
     """Planner 生成 + 校验；schema 失败 constrained recovery ×1。
 
@@ -830,14 +802,13 @@ def _generate_planner_case(
 
     def parse_and_validate(text: str) -> DSLCase:
         case_dict = _extract_json(text)
-        # R7.1：transition_ref 确定性展开 + state cursor grounding
-        #（在 DSL 校验前——展开后才合法）
+        # S3：transition_refs + assertions 确定性展开（在 DSL 校验前——
+        # 展开后才合法；LLM 不输出步骤结构，无 28KB 回吐空间）
         if refs_only and verified_edges:
-            n_before = len([
-                s for s in case_dict.get("steps", []) if "transition_ref" in s
-            ])
-            case_dict = _expand_transition_refs(
-                case_dict, verified_edges, observations=observations)
+            n_before = len(case_dict.get("transition_refs") or [])
+            case_dict = _expand_plan_schema(
+                case_dict, verified_edges,
+                observations=observations, entry_url=entry_url)
             meta["transitions_expanded"] = n_before
         case = validate_case(case_dict)
         if refs_only:
@@ -878,8 +849,8 @@ def _generate_planner_case(
         t = perf_counter()
         repaired_text = _call_llm(
             recovery_prompt,
-            system_prompt=PLANNER_RECOVERY_SYSTEM_PROMPT_REFS_ONLY
-            if refs_only else PLANNER_RECOVERY_SYSTEM_PROMPT,
+            system_prompt=(SYSTEM_PROMPT_REFS_ONLY
+                            if refs_only else PLANNER_RECOVERY_SYSTEM_PROMPT),
         )
         meta["planner_recovery_ms"] = int((perf_counter() - t) * 1000)
         meta["recovery_output_chars"] = len(repaired_text)
@@ -1989,6 +1960,12 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
 
     t_planner = perf_counter()
     planner_mode = "refs_only" if multi_snapshot else "legacy"
+    # S1 临时诊断：prompt 尺寸（排查 Planner 28KB 输出复发）
+    print(f"[GEN] PROMPT_CHARS grounded={len(grounded_prompt)} "
+          f"compact_refs={len(compact_refs or '')} "
+          f"explore_done={(explore_result or {}).get('done')} "
+          f"steps={(explore_result or {}).get('steps_used')} "
+          f"obs={len(pages)}", flush=True)
 
     # ← grounding 验证：observation_ref 必须来自系统提供的真实 id
     #（不靠 Prompt——代码校验；非法 ref 清空为 None，降级弱验证）
@@ -2009,6 +1986,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         case, planner_meta = _generate_planner_case(
             prompt, mode=planner_mode, tables=effective_tables,
             verified_edges=verified_edges, observations=pages,
+            entry_url=entry_url,
         )   # ← Schema Recovery ×1（refs-only 模式含契约违规修复）
         case, removed = _normalize_steps(case)   # ← 计划归一化 + 记录删除
         case = _normalize_invalid_scopes(case)   # ← 导航 scope invariant

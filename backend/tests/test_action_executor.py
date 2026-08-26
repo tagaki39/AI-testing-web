@@ -318,16 +318,18 @@ def test_a43_policy_derives_completed_from_transitions():
 
 
 def test_a43_policy_hides_terminal_action_until_complete():
-    """Policy：数量未完成时 interaction root 内终态动作被隐藏；
-    完成后原样返回（数据驱动，无浏览器）。"""
-    from explore.explorer import _apply_goal_constraints
+    """Policy（modal）：数量未完成时 interaction root 内终态动作被隐藏；
+    完成后只保留收尾动作（数据驱动，无浏览器）。"""
+    from explore.explorer import _apply_modal_constraints
     from explore.observation import ExploreState
     modal_actions = [
         {"ref": "obs2:e1", "kind": "action", "name": "Continue Shopping"},
         {"ref": "obs2:e2", "kind": "action", "name": "View Cart"},
         {"ref": "obs2:e3", "type": "text", "text": "Added!", "kind": "evidence"},
     ]
-    state = ExploreState(goal="将前两个商品加入购物车", entry_url="https://x.com")
+    state = ExploreState(
+        goal="将前两个商品加入购物车，并在购物车中验证商品信息",
+        entry_url="https://x.com")
     state.observations = [
         {"id": "obs1", "url": "x", "elements": [
             {"ref": "obs1:e1", "kind": "action", "name": "Add to cart",
@@ -339,7 +341,7 @@ def test_a43_policy_hides_terminal_action_until_complete():
     state.transitions = [
         {"from": "obs1", "action": "click", "target_ref": "obs1:e1", "to": "obs2"},
     ]
-    names = [e.get("name") for e in _apply_goal_constraints(
+    names = [e.get("name") for e in _apply_modal_constraints(
         state.goal, state, modal_actions) if e.get("kind") == "action"]
     assert names == ["Continue Shopping"]
     # 完成 2 个 → 全部暴露
@@ -348,9 +350,42 @@ def test_a43_policy_hides_terminal_action_until_complete():
          "identity": {"attr": "data-product-id", "value": "8"}})
     state.transitions.append(
         {"from": "obs1", "action": "click", "target_ref": "obs1:e2", "to": "obs3"})
-    names2 = [e.get("name") for e in _apply_goal_constraints(
+    names2 = [e.get("name") for e in _apply_modal_constraints(
         state.goal, state, modal_actions) if e.get("kind") == "action"]
-    assert set(names2) == {"Continue Shopping", "View Cart"}
+    assert set(names2) == {"View Cart"}   # 完成态：只留收尾动作
+
+
+def test_a43_policy_excludes_completed_identity():
+    """S1：数量未完成时，已完成 identity 的 action 不作为剩余目标候选——
+    Add#1（product 1）后，product 1 的 Add 从 ActionSpace 消失，
+    第二次必然选不同商品（不靠 LLM 记忆，确定性过滤）。"""
+    from explore.explorer import _apply_goal_constraints
+    from explore.observation import ExploreState
+    state = ExploreState(goal="将前两个商品加入购物车", entry_url="https://x.com")
+    state.observations = [
+        {"id": "obs1", "url": "x", "elements": [
+            {"ref": "obs1:e1", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "1"}},
+            {"ref": "obs1:e2", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "8"}},
+        ]},
+    ]
+    state.transitions = [
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e1", "to": "obs2"},
+    ]
+    list_actions = state.observations[0]["elements"]
+    remaining = [e for e in _apply_goal_constraints(
+        state.goal, state, list_actions) if e.get("kind") == "action"]
+    # product 1（已完成）被过滤——只剩 product 8
+    assert len(remaining) == 1
+    assert remaining[0]["identity"] == {"attr": "data-product-id", "value": "8"}
+    # 无 identity 的 action 不过滤（不能误伤）
+    state.observations[0]["elements"].append(
+        {"ref": "obs1:e9", "kind": "action", "name": "Clear cart"})
+    remaining2 = [e for e in _apply_goal_constraints(
+        state.goal, state, state.observations[0]["elements"])
+        if e.get("kind") == "action"]
+    assert any(e.get("name") == "Clear cart" for e in remaining2)
 
 
 # ── 运行入口 ──────────────────────────────────────────────────────────────────

@@ -335,6 +335,67 @@ def test_j3_no_action_goal_exempt() -> None:
     assert _validate_completion(state) is None
 
 
+def test_cart_entry_name_semantic_classifier() -> None:
+    """购物车入口语义分类：PUA 图标前缀可匹配（BFC：导航 " Cart"），
+    但 "Add to cart" 绝不误判（正则保持语义精确）。"""
+    from explore.explorer import _is_cart_entry_name
+    assert _is_cart_entry_name("Cart")
+    assert _is_cart_entry_name(" Cart")
+    assert _is_cart_entry_name("View Cart")
+    assert _is_cart_entry_name(" View Cart")
+    # 反例：加购动作不是进入购物车
+    assert not _is_cart_entry_name("Add to cart")
+    assert not _is_cart_entry_name("Continue Shopping")
+
+
+def test_finish_disabled_until_completion() -> None:
+    """S1：完成校验不通过时 finish 在决策层禁用（prompt 白名单不含
+    finish + 代码校验拒绝）——不消耗预算让 LLM 反复尝试同一结论。"""
+    state = ExploreState(
+        goal="将前两个商品加入购物车，并在购物车中验证商品信息",
+        entry_url="https://x.com",
+    )
+    state.step_count = 5
+    state.history = [
+        {"action": "click", "target_ref": "obs1:e3", "target": {"role": "link", "name": "Add to cart"}},
+    ]
+    def llm(prompt, system_prompt=None, timeout=None):
+        # LLM 仍输出 finish（不遵守白名单）→ 代码校验拒绝
+        return '{"action": "finish", "exploration_complete": true}'
+    decision, err = _decide(state, llm, elements=[
+        {"ref": "obs2:e1", "kind": "action", "role": "button", "name": "Continue Shopping"},
+    ])
+    assert decision is None, "未完成时 finish 必须被拒"
+    assert "finish 当前禁用" in (err or "")
+    # 完成（数量齐 + 正停留在购物车终态）→ finish 允许
+    state.observations = [
+        {"id": "obs2", "url": "https://x.com", "elements": [
+            {"ref": "obs2:e1", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "1"}},
+            {"ref": "obs2:e2", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "8"}},
+        ]},
+        {"id": "obs6", "url": "https://x.com/view_cart", "elements": [
+            {"ref": "obs6:e1", "kind": "evidence", "text": "Shopping Cart"},
+        ]},
+    ]
+    state.transitions = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e1",
+         "target_name": "Add to cart", "to": "obs3"},
+        {"from": "obs4", "action": "click", "target_ref": "obs2:e2",
+         "target_name": "Add to cart", "to": "obs5"},
+        {"from": "obs5", "action": "click", "target_ref": "obs5:e2",
+         "target_name": "View Cart", "to": "obs6"},
+    ]
+    state.current_obs = "obs6"
+    state.history.append(
+        {"action": "click", "target_ref": "obs1:e3", "target": {"role": "link", "name": "Add to cart"}})
+    decision2, err2 = _decide(state, llm, elements=[
+        {"ref": "obs2:e1", "kind": "action", "role": "button", "name": "Continue Shopping"},
+    ])
+    assert decision2 is not None and decision2.get("action") == "finish", f"完成时应允许 finish: {err2}"
+
+
 def test_j4_cart_verify_requires_cart_entry_transition() -> None:
     """R7.2：目标要求"验证购物车"但 StateGraph 无成功购物车入口
     transition（View Cart）→ 完成宣告被拒；有则通过（不靠 URL）。"""
@@ -346,23 +407,48 @@ def test_j4_cart_verify_requires_cart_entry_transition() -> None:
     state.history = [
         {"action": "click", "target_ref": "obs1:e3", "target": {"role": "link", "name": "Add to cart"}},
     ]
-    # 只有加购 transition，无购物车入口 → 拒绝
+    # 数量检查先于 cart：completed=0 < required=2 → 数量拒绝
     state.transitions = [
         {"from": "obs2", "action": "click", "target_ref": "obs2:e1",
          "target_name": "Add to cart", "to": "obs3"},
     ]
     err = _validate_completion(state)
-    assert err is not None and "购物车" in err
-    # 成功 View Cart transition → 通过
-    state.transitions.append(
+    assert err is not None and "数量目标未完成" in err
+    # 数量完成（2 个不同实体）+ 成功 View Cart transition → 通过
+    state.observations = [
+        {"id": "obs2", "url": "https://x.com", "elements": [
+            {"ref": "obs2:e1", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "1"}},
+            {"ref": "obs2:e2", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "8"}},
+        ]},
+        {"id": "obs6", "url": "https://x.com/view_cart", "elements": [
+            {"ref": "obs6:e1", "kind": "evidence", "text": "Shopping Cart"},
+        ]},
+    ]
+    state.transitions = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e1",
+         "target_name": "Add to cart", "to": "obs3"},
+        {"from": "obs4", "action": "click", "target_ref": "obs2:e2",
+         "target_name": "Add to cart", "to": "obs5"},
         {"from": "obs5", "action": "click", "target_ref": "obs5:e2",
-         "target_name": "View Cart", "to": "obs6"})
+         "target_name": "View Cart", "to": "obs6"},
+    ]
+    state.current_obs = "obs6"   # current-state anchored：正停留在购物车终态
     assert _validate_completion(state) is None
+    # 进过购物车但已离开（current_obs ≠ cart to）→ 拒绝
+    state.current_obs = "obs3"
+    assert _validate_completion(state) is not None
     # self-loop 的 View Cart（无状态变化）不算成功入口
     state.transitions = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e1",
+         "target_name": "Add to cart", "to": "obs3"},
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e2",
+         "target_name": "Add to cart", "to": "obs5"},
         {"from": "obs5", "action": "click", "target_ref": "obs5:e2",
          "target_name": "View Cart", "to": "obs5"},
     ]
+    state.current_obs = "obs5"
     assert _validate_completion(state) is not None
 
 

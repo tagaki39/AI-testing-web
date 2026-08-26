@@ -45,12 +45,14 @@ LEGACY_KEYWORDS = [
     "不得在修改生效前断言新值",
 ]
 
+# S3：refs-only 输出 transition_refs + assertions——状态变化由已验证
+# 转移表达（执行器自动等待），不再需要 wait/postcondition 规则
 REFS_ONLY_KEYWORDS = [
-    "Wait after state-changing actions",
-    "Modify-then-assert",
-    "postcondition",
-    "不能证明加购完成",
-    "不得在修改生效前断言新值",
+    "transition_refs",
+    "assertions",
+    "已验证状态转移",
+    "你不需要（也无权）推导状态机",
+    "禁止输出任何 action 为 click/fill/goto 的步骤对象",
 ]
 
 
@@ -76,15 +78,18 @@ def test_wait_for_action_valid() -> None:
 
 
 def test_wait_rule_not_legacy_only() -> None:
-    """等待规则必须同时存在于两个模式（legacy 与 refs-only 走不同 prompt）。"""
-    for prompt in (SYSTEM_PROMPT, SYSTEM_PROMPT_REFS_ONLY):
-        assert "Wait after state-changing actions" in prompt
-        assert "Modify-then-assert" in prompt
-        # 规则必须是 postcondition 语义：允许"等 Remove"，禁止"等 Cart"
-        assert "Remove" in prompt
-        assert "不能证明加购完成" in prompt
-        # 禁止机械 wait-before-action
-        assert "机械" in prompt
+    """等待规则在 legacy 模式（SYSTEM_PROMPT）；refs-only 用 transition_refs
+    表达状态变化（已验证转移 + 执行器自动等待），S3 后无 wait 规则。"""
+    assert "Wait after state-changing actions" in SYSTEM_PROMPT
+    assert "Modify-then-assert" in SYSTEM_PROMPT
+    # 规则必须是 postcondition 语义：允许"等 Remove"，禁止"等 Cart"
+    assert "Remove" in SYSTEM_PROMPT
+    assert "不能证明加购完成" in SYSTEM_PROMPT
+    # 禁止机械 wait-before-action
+    assert "机械" in SYSTEM_PROMPT
+    # refs-only：状态变化只由 transition_refs 表达
+    assert "transition_refs" in SYSTEM_PROMPT_REFS_ONLY
+    assert "Wait after state-changing actions" not in SYSTEM_PROMPT_REFS_ONLY
 
 
 # ── detect_missing_postconditions 真检测器（graph-aware，确定性模式）───────────

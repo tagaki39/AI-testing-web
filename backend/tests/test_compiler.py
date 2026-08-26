@@ -568,15 +568,16 @@ def test_plan_summary_sanitized():
 
 # ── 4. R7.1：transition_ref 展开 + State Cursor Grounding ─────────────────────
 
-def test_expand_transition_refs_deterministic():
-    """transition_ref → action/target_ref/observation_ref 由已验证边展开；
-    断言 observation_ref 由 state cursor 自动赋值（LLM 无权写）。"""
-    from ai_agent import _expand_transition_refs
+def test_expand_plan_schema_deterministic():
+    """S3：transition_refs 数组 → 确定性展开；goto 自动注入；
+    断言 observation_ref 由 cursor 自动赋值（LLM 无权写）。"""
+    from ai_agent import _expand_plan_schema
     edges = [
         {"from": "obs2", "action": "click", "target_ref": "obs2:e44", "to": "obs3"},
         {"from": "obs3", "action": "click", "target_ref": "obs3:e2", "to": "obs5"},
     ]
     obs = [
+        {"id": "obs1", "url": "https://x.com/", "elements": []},
         {"id": "obs2", "url": "https://x.com/p", "elements": [
             {"ref": "obs2:e44", "kind": "action", "name": "Add to cart"}]},
         {"id": "obs3", "url": "https://x.com/p", "elements": [
@@ -584,34 +585,36 @@ def test_expand_transition_refs_deterministic():
         {"id": "obs5", "url": "https://x.com/cart", "elements": [
             {"ref": "obs5:e1", "kind": "evidence", "text": "Blue Top"}]},
     ]
-    out = _expand_transition_refs({
-        "name": "t", "steps": [
-            {"action": "goto", "value": "https://x.com/p"},
-            {"transition_ref": "t1"},
-            {"transition_ref": "t2"},
+    out = _expand_plan_schema({
+        "name": "t", "transition_refs": ["t1", "t2"],
+        "assertions": [
             {"action": "assert_visible", "target_ref": "obs5:e1"},
+            {"action": "assert_text", "value": "Blue Top"},
         ],
-    }, edges, obs)
+    }, edges, obs, entry_url="https://x.com/")
     steps = out["steps"]
+    # goto 自动注入（入口，observation_ref 匹配入口 obs）
+    assert steps[0] == {"action": "goto", "value": "https://x.com/",
+                        "observation_ref": "obs1"}
     assert steps[1] == {"action": "click", "target_ref": "obs2:e44",
                         "observation_ref": "obs2"}
     assert steps[2] == {"action": "click", "target_ref": "obs3:e2",
                         "observation_ref": "obs3"}
-    # 断言 observation_ref 由 cursor 自动赋值（当前 obs5，覆盖 LLM 手写）
+    # 断言 observation_ref 由 cursor 自动赋值（当前 obs5）
     assert steps[3]["action"] == "assert_visible"
     assert steps[3]["target_ref"] == "obs5:e1"
     assert steps[3]["observation_ref"] == "obs5"
-    assert "transition_ref" not in steps[3]
-    # 无边（legacy）→ 原样返回
-    assert _expand_transition_refs(out, []) is out
+    # 页面级断言无 target_ref → observation_ref 也自动赋值
+    assert steps[4]["action"] == "assert_text"
+    assert steps[4]["observation_ref"] == "obs5"
 
 
 def test_expand_transition_refs_unknown_rejected():
     """未知 transition_ref → ValueError（schema recovery 重试，不静默）。"""
-    from ai_agent import _expand_transition_refs
+    from ai_agent import _expand_plan_schema
     try:
-        _expand_transition_refs({
-            "name": "t", "steps": [{"transition_ref": "t9"}],
+        _expand_plan_schema({
+            "name": "t", "transition_refs": ["t9"], "assertions": [],
         }, [{"from": "obs1", "action": "click",
              "target_ref": "obs1:e1", "to": "obs2"}])
     except ValueError as exc:
@@ -623,7 +626,7 @@ def test_expand_transition_refs_unknown_rejected():
 def test_expand_assertion_ref_out_of_current_state():
     """断言引用非当前状态元素 → ASSERTION_REF_OUT_OF_CURRENT_STATE
     （跨状态引用结构上不可能，不靠 prompt/G3 兜底）。"""
-    from ai_agent import _expand_transition_refs
+    from ai_agent import _expand_plan_schema
     edges = [
         {"from": "obs2", "action": "click", "target_ref": "obs2:e44", "to": "obs3"},
     ]
@@ -634,12 +637,9 @@ def test_expand_assertion_ref_out_of_current_state():
             {"ref": "obs3:e1", "kind": "evidence", "text": "Cart"}]},
     ]
     try:
-        _expand_transition_refs({
-            "name": "t", "steps": [
-                {"action": "goto", "value": "https://x.com/p"},
-                {"transition_ref": "t1"},
-                {"action": "assert_visible", "target_ref": "obs2:e1"},
-            ],
+        _expand_plan_schema({
+            "name": "t", "transition_refs": ["t1"],
+            "assertions": [{"action": "assert_visible", "target_ref": "obs2:e1"}],
         }, edges, obs)
     except ValueError as exc:
         assert "ASSERTION_REF_OUT_OF_CURRENT_STATE" in str(exc)
@@ -650,16 +650,14 @@ def test_expand_assertion_ref_out_of_current_state():
 
 def test_expand_transition_out_of_order_rejected():
     """transition 起点 ≠ cursor → TRANSITION_OUT_OF_ORDER（路径沿边推进）。"""
-    from ai_agent import _expand_transition_refs
+    from ai_agent import _expand_plan_schema
     edges = [
         {"from": "obs2", "action": "click", "target_ref": "obs2:e44", "to": "obs3"},
     ]
     try:
-        _expand_transition_refs({
-            "name": "t", "steps": [
-                {"transition_ref": "t1"},
-                {"transition_ref": "t1"},   # 第二次：cursor=obs3 ≠ obs2
-            ],
+        _expand_plan_schema({
+            "name": "t", "transition_refs": ["t1", "t1"],   # 第二次 cursor=obs3
+            "assertions": [],
         }, edges)
     except ValueError as exc:
         assert "TRANSITION_OUT_OF_ORDER" in str(exc)
