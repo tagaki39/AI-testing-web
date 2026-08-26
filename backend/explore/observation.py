@@ -419,7 +419,7 @@ _INTERACTIVE_ROLES = {
 # 解析 aria_snapshot YAML 行的正则
 _ELEMENT_RE = re.compile(r'-\s+(\w+)\s+"([^"]*)"')          # - button "Login"
 _TEXT_RE = re.compile(r'-\s+text:\s*(.+)')                  # - text: Products
-def _observe_until_stable(page, timeout_ms: int = 3000) -> str:
+def _observe_until_stable(page, timeout_ms: int = 2000) -> str:
     """轮询页面 snapshot 直到状态稳定（等状态证据，不等固定时间）。
 
     评审 P0-2：点击后固定 300ms 等待不够——模态框/SPA 延迟渲染时
@@ -427,6 +427,9 @@ def _observe_until_stable(page, timeout_ms: int = 3000) -> str:
     （BFC 场景：Add to cart 后 modal 未渲染，obs3→obs3，modal 状态
     被错误归因到下一次 text 点击的超时窗口）。
     轮询：snapshot hash 变化后连续两次相同 → 认为稳定。
+    P1：本函数只用于【已确认分叉后】的新状态稳定（settle）——
+    不再承担"等待分叉"职责（旧登录页"连续稳定"≠ 动作完成，
+    见 _observe_after_action）。
     """
     deadline = perf_counter() + timeout_ms / 1000
     last_hash: str | None = None
@@ -441,6 +444,35 @@ def _observe_until_stable(page, timeout_ms: int = 3000) -> str:
                 return latest
         else:
             last_hash, stable_count = h, 0
+        page.wait_for_timeout(150)
+    return latest
+
+
+def _observe_after_action(page, before_url: str, before_snapshot: str,
+                          transition_timeout_ms: int = 5000,
+                          settle_timeout_ms: int = 2000) -> str:
+    """两阶段观察：先等状态分叉（transition divergence），再等新状态稳定。
+
+    P1（RuoYi 异步登录实测）：旧页面"连续两次稳定" ≠ 动作完成——登录
+    POST 后台跑几秒（SPA router push /index 延迟），登录页视觉稳定，
+    单阶段 _observe_until_stable 提前返回 → 伪 self-loop → StateGraph
+    无转移 → verified 门误判登录失败。
+
+    Phase 1（transition watch，≤ transition_timeout_ms）：
+      不断比较当前 URL/snapshot 与 before——出现有效变化 → 分叉确认
+    Phase 2（settle，≤ settle_timeout_ms）：
+      等新状态连续稳定（_observe_until_stable）
+
+    整个窗口无变化 → 诚实判定 self-loop（返回最后观察）。
+    """
+    before_hash = hashlib.sha256(before_snapshot.encode()).hexdigest()[:10]
+    deadline = perf_counter() + transition_timeout_ms / 1000
+    latest = before_snapshot
+    while perf_counter() < deadline:
+        latest = _observe(page)
+        if page.url != before_url \
+                or hashlib.sha256(latest.encode()).hexdigest()[:10] != before_hash:
+            return _observe_until_stable(page, timeout_ms=settle_timeout_ms)
         page.wait_for_timeout(150)
     return latest
 

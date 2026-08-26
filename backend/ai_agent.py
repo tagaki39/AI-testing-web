@@ -289,6 +289,13 @@ _EMAIL_IN_GOAL_RE = re.compile(r'[\w.+-]+@[\w.-]+\.[\w.]+')
 # ⚠️ "xxx / yyy" 模式必须要求 / 两边有空格 + 前置标识词——
 # 否则 "https://example.com" 的 // 会被误认为用户名/密码分隔（修复）
 _PASSWORD_PATTERNS = [
+    # "账号 test1 密码 147258"（无斜杠格式）——用户名 + 密码一起提取，
+    # 否则 username 残留进 LLM 上下文（LLM 输出真实值 → Data Grounding 拒）
+    re.compile(
+        r'(?:账号|用户名|login\s+with|using|用|使用)\s*[:：]?\s*'
+        r'([^\s，,。;；]+)\s+(?:密码|口令)[：:\s]+([^\s，,。;；]+)',
+        re.IGNORECASE,
+    ),
     re.compile(r'(?:密码|口令)[：:\s]+([^\s，,。;；]+)'),
     re.compile(r'password[：:\s]+([^\s，,。;；]+)', re.IGNORECASE),
     re.compile(
@@ -316,24 +323,38 @@ def _extract_and_redact_goal(goal: str) -> tuple[str, dict]:
         redacted = redacted.replace(m.group(0), "${email}")
 
     # ② 密码（多种写法，命中一个即可）
-    # 注意："用户名 / 密码" 格式：group(1)=用户名，group(2)=密码，
-    # 两者都提取注入（探索时 fill 都用 ${var} 占位，Executor 本地填值）；
-    # 其余写法（密码:/password:/口令）只有密码，取 group(1)。
-    m = _PASSWORD_PATTERNS[0].search(redacted) or _PASSWORD_PATTERNS[1].search(redacted)
+    # 注意：
+    #   pattern[0] = "账号 X 密码 Y"（无斜杠）：group(1)=用户名, group(2)=密码
+    #   pattern[3] = "用户名 / 密码"（斜杠）：group(1)=用户名, group(2)=密码
+    #   其余写法（密码:/password:/口令）只有密码，取 group(1)
+    m = _PASSWORD_PATTERNS[0].search(redacted)
     if m:
-        secret = m.group(1)
+        # 账号 X 密码 Y：group(1)=用户名（提取），group(2)=密码
+        username = m.group(1)
+        if not username.startswith("${"):
+            runtime["username"] = username
+            redacted = redacted.replace(username, "${username}")
+        secret = m.group(2)
     else:
-        m = _PASSWORD_PATTERNS[2].search(redacted)
+        m = _PASSWORD_PATTERNS[1].search(redacted)
         if m:
-            username = m.group(1)
-            if not username.startswith("${"):
-                # 用户名位置可能是已脱敏的 ${email} 占位符（修复：
-                # "login with ${email} / test123" 不再把占位符当真实用户名）
-                runtime["username"] = username
-                redacted = redacted.replace(username, "${username}")
-            secret = m.group(2)
+            secret = m.group(1)
         else:
-            secret = None
+            m = _PASSWORD_PATTERNS[2].search(redacted)
+            if m:
+                secret = m.group(1)
+            else:
+                m = _PASSWORD_PATTERNS[3].search(redacted)
+                if m:
+                    username = m.group(1)
+                    if not username.startswith("${"):
+                        # 用户名位置可能是已脱敏的 ${email} 占位符（修复：
+                        # "login with ${email} / test123" 不再把占位符当真实用户名）
+                        runtime["username"] = username
+                        redacted = redacted.replace(username, "${username}")
+                    secret = m.group(2)
+                else:
+                    secret = None
     if secret:
         runtime["password"] = secret
         redacted = redacted.replace(secret, "${password}")

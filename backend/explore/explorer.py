@@ -12,7 +12,7 @@ import re
 
 from execution.action_executor import execute_action
 from .observation import (
-    ExploreState, _observe, _observe_until_stable, _record_page,
+    ExploreState, _observe, _observe_after_action, _record_page,
 )
 from .action_space import _build_action_space, _locator_for_element
 
@@ -901,9 +901,15 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
 
             t0 = perf_counter()
             if action_done in {"click", "press", "back"}:
-                # P0-2：等状态证据而非固定时间——点击后模态框/SPA 延迟
-                # 渲染时，固定 300ms 观察会错位（旧状态 → self-loop 归因错）
-                snapshot = _observe_until_stable(page)
+                # P0-2/P1：两阶段观察——先等状态分叉（延迟 SPA 跳转，
+                # 如 RuoYi 登录几秒后才 router push /index），再等新状态
+                # 稳定。旧登录页"连续稳定"≠ 动作完成（过早返回 → 伪
+                # self-loop → 无转移 → verified 门误判）。
+                snapshot = _observe_after_action(
+                    page,
+                    before_url=page.url,
+                    before_snapshot=state.snapshot or _observe(page),
+                )
                 state.timings["settle_ms"] += int((perf_counter() - t0) * 1000)
             else:
                 snapshot = _observe(page)
