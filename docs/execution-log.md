@@ -15,9 +15,9 @@
 
 | 场景 | 结果 | 关键指标 |
 |---|---|---|
-| AutomationExercise BFC | ✅ | 探索 6 步/5 llm/done=True；case 9 步（两个商品 id=1/8）；执行 9/9（identity_exact ×2） |
+| AutomationExercise BFC | ✅ | 探索 7 步/5 llm/done=True；case 10 步（两个商品 id=1/8）；执行 10/10（identity_exact） |
 | SauceDemo 登录+加购 | ✅ | 探索 4 步/done=True；case 6 步（fill ×2 由 pre_actions 恢复）；执行 6/6 |
-| xywhaigc 登录 | ⚠️ BLOCKED（环境） | 站点手工登录失败（URL 不跳转）→ 明确返回 `探索未验证目标动作: login`（失败位置正确，非代码回归） |
+| xywhaigc 登录 | ✅（P1 修复后） | 探索 3 步/3 llm/done=True；case 6 步（fill×2 + 登录 + assert_url /index）；执行 6/6（真实登录成功） |
 
 ### 核心 bug 链（本轮修复）
 
@@ -34,6 +34,19 @@
    representation 须动作语义等价（同 tag+文本）才选一。
 5. **PUA 语义归一化**：购物车入口判定剥 PUA 图标（" Cart" → Cart），不改原始名称。
 
+### P1 修复（`5f8b55e`）——两阶段观察
+
+- **根因**：点击 Login 后 RuoYi 登录 POST 后台跑几秒才 router push /index——
+  旧 `_observe_until_stable` 在登录页"连续两次稳定"（几百 ms）就提前返回
+  → 伪 self-loop → 无转移 → verified 门误判登录失败（错误归因为"环境"）。
+- **修复**：`_observe_after_action` 两阶段——Phase 1 等 URL/hash 相对 before
+  分叉（≤5s），Phase 2 新状态 settle（≤2s）。`_observe_until_stable` 收敛为
+  纯 settle。
+- **脱敏**：新增"账号 X 密码 Y"格式提取（username 曾残留进 LLM 上下文 →
+  输出真实值被 Data Grounding 拒 → 预算浪费）；斜杠格式索引修正。
+- **效果**：xywhaigc 从"10 llm 预算耗尽失败"到"3 步/3 llm 完成 + 6/6
+  真实登录"（assert_url /index 真实验证）；BFC/SauceDemo 回归通过。
+
 ### 已知限制（技术债，只记录不修）
 
 - **verified outcome ≈ from_obs != to_obs** 是阶段性代理。若遇"业务成功但 canonical
@@ -41,7 +54,9 @@
   `state transition OR explicit postcondition evidence`。当前无真实失败案例，不加。
 - **显式 wait_for 未注入**：DSL 无 wait_for 步骤（依赖 Playwright 自动等待 + resolve 5s
   轮询）。慢页面（SPA >5s 渲染）时 click resolve 可能失败。挂起（用户决策后实施）。
-- **xywhaigc**：站点登录当前失败（外部环境）。账号恢复后需补跑正常链路。
+- **P2/P3（观察）**：canonical observation 对 focus 等瞬时 UI 状态可能过敏（伪
+  transition）；ActionSpace 允许低价值动作（click textbox / 重复同值 fill）浪费预算。
+  当前无真实阻塞案例，观察后再修。
 
 ### 清理项（S1）
 
