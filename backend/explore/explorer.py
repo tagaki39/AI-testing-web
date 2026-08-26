@@ -53,6 +53,21 @@ def _detect_auth_failure(snapshot: str) -> bool:
     low = snapshot.lower()
     return any(m in low for m in _AUTH_FAILURE_MARKERS)
 
+
+def _detect_error_page(snapshot: str) -> bool:
+    """页面是否为明确错误页（404/500 → 目标无法继续 → honest stop）。
+
+    R5（xywhaigc 案例）：登录后跳 404，探索不应继续点"返回首页"
+    把无关状态纳入路径。保守匹配防误报：404/500 需要数字 + 错误
+    关键词组合，或明确中文短语。
+    """
+    low = snapshot.lower()
+    if "404" in low and any(m in low for m in ("not found", "找不到", "不存在")):
+        return True
+    if "500" in low and any(m in low for m in ("internal", "服务器错误", "服务异常")):
+        return True
+    return any(m in low for m in ("页面不存在", "找不到网页", "404错误"))
+
 def _is_repeated_no_progress(state: "ExploreState", action: str, ref: str) -> bool:
     """同一状态 + 同一动作 + 同一 ref 连续重复且上一次无进展 → True。
 
@@ -489,6 +504,19 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                     "url": state.current_url,
                     "action": "auth_rejected",
                     "error": "页面出现认证失败提示，测试目标无法继续——停止探索",
+                })
+                state.done = True
+                break
+
+            # 错误页 honest stop（R5：xywhaigc 案例——登录后 404，探索
+            # 不应继续点"返回首页"把无关状态纳入探索路径，最后靠 G3 兜底。
+            # 明确错误页 = 用户目标无法继续 → 诚实停止并记录）。
+            if _detect_error_page(state.snapshot):
+                state.history.append({
+                    "url": state.current_url,
+                    "action": "error_page",
+                    "error": "页面为错误页（404/500）——测试目标无法继续，"
+                             "停止探索（GOAL_NOT_REACHED）",
                 })
                 state.done = True
                 break

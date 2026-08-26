@@ -16,9 +16,9 @@ from .action_space import (
 from .explorer import (
     explore, _within_origin,   # R4：policy 已合并回 explorer；_act 已由 execution/action_executor 取代
     GOAL_ACTION_PATTERNS, _ACTION_KEYWORDS, goal_requires_actions,
-    _decide, _detect_auth_failure, _is_repeated_no_progress,
-    _validate_completion, DECIDE_PROMPT, EXPLORE_SYSTEM_PROMPT,
-    _elements_to_prompt,
+    _decide, _detect_auth_failure, _detect_error_page,
+    _is_repeated_no_progress, _validate_completion, DECIDE_PROMPT,
+    EXPLORE_SYSTEM_PROMPT, _elements_to_prompt,
 )
 # R3.1：执行超时常量已迁入执行层（Browser Action Executor）——
 # 保留此重导出以免破坏既有引用

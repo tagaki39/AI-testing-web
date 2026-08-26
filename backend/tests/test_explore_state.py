@@ -36,7 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from explore import (   # noqa: E402
-    ExploreState, _decide, _detect_auth_failure,
+    ExploreState, _decide, _detect_auth_failure, _detect_error_page,
     _is_repeated_no_progress, _record_page, _validate_action_target,
     _validate_completion, validate_actionability,
 )
@@ -324,6 +324,24 @@ def test_j3_no_action_goal_exempt() -> None:
     state = ExploreState(goal="verify page contains welcome", entry_url="https://x.com")
     state.step_count = 0
     assert _validate_completion(state) is None
+
+
+# ── K：错误页 honest stop（R5：404/500 → 目标无法继续 → 诚实停止）─────────────
+
+def test_k_detects_404_page() -> None:
+    """404 错误页（数字 + 关键词 / 明确中文）→ 识别。"""
+    assert _detect_error_page("404错误! 找不到网页！ 对不起，您正在寻找的页面不存在。")
+    assert _detect_error_page("404 Not Found - The requested URL was not found on this server")
+    assert _detect_error_page("页面不存在，请返回首页")
+    assert _detect_error_page("Internal Server Error 500")
+
+
+def test_k2_no_false_positive() -> None:
+    """正常页面（含 404 数字/常见词）→ 不误报。"""
+    assert not _detect_error_page("Products list with 404 items and prices")
+    assert not _detect_error_page("welcome to the page, content loaded")
+    assert not _detect_error_page("")
+    assert not _detect_error_page("价格 500 元，库存充足")
 
 
 # ── F/G：no-progress guard + auth failure（Transition/Progress Validation）────
