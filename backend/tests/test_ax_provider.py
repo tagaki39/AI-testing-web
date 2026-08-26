@@ -21,7 +21,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from explore.observation import (   # noqa: E402
-    AXNode, CDPAccessibilityProvider, normalize_cdp_ax_node,
+    AXNode, CDPAccessibilityProvider, build_observation_elements,
+    normalize_cdp_ax_node,
 )
 
 
@@ -70,6 +71,64 @@ def test_normalize_string_values():
         {"name": "checked", "value": {"value": "mixed"}},
     ]))
     assert n.checked == "mixed"
+
+
+# ── A2：Structured Observation（kind / context / 树结构）─────────────────────
+
+def _ax(id_, role, name="", parent=None, ignored=False, **kw):
+    return AXNode(ax_id=id_, role=role, name=name, parent_ax_id=parent,
+                  child_ax_ids=[], backend_dom_node_id=None, ignored=ignored, **kw)
+
+
+def test_a2_kind_classification():
+    """button → action / dialog → container / 无区分能力文本被跳过。"""
+    nodes = [
+        _ax("1", "button", "Continue Shopping"),
+        _ax("2", "dialog", "Added!"),
+        _ax("3", "text", "登录成功"),
+    ]
+    els = build_observation_elements(nodes)
+    kinds = {e.role: e.kind for e in els}
+    assert kinds["button"] == "action"
+    assert kinds["dialog"] == "container"
+    assert "text" not in kinds   # 文本 evidence 由 aria 文本路径承担（A2 阶段）
+
+
+def test_a2_semantic_context_dialog():
+    """dialog 内的 button → context_role=dialog, context_name=Added!。"""
+    nodes = [
+        _ax("1", "dialog", "Added!"),
+        _ax("2", "button", "Continue Shopping", parent="1"),
+        _ax("3", "button", "View Cart", parent="1"),
+        _ax("4", "button", "Add to cart"),   # dialog 外
+    ]
+    els = build_observation_elements(nodes)
+    by_name = {e.name: e for e in els}
+    assert by_name["Continue Shopping"].context_role == "dialog"
+    assert by_name["Continue Shopping"].context_name == "Added!"
+    assert by_name["Add to cart"].context_role is None   # 容器外无 context
+
+
+def test_a2_parent_ref_reconstruction():
+    """父引用重建：child 的 parent_ref 指向父元素 ref。"""
+    nodes = [
+        _ax("1", "listitem", "Blue Top"),
+        _ax("2", "button", "Add to cart", parent="1"),
+    ]
+    els = build_observation_elements(nodes)
+    child = next(e for e in els if e.role == "button")
+    parent = next(e for e in els if e.role == "listitem")
+    assert child.parent_ref == parent.ref
+
+
+def test_a2_ignored_nodes_skipped():
+    """ignored 节点不进元素列表。"""
+    nodes = [
+        _ax("1", "button", "Login"),
+        _ax("2", "text", "decor", ignored=True),
+    ]
+    els = build_observation_elements(nodes)
+    assert len(els) == 1 and els[0].role == "button"
 
 
 # ── 真实 CDP 冒烟（Chromium 不可用时 SKIP）───────────────────────────────────

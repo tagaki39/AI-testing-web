@@ -91,6 +91,98 @@ class AriaSnapshotProvider(AccessibilityProvider):
     def capture(self, page) -> list[AXNode]:
         # 扁平兼容：不建层级，全部作为忽略节点（A2 的 aria legacy 路径接管）
         return []
+
+
+# ── A2：Structured Observation（结构化 A11y 元素模型）─────────────────────────
+# kind 分类（确定性规则，不上 LLM）：action 可操作 / evidence 证据 /
+# container 语义容器。semantic_context = 最近有区分能力的语义容器
+#（dialog/listitem/form...）——Compiler 未来用它生成 scope，替代 scope_has_text。
+
+ACTION_ROLES = {
+    "button", "link", "textbox", "searchbox", "combobox", "checkbox",
+    "radio", "switch", "option", "menuitem", "tab", "slider",
+}
+
+CONTAINER_ROLES = {
+    "dialog", "form", "navigation", "main", "region", "article",
+    "list", "listitem", "group",
+}
+
+
+@dataclass
+class ObservationElement:
+    """结构化观察元素（A4 数据模型：层级/状态/kind/语义上下文）。"""
+    ref: str
+    role: str | None
+    name: str | None
+    kind: Literal["action", "evidence", "container"]
+    parent_ref: str | None = None
+    children: list[str] = field(default_factory=list)
+    focusable: bool = False
+    disabled: bool = False
+    checked: bool | None = None
+    selected: bool | None = None
+    expanded: bool | None = None
+    context_role: str | None = None      # 最近语义容器（dialog/listitem/form...）
+    context_name: str | None = None
+    backend_dom_node_id: int | None = None   # 仅诊断，不作为 locator
+
+
+def _classify(role: str | None) -> str:
+    if role in ACTION_ROLES:
+        return "action"
+    if role in CONTAINER_ROLES:
+        return "container"
+    return "evidence"
+
+
+def find_semantic_context(node: AXNode, by_id: dict[str, AXNode]) -> tuple[str | None, str | None]:
+    """沿祖先找最近的、有 name 的语义容器（dialog/form/article/listitem/group/region）。"""
+    parent = by_id.get(node.parent_ax_id or "") if node.parent_ax_id else None
+    seen = 0
+    while parent and seen < 32:
+        if parent.role in {"dialog", "form", "article", "listitem", "group", "region"} \
+                and parent.name:
+            return parent.role, parent.name
+        parent = by_id.get(parent.parent_ax_id or "") if parent.parent_ax_id else None
+        seen += 1
+    return None, None
+
+
+def build_observation_elements(ax_nodes: list[AXNode]) -> list[ObservationElement]:
+    """AX 树 → 结构化元素列表（扁平 ref 序列 + 层级/kind/语义上下文）。
+
+    A2：Observation 的事实源从文本升级为结构化树；refs 保持 obsN:eM
+    格式（Planner 只认 ref，AXNodeId 不进入 DSL）。
+    """
+    by_id = {n.ax_id: n for n in ax_nodes}
+    active = [
+        n for n in ax_nodes
+        if not n.ignored and n.role not in ("generic", "text", "StaticText",
+                                            "none", "presentation")
+    ]
+    ax_to_ref = {n.ax_id: f"e{i + 1}" for i, n in enumerate(active)}
+    elements: list[ObservationElement] = []
+    for n in active:
+        kind = _classify(n.role)
+        ctx_role, ctx_name = find_semantic_context(n, by_id)
+        elements.append(ObservationElement(
+            ref=ax_to_ref[n.ax_id],
+            role=n.role,
+            name=n.name or None,
+            kind=kind,
+            parent_ref=ax_to_ref.get(n.parent_ax_id or ""),
+            children=[c for c in n.child_ax_ids if c in ax_to_ref],
+            focusable=n.focusable,
+            disabled=n.disabled,
+            checked=n.checked,
+            selected=n.selected,
+            expanded=n.expanded,
+            context_role=ctx_role,
+            context_name=ctx_name,
+            backend_dom_node_id=n.backend_dom_node_id,
+        ))
+    return elements
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
 _MAX_TEXT_ELEMENTS = 20      # 文本节点最多注入 20 个（防上下文膨胀）
 _MAX_TEXT_LINES = 25         # 智能裁剪：text 行限量
@@ -261,6 +353,33 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     if snapshot is None:
         snapshot = _observe(page)
     elements = _parse_elements(snapshot)   # ← ref 表（页面级 e1/e2，局部变量）
+
+    # A2：CDP 结构化 A11y 增强——给 role 元素附加 kind/context/层级
+    #（语义容器 context 供 A3 ActionSpace 用；CDP 不可用时静默跳过，
+    #  保持 aria legacy 路径——观察能力兼容 fallback，非定位猜测）。
+    try:
+        ax_nodes = CDPAccessibilityProvider().capture(page)
+        if ax_nodes:
+            structured = build_observation_elements(ax_nodes)
+            ax_by_sig: dict[tuple, ObservationElement] = {}
+            for se in structured:
+                ax_by_sig.setdefault((se.role, (se.name or "").strip()), se)
+            for e in elements:
+                if "role" not in e or not e.get("name"):
+                    continue
+                se = ax_by_sig.get((e["role"], str(e["name"]).strip()))
+                if se is None:
+                    continue
+                e["kind"] = se.kind
+                if se.context_role:
+                    e["context_role"] = se.context_role
+                    e["context_name"] = se.context_name
+                if se.parent_ref:
+                    e["parent_ref"] = se.parent_ref
+                if se.backend_dom_node_id:
+                    e["backend_dom_node_id"] = se.backend_dom_node_id
+    except Exception:
+        pass   # CDP 不可用 → 保持扁平（aria legacy）
 
     # 状态哈希：snapshot 变化 = 页面状态变化（即使 URL 相同）
     state_hash = hashlib.sha256(snapshot.encode()).hexdigest()[:10]
