@@ -227,9 +227,19 @@ def build_locator_candidates(container, t: ParsedTarget) -> list[tuple[str, obje
         # 确定性属性定位（非 CSS fallback：由 Compiler 从观察元素编译，
         # LLM 不生成）。多个 DOM representation 时 count>1 由调用方
         # 做可执行性裁决（visible 唯一）。
-        candidates.append(("identity_exact", container.locator(
-            f'[{t.identity["attr"]}="{t.identity["value"]}"]',
-        )))
+        # S1：identity 是业务约束（filter）——目标指定了商品，role/text
+        # fallback 可能命中【别的商品】（BFC 实测：id=8 元素渲染竞态时
+        # role 命中了唯一可见的 Blue Top Add → 加错商品，购物车两件 500）。
+        # count=0 时由调用方轮询等待（allow_lazy）或诚实失败，绝不降级。
+        selector = f'[{t.identity["attr"]}="{t.identity["value"]}"]'
+        # S1：identity 是业务实体约束——【全局】建立候选集，scope 不参与。
+        # BFC 实测：scope 容器（I1 采集的 scope_has_text 可能因 DOM 结构
+        # 匹配到相邻卡片）会把正确 identity 过滤掉（global=2 scoped=0）。
+        # identity 唯一标识业务实体，跨容器；scope 只对无 identity 的
+        # role/text fallback 消歧。
+        _page = container.page if hasattr(container, "page") else container
+        candidates.append(("identity_exact", _page.locator(selector)))
+        return candidates
     if t.test_id:
         # get_by_test_id 默认只认 data-testid；真实站点常用 data-test/data-qa
         #（saucedemo 用 data-test）→ 附加属性变体
@@ -484,10 +494,32 @@ def decide_resolution(rows: list) -> ResolutionResult:
                     hits=[(strategy, locator.nth(i))],
                 )
             if len(visible_indices) > 1:
+                # S1：多 visible 必须【证明动作语义等价】才视为同一动作的
+                # 多个 representation（Identity 约束"是谁"，role/name 约束
+                # "做什么"——只有 (tag, 文本) 一致的节点才等价）。
+                # BFC 实测：全局 [data-product-id="1"] 16 个都是 Blue Top
+                # 的 Add to cart（Polo 卡片 + 推荐区）→ 等价 → 选第一个；
+                # 若混入不同语义（Remove/View Product）→ AMBIGUOUS。
+                try:
+                    handles = locator.all()
+                    sigs = {
+                        handles[i].evaluate(
+                            "el => el.tagName + '|' + (el.innerText || '').trim()")
+                        for _, i in visible_indices
+                    }
+                except Exception:
+                    sigs = {"?"}
+                if len(sigs) == 1:
+                    strategy, i = visible_indices[0]
+                    return ResolutionResult(
+                        status="resolved", strategy="identity_exact",
+                        hits=[(strategy, locator.nth(i))],
+                    )
                 return ResolutionResult(
                     status="ambiguous",
-                    detail=f"identity_exact 命中 {len(visible_indices)} 处可见的"
-                           "重复表示（同一业务实体多份可见 DOM，无法裁决）",
+                    detail=(f"identity_exact 命中 {len(visible_indices)} 处可见"
+                            "但动作语义不一致的节点（同业务实体不同动作）"
+                            "——无法视为同一动作的 representation"),
                 )
         if positive_by_strategy:
             return ResolutionResult(

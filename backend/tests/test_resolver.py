@@ -446,14 +446,37 @@ def test_a42_identity_2_candidates_1_visible_resolved():
         pw.stop()
 
 
-def test_a42_identity_2_visible_ambiguous():
-    """identity_exact 命中 2 个且都可见 → AMBIGUOUS（诚实拒绝，不猜）。"""
+def test_a42_identity_2_visible_equivalent_resolved():
+    """S1：同 identity + 动作语义等价（同 role/文本）→ 同一动作的多个
+    representation（normal/overlay/多区卡片）→ resolved 选第一个。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button data-product-id="1" id="first">Add to cart</button>\n'
+            '<button data-product-id="1" id="second">Add to cart</button>'
+        )
+        strategy, locator = _resolve_locator(
+            page, {"role": "button", "name": "Add to cart",
+                   "identity": {"attr": "data-product-id", "value": "1"}},
+        )
+        assert strategy == "identity_exact"
+        assert locator.count() == 1
+        assert locator.get_attribute("id") == "first"
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_a42_identity_2_visible_diff_action_ambiguous():
+    """S1：同 identity 但动作语义不一致（Add to cart vs Remove）——
+    不是同一动作的 representation → AMBIGUOUS（不因 identity 相同乱点）。"""
     from execution.runner import _resolve_locator
     pw, browser, page = _launch()
     try:
         page.set_content(
             '<button data-product-id="1">Add to cart</button>\n'
-            '<button data-product-id="1">Add to cart</button>'
+            '<button data-product-id="1">Remove</button>'
         )
         try:
             _resolve_locator(
@@ -462,7 +485,32 @@ def test_a42_identity_2_visible_ambiguous():
             )
         except LocatorAmbiguousError:
             return
-        raise AssertionError("两个可见 identity 候选未被拒绝")
+        raise AssertionError("不同动作语义未被拒绝")
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_identity_global_not_scoped():
+    """S1：identity 是业务实体约束——全局建立候选集，scope 容器内
+    0 匹配不得过滤正确 identity（BFC 实测：scope_has_text 采集到相邻
+    卡片时 scoped=0 global=2 → 加购目标被 scope 抹掉）。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<div data-product-id="1"><p>Blue Top</p><a href="#">Add to cart</a></div>\n'
+            '<div data-product-id="8"><p>Fancy Green Top</p><a href="#">Add to cart</a></div>'
+        )
+        # scope 容器错误指向 Blue Top（id=1 卡片），但 identity=8 全局唯一
+        strategy, locator = _resolve_locator(
+            page, {"role": "link", "name": "Add to cart",
+                   "identity": {"attr": "data-product-id", "value": "8"}},
+            scope={"has_text": "Blue Top"},
+        )
+        assert strategy == "identity_exact"
+        assert locator.count() == 1
+        assert "Fancy Green Top" in locator.inner_text()
     finally:
         browser.close()
         pw.stop()
