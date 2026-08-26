@@ -16,8 +16,10 @@ from .observation import ExploreState   # 类型注解（observation 只在函�
 ACTION_CAPABILITIES = {
     "button": {"click", "press"},
     "link": {"click", "press"},
-    "textbox": {"click", "fill", "press"},
-    "searchbox": {"click", "fill", "press"},
+    # P3：textbox/searchbox 不支持 click——fill() 本身完成 focus，
+    # 先 click 文本框是低价值动作（浪费预算；LLM 常误用）
+    "textbox": {"fill", "press"},
+    "searchbox": {"fill", "press"},
     "combobox": {"click", "press"},
     "checkbox": {"click"},
     "radio": {"click"},

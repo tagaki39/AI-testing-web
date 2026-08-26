@@ -3,26 +3,20 @@ explorer.py — 探索主循环（R3 拆分自 explore_flow）
   bounded loop：observe → ActionSpace → choose → execute → transition。
   Execute, don't predict：短超时执行，失败进 failed_actions。
 """
+import json
+import re
 from time import perf_counter
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
-import json
-import re
 
 from execution.action_executor import execute_action
 from .observation import (
     ExploreState, _observe, _observe_after_action, _record_page,
 )
-from .action_space import _build_action_space, _locator_for_element
-
-
-import json
-import re
-from time import perf_counter
-
-from .action_space import _validate_action_target
-from .observation import ExploreState   # 类型注解
+from .action_space import (
+    _build_action_space, _locator_for_element, _validate_action_target,
+)
 
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
 # S1：状态内可回放动作（from == to 时进 pending，绑定到后续真实迁移）
@@ -626,6 +620,23 @@ def _decide(state: ExploreState, llm_call, elements: list[dict] | None = None) -
                 return None, ("NO_PROGRESS: 同一元素上的同一动作上一次执行"
                               "未产生状态变化（self-loop）——禁止原地重复，"
                               "请选择其他动作或输出 finish 宣告失败")
+            # P3：同一 ref 已成功 fill 相同 ${var}（且期间无状态迁移）→
+            # 重复 fill 无意义（确定性拦截，省预算——xywhaigc 实测
+            # LLM 反复 fill 同一文本框）
+            if action == "fill" and ref:
+                repeated_fill = any(
+                    h.get("action") == "fill"
+                    and h.get("target_ref") == ref
+                    and h.get("value") == decision.get("value")
+                    for h in state.history
+                )
+                if repeated_fill and not any(
+                    t.get("from") != t.get("to")
+                    and t.get("target_ref") == ref
+                    for t in state.transitions
+                ):
+                    return None, ("NO_PROGRESS: 该文本框已成功 fill 相同值"
+                                  "（期间无状态迁移）——禁止重复，请进行其他操作")
             # 动作-元素结构合法性（评审 P0-1：text 元素不可点击等）。
             # 确定性拒绝 → 反馈历史让模型自纠（llm+1，step+0）。
             el = next((e for e in elements if e["ref"] == ref), None)

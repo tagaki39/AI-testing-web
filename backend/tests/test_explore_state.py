@@ -160,7 +160,8 @@ def test_h2_role_action_matrix() -> None:
     assert _validate_action_target("click", {"role": "button", "name": "Login"}) == (True, None)
     assert _validate_action_target("fill", {"role": "button", "name": "Login"})[0] is False
     assert _validate_action_target("fill", {"role": "textbox", "name": "Email"}) == (True, None)
-    assert _validate_action_target("click", {"role": "textbox", "name": "Email"}) == (True, None)
+    # P3：textbox 不支持 click（fill() 完成 focus——低价值动作移除）
+    assert _validate_action_target("click", {"role": "textbox", "name": "Email"})[0] is False
     assert _validate_action_target("press", {"role": "link", "name": "Cart"}) == (True, None)
 
 
