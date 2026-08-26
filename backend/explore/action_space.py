@@ -87,9 +87,15 @@ def _locator_for_element(page, element: dict) -> tuple[dict, dict | None, object
 
     E1：_act 与 validate_actionability 共用的定位构建——
     I1 同名重复元素带 scope_has_text 锚点消歧。
+    A4.2：观察期采集的稳定 identity（data-test 等）进 target——
+    探索执行与 DSL 执行同一定位语义（identity_exact 全站唯一，
+    同名元素（6 个 Add to cart / 图 link 与名 link）不再歧义）。
     """
     target = {"role": element["role"], "name": element["name"]} if "role" in element \
         else {"text": element["text"]}
+    ident = element.get("identity") or {}
+    if ident.get("attr") and ident.get("value"):
+        target["identity"] = ident
     scope = {"has_text": element["scope_has_text"]} if element.get("scope_has_text") else None
     _, locator = _resolve_locator(page, target, scope=scope)
     return target, scope, locator
