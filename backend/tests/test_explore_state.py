@@ -110,7 +110,8 @@ def _decide_state() -> ExploreState:
         goal="login", entry_url="https://x.com",
         input_keys={"email", "password"},
     )
-    state.elements = [{"ref": "obs2:e10", "role": "textbox", "name": "Email"}]
+    state.elements = [{"ref": "obs2:e10", "kind": "action",
+            "role": "textbox", "name": "Email"}]
     state.observations = [{
         "id": "obs2", "url": "https://x.com/login",
         "state_hash": "h", "elements": state.elements,
@@ -168,7 +169,8 @@ def test_h3_text_click_rejected_in_decide() -> None:
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
         {"ref": "obs1:e1", "type": "text", "text": "Blue Top"},
-        {"ref": "obs1:e2", "role": "button", "name": "Add to cart"},
+        {"ref": "obs1:e2", "kind": "action",
+            "role": "button", "name": "Add to cart"},
     ]
     state.observations = [{
         "id": "obs1", "url": "https://x.com", "state_hash": "h",
@@ -178,13 +180,15 @@ def test_h3_text_click_rejected_in_decide() -> None:
         return '{"action": "click", "target_ref": "obs1:e1"}'
     decision, err = _decide(state, llm)
     assert decision is None, "click text 必须被拒"
-    assert "NON_ACTIONABLE_REF" in (err or "")
+    # R7.3：决策层白名单提前拒绝（text 无 kind=action，不进入 Selectable）
+    assert "不是可操作元素" in (err or "")
 
 
 def test_h4_button_click_passes() -> None:
     """点击真按钮 → 通过（对照）。"""
     state = ExploreState(goal="buy", entry_url="https://x.com")
-    state.elements = [{"ref": "obs1:e2", "role": "button", "name": "Add to cart"}]
+    state.elements = [{"ref": "obs1:e2", "kind": "action",
+            "role": "button", "name": "Add to cart"}]
     state.observations = [{
         "id": "obs1", "url": "https://x.com", "state_hash": "h",
         "elements": state.elements,
@@ -254,8 +258,10 @@ def test_i4_blacklist_removed_from_action_space() -> None:
     from explore import _build_action_space
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
-        {"ref": "obs4:e25", "role": "link", "name": "Add to cart", "actionable": True},
-        {"ref": "obs4:e24", "role": "button", "name": "Continue Shopping", "actionable": True},
+        {"ref": "obs4:e25", "kind": "action",
+            "role": "link", "name": "Add to cart", "actionable": True},
+        {"ref": "obs4:e24", "kind": "action",
+            "role": "button", "name": "Continue Shopping", "actionable": True},
     ]
     state.observations = [{
         "id": "obs4", "url": "https://x.com", "state_hash": "h",
@@ -273,8 +279,10 @@ def test_i5_blacklisted_ref_rejected_by_validator() -> None:
     """防御兜底：模型仍输出黑名单 ref → ref 校验拒绝（不在候选表内）。"""
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
-        {"ref": "obs4:e25", "role": "link", "name": "Add to cart", "actionable": True},
-        {"ref": "obs4:e24", "role": "button", "name": "Continue Shopping", "actionable": True},
+        {"ref": "obs4:e25", "kind": "action",
+            "role": "link", "name": "Add to cart", "actionable": True},
+        {"ref": "obs4:e24", "kind": "action",
+            "role": "button", "name": "Continue Shopping", "actionable": True},
     ]
     state.observations = [{
         "id": "obs4", "url": "https://x.com", "state_hash": "h",
@@ -288,7 +296,7 @@ def test_i5_blacklisted_ref_rejected_by_validator() -> None:
         e for e in state.elements if (state.current_obs, "click", e["ref"])
         not in state.failed_actions])
     assert decision is None, "黑名单 ref 必须被拒"
-    assert "不在当前元素表" in (err or "")
+    assert "不是可操作元素" in (err or "")
 
 
 # ── J：完成宣告的完整性校验（BFC 实测：3 步宣告完成，目标动作未探索）─────────
@@ -327,6 +335,37 @@ def test_j3_no_action_goal_exempt() -> None:
     assert _validate_completion(state) is None
 
 
+def test_j4_cart_verify_requires_cart_entry_transition() -> None:
+    """R7.2：目标要求"验证购物车"但 StateGraph 无成功购物车入口
+    transition（View Cart）→ 完成宣告被拒；有则通过（不靠 URL）。"""
+    state = ExploreState(
+        goal="将前两个商品加入购物车，并在购物车中验证商品信息",
+        entry_url="https://x.com",
+    )
+    state.step_count = 5
+    state.history = [
+        {"action": "click", "target_ref": "obs1:e3", "target": {"role": "link", "name": "Add to cart"}},
+    ]
+    # 只有加购 transition，无购物车入口 → 拒绝
+    state.transitions = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e1",
+         "target_name": "Add to cart", "to": "obs3"},
+    ]
+    err = _validate_completion(state)
+    assert err is not None and "购物车" in err
+    # 成功 View Cart transition → 通过
+    state.transitions.append(
+        {"from": "obs5", "action": "click", "target_ref": "obs5:e2",
+         "target_name": "View Cart", "to": "obs6"})
+    assert _validate_completion(state) is None
+    # self-loop 的 View Cart（无状态变化）不算成功入口
+    state.transitions = [
+        {"from": "obs5", "action": "click", "target_ref": "obs5:e2",
+         "target_name": "View Cart", "to": "obs5"},
+    ]
+    assert _validate_completion(state) is not None
+
+
 # ── K：错误页 honest stop（R5：404/500 → 目标无法继续 → 诚实停止）─────────────
 
 def test_k_detects_404_page() -> None:
@@ -352,11 +391,14 @@ def test_a3_dialog_limits_action_space() -> None:
     Continue Shopping），dialog 外 Add to cart 不暴露。"""
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
-        {"ref": "obs4:e35", "role": "link", "name": "View Cart",
+        {"ref": "obs4:e35", "kind": "action",
+            "role": "link", "name": "View Cart",
          "actionable": True, "context_role": "dialog", "context_name": "Added!"},
-        {"ref": "obs4:e36", "role": "button", "name": "Continue Shopping",
+        {"ref": "obs4:e36", "kind": "action",
+            "role": "button", "name": "Continue Shopping",
          "actionable": True, "context_role": "dialog", "context_name": "Added!"},
-        {"ref": "obs4:e25", "role": "link", "name": "Add to cart",
+        {"ref": "obs4:e25", "kind": "action",
+            "role": "link", "name": "Add to cart",
          "actionable": True, "kind": "action"},   # dialog 外 action（无 context）
         {"ref": "obs4:e30", "type": "text", "text": "Blue Top"},
     ]
@@ -376,8 +418,10 @@ def test_a3_no_dialog_no_restriction() -> None:
     """无 dialog 上下文 → 全部 actionable 元素正常暴露。"""
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
-        {"ref": "obs2:e10", "role": "link", "name": "Add to cart", "actionable": True},
-        {"ref": "obs2:e4", "role": "link", "name": "Cart", "actionable": True},
+        {"ref": "obs2:e10", "kind": "action",
+            "role": "link", "name": "Add to cart", "actionable": True},
+        {"ref": "obs2:e4", "kind": "action",
+            "role": "link", "name": "Cart", "actionable": True},
     ]
     state.observations = [{
         "id": "obs2", "url": "https://x.com", "state_hash": "h",
@@ -393,7 +437,8 @@ def test_a3_no_dialog_no_restriction() -> None:
 def _progress_state() -> ExploreState:
     state = ExploreState(goal="login", entry_url="https://x.com",
                          input_keys={"email", "password"})
-    state.elements = [{"ref": "obs2:e12", "role": "button", "name": "Login"}]
+    state.elements = [{"ref": "obs2:e12", "kind": "action",
+            "role": "button", "name": "Login"}]
     state.observations = [{
         "id": "obs2", "url": "https://x.com/login",
         "state_hash": "h", "elements": state.elements,
@@ -422,7 +467,8 @@ def test_f2_self_loop_different_action_passes() -> None:
     state.transitions.append({
         "from": "obs2", "action": "click", "target_ref": "obs2:e12", "to": "obs2",
     })
-    state.elements.append({"ref": "obs2:e10", "role": "textbox", "name": "Email"})
+    state.elements.append({"ref": "obs2:e10", "kind": "action",
+            "role": "textbox", "name": "Email"})
     def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "fill", "target_ref": "obs2:e10", "value": "${email}"}'
     decision, err = _decide(state, llm)

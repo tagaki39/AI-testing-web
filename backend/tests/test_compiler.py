@@ -139,6 +139,44 @@ def test_compile_unknown_ref_rejected():
     raise AssertionError("未抛出 UnknownTargetRefError")
 
 
+def test_compile_ax_static_text_as_text_locator():
+    """AX StaticText 不是 ARIA role——编译成 text 定位（get_by_text），
+    不生成 Locator(role="StaticText")（BFC 购物车断言真实失败回归）。"""
+    graph = StateGraph(observations=[
+        {"id": "obs1", "url": "https://x.com/cart", "elements": [
+            {"ref": "obs1:e11",
+             "role": "StaticText", "name": "Shopping Cart"},
+        ]},
+    ], transitions=[])
+    case = _case([
+        {"action": "goto", "value": "https://x.com/cart"},
+        {"action": "assert_visible", "target_ref": "obs1:e11",
+         "observation_ref": "obs1"},
+    ])
+    compiled = compile_targets(case, graph)
+    assert compiled.steps[1].target == Locator(text="Shopping Cart")
+
+
+def test_compile_linebreak_not_as_empty_text():
+    """LineBreak 无有意义文本——拒绝，绝不生成 Locator(text="")。"""
+    graph = StateGraph(observations=[
+        {"id": "obs1", "url": "https://x.com/cart", "elements": [
+            {"ref": "obs1:e12", "role": "LineBreak"},
+        ]},
+    ], transitions=[])
+    case = _case([
+        {"action": "goto", "value": "https://x.com/cart"},
+        {"action": "assert_visible", "target_ref": "obs1:e12",
+         "observation_ref": "obs1"},
+    ])
+    try:
+        compile_targets(case, graph)
+    except ValueError as exc:
+        assert "LineBreak" in str(exc)
+        return
+    raise AssertionError("LineBreak 未被拒绝")
+
+
 def test_compile_empty_graph_noop():
     """空图 → 原样返回（legacy 降级路径不做编译）。"""
     case = _case([

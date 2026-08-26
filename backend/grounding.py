@@ -84,11 +84,16 @@ class GraphTransition(DSLModel):
     from_ 用别名 "from"（Python 关键字）：支持
       GraphTransition(from_="obs3", ...)      按字段名构造
       GraphTransition.model_validate({...})   按探索结果 dict 校验
+    target_name = 【临时 diagnostic 字段，非核心事实】R7.2 完成校验按
+    成功 transition 的语义判定（购物车入口 View Cart——不靠 URL 启发）。
+    最终应由 target_ref 从 ObservationStore 反查派生，这里仅为
+    避免探索结果带字段时校验失败；核心事实仍是 from/action/target_ref/to。
     """
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     from_: str = Field(alias="from")
     action: str
     target_ref: str
+    target_name: str | None = None   # 临时 diagnostic，后续改为派生
     to: str
 
 

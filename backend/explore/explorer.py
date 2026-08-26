@@ -110,6 +110,21 @@ def goal_requires_actions(goal: str) -> bool:
     return any(p.search(goal) for p in GOAL_ACTION_PATTERNS.values())
 
 
+def _has_cart_entry_transition(state: "ExploreState") -> bool:
+    """StateGraph 中是否存在成功的购物车入口 transition。
+
+    成功 = from ≠ to（产生真实状态变化）；动作名匹配购物车入口
+    （View Cart / 查看购物车 等）。StateGraph 是唯一事实源——
+    不靠 URL 启发（SPA 无 URL 变化 / /basket / /checkout 场景）。
+    """
+    return any(
+        t.get("action") == "click"
+        and t.get("from") != t.get("to")
+        and _CART_ENTRY_RE.search(str(t.get("target_name") or ""))
+        for t in state.transitions
+    )
+
+
 def _validate_completion(state: "ExploreState") -> str | None:
     """探索完成宣告的完整性校验（GQ 决策 1，可单测）。
 
@@ -143,35 +158,53 @@ def _validate_completion(state: "ExploreState") -> str | None:
         if not covered:
             return (f"探索不充分：目标要求 {label} 动作，但探索未执行过"
                     f"（history 无 {keywords[0]} 的 click）——请继续探索该流程")
+    # R7.2（确定性）：目标要求"验证购物车"时，StateGraph 必须存在成功的
+    # 购物车入口 transition——否则 Planner 的 verified edges 里没有
+    # View Cart 边，无法合法生成"进入购物车验证"步骤（BFC 实测：探索
+    # 在第二次加购弹窗就 finish，Planner 只能重复已有 Add 边 + 弱断言）。
+    # 判定用成功 transition 的 target_name（View Cart/查看购物车等），
+    # 不靠 URL 启发（SPA 无 URL 变化、/basket、/checkout 等场景）。
+    if _CART_VERIFY_RE.search(state.goal) and not _has_cart_entry_transition(state):
+        return ("探索不充分：目标要求在购物车中验证，但探索尚未实际执行"
+                "进入购物车（如 View Cart）并形成成功状态转移——"
+                "请点击进入购物车的入口观察后再宣告完成")
     return None
 
 def _elements_to_prompt(elements: list[dict], state: "ExploreState | None" = None) -> str:
     """元素表 → 决策上下文（紧凑格式）。
 
+    R7.3（评审收紧）：Selectable refs 与 Evidence 分段——
+      - Selectable：kind=action 的元素带 ref（唯一可被 target_ref 引用）
+      - Evidence：文本/容器只展示内容，【不显示 ref】——模型在决策层
+        就无法选择它（_decide 校验 ref 必须属于 selectable action，
+        而不是决策后被 ACTION_CAPABILITIES 拒绝浪费预算）
     E1（评审收紧）：blacklist 后从模型 action space 删除失败 ref——
-    比"告诉 LLM 别选它"强：确定性约束缩小输入空间，而不是靠提示词
-    让模型记住约束。被黑名单的 ref 直接从元素表消失。
+    被黑名单的 ref 直接从元素表消失。
     """
     lines = []
-    for e in elements:
+    selectable = [e for e in elements if e.get("kind") == "action"]
+    for e in selectable:
         if state is not None and state.current_obs:
             key = (state.current_obs, "click", e["ref"])
             if key in state.failed_actions:
                 continue   # 已确定性失败的 ref 不出现在候选表
-        if "role" in e:
-            # 消歧信息（A4.2/A4.1 观察期采集）：商品名/容器锚点优先
-            #（LLM 靠它理解"前两个商品"），无则用 identity（data-product-id）。
-            # 没有它们，6 个同名 "Add to cart" 无法区分——LLM 只会选第一个。
-            line = f'{e["ref"]}: {e["role"]} "{e["name"]}"'
-            anchor = e.get("scope_has_text")
-            ident = e.get("identity") or {}
-            if anchor:
-                line += f' [{anchor}]'
-            elif ident.get("value"):
-                line += f' [id={ident["value"]}]'
-            lines.append(line)
-        else:
-            lines.append(f'{e["ref"]}: text "{e["text"]}"')
+        # 消歧信息（A4.2/A4.1 观察期采集）：商品名/容器锚点优先
+        #（LLM 靠它理解"前两个商品"），无则用 identity（data-product-id）。
+        line = f'{e["ref"]}: {e["role"]} "{e["name"]}"'
+        anchor = e.get("scope_has_text")
+        ident = e.get("identity") or {}
+        if anchor:
+            line += f' [{anchor}]'
+        elif ident.get("value"):
+            line += f' [id={ident["value"]}]'
+        lines.append(line)
+    ev = [e for e in elements if e.get("kind") != "action"]
+    if ev:
+        lines.append("(以下为页面文本，只作定位/验证参考，不能作为动作目标):")
+        for e in ev[:_MAX_EVIDENCE_PROMPT]:
+            text = (e.get("text") or e.get("name") or "").strip()[:50]
+            if text:
+                lines.append(f'  - "{text}"')
     return "\n".join(lines) if lines else "(当前页面无可操作元素)"
 
 
@@ -234,6 +267,16 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
 # 不引入 required_count/completed_adds 等第二事实源；未来"添加三个角色"
 # "上传四张图片"只是同一个 Policy 规则，不需要新的 guard。
 
+_CART_VERIFY_RE = re.compile(
+    r"验证.*购物车|购物车.*验证|verify.*\bcart\b|check.*\bcart\b", re.I)
+_MAX_EVIDENCE_PROMPT = 8   # R7.3：evidence 文本限量展示（无 ref）
+# 购物车入口动作（R7.2 完成校验用——按成功 transition 的 target_name 判定）
+_CART_ENTRY_RE = re.compile(
+    r"\bview\s+cart\b|\bopen\s+(?:shopping\s+)?cart\b|^cart$|"
+    r"查看购物车|进入购物车|购物车页面",
+    re.I,
+)
+
 _CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 _QTY_PATTERNS = (
@@ -249,6 +292,12 @@ _QTY_PATTERNS = (
 _TERMINAL_ACTION_RE = re.compile(
     r"(?<![a-z] )((view\s*)?cart|checkout|submit|place\s*order|pay)\b"
     r"|下单|结账|支付|结算",
+    re.IGNORECASE,
+)
+# 继续购物类动作（数量完成时 interaction root 内无意义 → 隐藏，
+# 与终态动作隐藏对称：数量未完成隐藏 View Cart，数量完成隐藏 Continue）
+_CONTINUE_ACTION_RE = re.compile(
+    r"continue\s+shopping|keep\s+shopping|继续购物|继续购买|返回购物",
     re.IGNORECASE,
 )
 
@@ -290,21 +339,42 @@ def _derive_completed_entities(state: "ExploreState") -> set[str]:
 
 def _apply_goal_constraints(goal: str, state: "ExploreState",
                             action_space: list[dict]) -> list[dict]:
-    """Policy：目标数量未完成时，interaction root 内终态动作不暴露。
+    """Policy：目标约束（interaction root 打开时生效）。
 
-    只作用于 interaction root 打开时（modal/overlay）；数量完成或
-    无数量要求 → 原样返回。完成度从 StateGraph 派生（_derive_completed_entities）。
+    对称限制（完成度从 StateGraph 派生，不存第二状态源）：
+      - 数量未完成：终态动作（View Cart 等）不暴露——LLM 只能继续完成目标
+      - 数量完成 + 目标仍要求购物车验证 + 存在收尾候选：只保留收尾动作
+        （BFC 实测：第 2 次加购弹窗 LLM 仍选 Continue 绕圈，预算耗尽
+        也没进购物车）
+    两个保护（不锁死页面）：
+      - 只收紧不改写：过滤后无可选 action → 保持原 ActionSpace
+        （让 completion validator 拒绝 finish，而不是把页面锁死）
+      - 无数量要求 → 原样返回
     """
     required = _extract_required_count(goal)
     if required is None:
         return action_space
-    if len(_derive_completed_entities(state)) >= required:
-        return action_space
-    return [
-        e for e in action_space
-        if e.get("kind") != "action"
-        or not _TERMINAL_ACTION_RE.search(e.get("name") or "")
-    ]
+    completed = _derive_completed_entities(state)
+    if len(completed) < required:
+        filtered = [
+            e for e in action_space
+            if e.get("kind") != "action"
+            or not _TERMINAL_ACTION_RE.search(e.get("name") or "")
+        ]
+    else:
+        # 数量完成：仅当目标仍要求购物车验证且当前存在收尾候选时才收紧
+        requires_cart = _CART_VERIFY_RE.search(goal)
+        terminal_cands = [
+            e for e in action_space
+            if e.get("kind") == "action"
+            and _TERMINAL_ACTION_RE.search(e.get("name") or "")
+        ]
+        if not requires_cart or not terminal_cands:
+            return action_space   # 不收紧（validator 负责拒绝 premature finish）
+        filtered = terminal_cands
+    if not any(e.get("kind") == "action" for e in filtered):
+        return action_space   # 收紧后无可选 action → 保持原样（防锁死）
+    return filtered
 
 
 # ── observe / record ───────────────────────────────────────────────────────────
@@ -350,9 +420,15 @@ def _decide(state: ExploreState, llm_call, elements: list[dict] | None = None) -
                 return None, f"press 的 value 必须是: {'/'.join(sorted(_PRESS_KEYS))}"
         if action != "finish":
             ref = decision.get("target_ref")
-            if ref is None or not any(e["ref"] == ref for e in elements):
-                return None, (f"target_ref {ref!r} 不在当前元素表——"
-                              "ref 带 obs 前缀，照抄表内完整格式（如 obs1:e1）")
+            # R7.3：ref 必须属于 Selectable actions（evidence/文本无动作
+            # 能力——决策层拒绝，不浪费预算等 ACTION_CAPABILITIES 拒绝）
+            selectable_refs = {
+                e["ref"] for e in elements if e.get("kind") == "action"
+            }
+            if ref is None or ref not in selectable_refs:
+                return None, (f"target_ref {ref!r} 不是可操作元素——"
+                              "只能选择可点击/可填写的动作元素，"
+                              "ref 照抄表内 Selectable 段完整格式（如 obs1:e1）")
             # no-progress guard：同一状态同一动作同一 ref 重复且上次无进展
             if _is_repeated_no_progress(state, action, ref):
                 return None, ("NO_PROGRESS: 同一元素上的同一动作上一次执行"
@@ -658,6 +734,9 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                     "from": from_obs,
                     "action": decision["action"],
                     "target_ref": ref,
+                    # R7.2：target_name——完成校验（购物车入口检测）按
+                    # 成功 transition 语义判定，不靠 URL 启发
+                    "target_name": (element or {}).get("name") if element else None,
                     "to": to_obs,
                 })
 

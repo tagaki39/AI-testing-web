@@ -36,18 +36,40 @@ from dsl import DSLCase, Locator, Scope, validate_case
 from grounding import StateGraph, UnknownTargetRefError
 
 
+# AX 文本节点角色（不是可定位的 ARIA role——Playwright get_by_role
+# 不支持 StaticText/InlineTextBox；编译成 text 定位（get_by_text））。
+# 只用白名单分组，不维护 Chromium AX role 黑名单（避免补丁膨胀）；
+# LineBreak 无有意义文本 → 拒绝（不能生成 Locator(text="")）。
+_AX_TEXT_ROLES = {"StaticText", "InlineTextBox"}
+_AX_NON_LOCATABLE_ROLES = {"LineBreak"}
+
+
 def _element_to_locator(element) -> Locator:
     """图元素 → Locator（确定性映射，无任何启发式）。
 
     可交互元素（role+name）→ 语义定位（最稳，官方推荐）
-    文本节点（text）       → 文本定位（无语义元素的兜底）
+    AX 文本节点（StaticText/InlineTextBox）→ 文本定位（get_by_text——
+    AX 文本角色不是 ARIA role，role 定位必然 0 命中）
+    无定位信息 / 不可定位角色 → ValueError（编译器拒绝，不静默）
     """
-    if element.role:
+    role = getattr(element, "role", None)
+    name = getattr(element, "name", None)
+    text = getattr(element, "text", None)
+    if role in _AX_TEXT_ROLES:
+        value = name or text
+        if not value or not value.strip():
+            raise ValueError(f"AX 文本节点缺少可定位文本: role={role!r}")
+        return Locator(text=value)
+    if role in _AX_NON_LOCATABLE_ROLES:
+        raise ValueError(f"AX 节点不可作为 DSL target: role={role!r}")
+    if role:
         # A4.2：稳定 identity（data-product-id 等）确定性编译进 Locator——
         # 由观察元素携带（GraphElement.identity），LLM 不生成。
         identity = getattr(element, "identity", None)
-        return Locator(role=element.role, name=element.name, identity=identity)
-    return Locator(text=element.text)
+        return Locator(role=role, name=name, identity=identity)
+    if text:
+        return Locator(text=text)
+    raise ValueError("元素缺少可编译的定位信息")
 
 
 def _element_key(element) -> tuple | None:
