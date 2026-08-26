@@ -357,7 +357,7 @@ def test_a3_dialog_limits_action_space() -> None:
         {"ref": "obs4:e36", "role": "button", "name": "Continue Shopping",
          "actionable": True, "context_role": "dialog", "context_name": "Added!"},
         {"ref": "obs4:e25", "role": "link", "name": "Add to cart",
-         "actionable": True},   # dialog 外（无 context）
+         "actionable": True, "kind": "action"},   # dialog 外 action（无 context）
         {"ref": "obs4:e30", "type": "text", "text": "Blue Top"},
     ]
     state.observations = [{

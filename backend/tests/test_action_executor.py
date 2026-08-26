@@ -142,12 +142,17 @@ def test_record_page_marks_actionable():
         )
         state = ExploreState(goal="t", entry_url="https://x.com")
         _record_page(state, page)
-        by_name = {e["name"]: e for e in state.elements if "role" in e}
+        # A4.1 契约：actionability 只属于 kind=action
+        actions = [e for e in state.elements if e.get("kind") == "action"]
+        by_name = {e["name"]: e for e in actions}
         assert by_name["Go"].get("actionable") is True      # 唯一元素可操作
         # 同名重复 + I1 锚点 → 也能被标记（scope 消歧解析成功）
-        buys = [e for e in state.elements if e.get("name") == "Buy"]
+        buys = [e for e in actions if e.get("name") == "Buy"]
         assert len(buys) == 2
         assert all(e.get("actionable") is True for e in buys)
+        # evidence 不应有 actionable 字段（防回归：对文本节点做 actionability）
+        evidence = [e for e in state.elements if e.get("kind") == "evidence"]
+        assert all("actionable" not in e for e in evidence)
     finally:
         browser.close()
         pw.stop()

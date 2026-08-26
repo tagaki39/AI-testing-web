@@ -7,7 +7,7 @@ explore/ — bounded exploration 包
 """
 from .observation import (
     ExploreState, _parse_elements, _record_page, _observe, _safe_title,
-    _attach_scope_context, _observe_until_stable,
+    _attach_legacy_dom_scope, _observe_until_stable,
 )
 from .action_space import (
     ACTION_CAPABILITIES, _build_action_space, _locator_for_element,

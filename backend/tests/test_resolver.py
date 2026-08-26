@@ -370,8 +370,9 @@ def test_snapshot_match_decorated_leading_icon():
 
 
 def test_attach_scope_context_duplicates_only():
-    """I1 采集：同名重复按钮获容器锚点（跳过价格行）；唯一元素零采集。"""
-    from explore import ExploreState, _attach_scope_context, _observe, _parse_elements
+    """Legacy DOM scope（A4.1）：重复 action 获容器锚点（跳过价格行）；
+    唯一元素零采集；只接收 kind=action 候选。"""
+    from explore import ExploreState, _attach_legacy_dom_scope, _observe, _parse_elements
     pw, browser, page = _launch()
     try:
         page.set_content(
@@ -383,7 +384,7 @@ def test_attach_scope_context_duplicates_only():
         state = ExploreState(goal="t", entry_url="https://x.com")
         state.snapshot = _observe(page)
         state.elements = _parse_elements(state.snapshot)
-        _attach_scope_context(state, page)
+        _attach_legacy_dom_scope(page, state.elements)   # 候选 = 全量（函数内过滤 action）
 
         buys = [e for e in state.elements if e.get("name") == "Buy"]
         assert len(buys) == 2
@@ -442,25 +443,26 @@ def test_text_node_scope_resolution():
         pw.stop()
 
 
-def test_capture_anchors_text_nodes():
-    """采集：重复文本节点（无 role）同样获得容器锚点。"""
-    from explore import ExploreState, _attach_scope_context
+def test_legacy_scope_ignores_evidence():
+    """A4.1 契约：evidence（无 kind=action）不进 legacy DOM scope——
+    get_by_role 只对 action 执行（性能根因防回归：CDP evidence 曾导致
+    空匹配 inner_text 等满超时）。"""
+    from explore import ExploreState, _attach_legacy_dom_scope
     pw, browser, page = _launch()
     try:
         page.set_content(
             '<div data-product-id="p1"><div>Blue Top</div>'
-            '<a class="add">Add to cart</a></div>\n'
-            '<div data-product-id="p2"><div>Red Top</div>'
             '<a class="add">Add to cart</a></div>'
         )
         state = ExploreState(goal="t", entry_url="https://x.com")
         state.elements = [
-            {"ref": "e1", "type": "text", "text": chr(0xF07A) + " Add to cart"},
-            {"ref": "e2", "type": "text", "text": chr(0xF07A) + " Add to cart"},
+            {"ref": "e1", "type": "text", "text": "Add to cart",
+             "kind": "evidence"},   # evidence 不应参与 scope 采集
+            {"ref": "e2", "role": "link", "name": "Add to cart",
+             "kind": "action", "context_role": "listitem"},   # 有 AX context → 不进来
         ]
-        _attach_scope_context(state, page)
-        anchors = {e.get("scope_has_text") for e in state.elements}
-        assert anchors == {"Blue Top", "Red Top"}
+        _attach_legacy_dom_scope(page, state.elements)
+        assert all(e.get("scope_has_text") is None for e in state.elements)
     finally:
         browser.close()
         pw.stop()

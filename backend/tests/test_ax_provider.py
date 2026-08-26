@@ -81,7 +81,7 @@ def _ax(id_, role, name="", parent=None, ignored=False, **kw):
 
 
 def test_a2_kind_classification():
-    """button → action / dialog → container / 无区分能力文本被跳过。"""
+    """button → action / dialog → container / 有名字的 text → evidence。"""
     nodes = [
         _ax("1", "button", "Continue Shopping"),
         _ax("2", "dialog", "Added!"),
@@ -91,7 +91,7 @@ def test_a2_kind_classification():
     kinds = {e.role: e.kind for e in els}
     assert kinds["button"] == "action"
     assert kinds["dialog"] == "container"
-    assert "text" not in kinds   # 文本 evidence 由 aria 文本路径承担（A2 阶段）
+    assert kinds["text"] == "evidence"   # 断言用文本证据保留
 
 
 def test_a2_semantic_context_dialog():

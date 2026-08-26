@@ -109,6 +109,8 @@ CONTAINER_ROLES = {
     "list", "listitem", "group",
 }
 
+EVIDENCE_ROLES = {"heading", "alert", "status", "img", "label"}
+
 
 @dataclass
 class ObservationElement:
@@ -163,7 +165,9 @@ def _classify(role: str | None) -> str:
         return "action"
     if role in CONTAINER_ROLES:
         return "container"
-    return "evidence"
+    if role in EVIDENCE_ROLES:
+        return "evidence"
+    return "evidence"   # 其他有 name 的节点 → evidence（text/StaticText 等）
 
 
 def find_semantic_context(node: AXNode, by_id: dict[str, AXNode]) -> tuple[str | None, str | None]:
@@ -179,6 +183,9 @@ def find_semantic_context(node: AXNode, by_id: dict[str, AXNode]) -> tuple[str |
     return None, None
 
 
+_MAX_EVIDENCE_ELEMENTS = 20   # evidence 限量（防元素表膨胀 → 评估 O(N) 爆炸）
+
+
 def build_observation_elements(ax_nodes: list[AXNode]) -> list[ObservationElement]:
     """AX 树 → 结构化元素列表（扁平 ref 序列 + 层级/kind/语义上下文）。
 
@@ -186,14 +193,29 @@ def build_observation_elements(ax_nodes: list[AXNode]) -> list[ObservationElemen
     格式（Planner 只认 ref，AXNodeId 不进入 DSL）。
     """
     by_id = {n.ax_id: n for n in ax_nodes}
+    # 有区分能力的节点：action / container / evidence（heading/alert/status/
+    # 有名字的 StaticText）——generic/none/presentation/无名节点跳过；
+    # evidence 限量（防元素表膨胀导致观察期评估 O(N) 协议往返爆炸）。
     active = [
         n for n in ax_nodes
-        if not n.ignored and n.role not in ("generic", "text", "StaticText",
-                                            "none", "presentation")
+        if not n.ignored
+        and n.role not in ("generic", "none", "presentation",
+                           "RootWebArea", "WebArea", "Iframe",
+                           "IframePresentational", "cell", "row", "column")
+        and (n.name or "").strip()
     ]
-    ax_to_ref = {n.ax_id: f"e{i + 1}" for i, n in enumerate(active)}
-    elements: list[ObservationElement] = []
+    ev_count = 0
+    kept: list[AXNode] = []
     for n in active:
+        kind = _classify(n.role)
+        if kind == "evidence":
+            if ev_count >= _MAX_EVIDENCE_ELEMENTS:
+                continue
+            ev_count += 1
+        kept.append(n)
+    ax_to_ref = {n.ax_id: f"e{i + 1}" for i, n in enumerate(kept)}
+    elements: list[ObservationElement] = []
+    for n in kept:
         kind = _classify(n.role)
         ctx_role, ctx_name = find_semantic_context(n, by_id)
         elements.append(ObservationElement(
@@ -307,6 +329,7 @@ def _parse_elements(snapshot: str) -> list[dict]:
                     "ref": f"e{len(elements) + 1}",
                     "role": role,
                     "name": name.strip(),
+                    "kind": "action",   # A4.1：统一 kind 契约（fallback 也 classify）
                 })
             continue
         m = _TEXT_RE.match(line)
@@ -318,6 +341,7 @@ def _parse_elements(snapshot: str) -> list[dict]:
                     "ref": f"e{len(elements) + 1}",
                     "type": "text",
                     "text": text[:50],
+                    "kind": "evidence",
                 })
     return elements
 
@@ -382,34 +406,33 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     state.current_url = url
     if snapshot is None:
         snapshot = _observe(page)
-    elements = _parse_elements(snapshot)   # ← ref 表（页面级 e1/e2，局部变量）
 
-    # A2：CDP 结构化 A11y 增强——给 role 元素附加 kind/context/层级
-    #（语义容器 context 供 A3 ActionSpace 用；CDP 不可用时静默跳过，
-    #  保持 aria legacy 路径——观察能力兼容 fallback，非定位猜测）。
+    # A4 修正（用户诊断：Raw CDP AX 里 Add to cart 是 link，aria 文本表
+    # 却是 text——"aria 表 + CDP 打补丁"的匹配投影会丢 actionable ancestor）：
+    # CDP AX Tree 是 ObservationElement 的唯一事实源；aria_snapshot 仅
+    # provider fallback（One source of truth）。
     try:
         ax_nodes = CDPAccessibilityProvider().capture(page)
-        if ax_nodes:
-            structured = build_observation_elements(ax_nodes)
-            ax_by_sig: dict[tuple, ObservationElement] = {}
-            for se in structured:
-                ax_by_sig.setdefault((se.role, (se.name or "").strip()), se)
-            for e in elements:
-                if "role" not in e or not e.get("name"):
-                    continue
-                se = ax_by_sig.get((e["role"], str(e["name"]).strip()))
-                if se is None:
-                    continue
-                e["kind"] = se.kind
-                if se.context_role:
-                    e["context_role"] = se.context_role
-                    e["context_name"] = se.context_name
-                if se.parent_ref:
-                    e["parent_ref"] = se.parent_ref
-                if se.backend_dom_node_id:
-                    e["backend_dom_node_id"] = se.backend_dom_node_id
+        structured = build_observation_elements(ax_nodes) if ax_nodes else []
+        if structured:
+            elements = [
+                {
+                    "ref": e.ref,
+                    "role": e.role,
+                    "name": e.name or "",
+                    "kind": e.kind,
+                    "disabled": e.disabled,
+                    "context_role": e.context_role,
+                    "context_name": e.context_name,
+                    "parent_ref": e.parent_ref,
+                    "backend_dom_node_id": e.backend_dom_node_id,
+                }
+                for e in structured
+            ]
+        else:
+            elements = _parse_elements(snapshot)   # CDP 不可用 → aria legacy
     except Exception:
-        pass   # CDP 不可用 → 保持扁平（aria legacy）
+        elements = _parse_elements(snapshot)   # CDP 不可用 → aria legacy
 
     # 状态哈希：A4 优先用语义状态签名（action/container 的 role/name/状态/
     # 语义父级排序 hash）——相同业务状态匹配回原 obs，减少 phantom states
@@ -453,9 +476,15 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     for element in state.elements:
         element["ref"] = f"{obs_id}:{element['ref']}"
 
-    # I1：同名重复元素采集容器文本锚点（只处理重复，非重复零开销）——
-    # 先 enrich 再持久化，元素表与 observation 共享同一对象
-    _attach_scope_context(state, page)
+    # A4.1：AX semantic context 优先——只有「重复 action 且无 AX context」
+    # 才走 legacy DOM scope（evidence/container 永不进入；CDP 建树后
+    # 不再对全量元素跑 DOM ancestor 采集——性能根因修复）
+    legacy_candidates = [
+        e for e in elements
+        if e.get("kind") == "action" and not e.get("context_role")
+    ]
+    if legacy_candidates:
+        _attach_legacy_dom_scope(page, legacy_candidates)
 
     # R3：观察期可操作性评估（Page Explorer 输出 actionable 标记——
     # 参考项目 page_explorer 的 verified 标记模式）。模态框打开时
@@ -471,7 +500,10 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     # ActionSpace 过滤所有 role 元素 → 探索残废（实测 actionable=True: 0）。
     from .action_space import _locator_for_element, validate_actionability
     for e in state.elements:
-        if "role" in e:
+        # A4.1 责任边界（性能根因）：只有 kind=action 才做 actionability
+        # 评估——evidence/container 不评估、不设 actionable 字段
+        #（否则 CDP 结构化后的全量元素 × 协议往返 = 秒级爆炸）。
+        if e.get("kind") == "action":
             try:
                 _, _, loc = _locator_for_element(page, e)
                 e["actionable"], _ = validate_actionability(page, loc, "click")
@@ -520,67 +552,58 @@ def _pick_anchor_text(lines: list[str], node_text: str) -> str | None:
     return None
 
 
-def _attach_scope_context(state: ExploreState, page) -> None:
-    """I1：为 observation 内同名重复的元素采集容器文本锚点（scope_has_text）。
+def _attach_legacy_dom_scope(page, candidates: list[dict]) -> None:
+    """Legacy DOM scope enrichment（A4.1：从默认机制降级为少数兼容兜底）。
 
-    只处理重复的元素（role+name 或 text 键）——非重复零开销（决策 3
-    性能上界）。锚点来自 DOM 祖先链（li/article/@data-testid/
-    @data-product-id/@data-item-id）——比 a11y 树 parent 更贴近真实
-    业务容器结构。文本节点（无 role 的 <a> 等）同样处理：图标前缀先
-    剥掉再匹配（PUA 在 CSS 伪元素里，DOM 文本不含）。
-    采集失败静默（无锚点 → Compiler 不附加 scope → 运行时诚实拒绝）。
+    只接收「重复的 action 且 AX context 不足」的候选——evidence/
+    container 永远不进来（性能根因修复：CDP evidence 曾进 get_by_role
+    空匹配 → inner_text 等满 15s ×N）。
+      - 按 (role, name) 分组，单元素组跳过
+      - get_by_role 前 count 防御（AX 节点存在 ≠ Playwright 能重新找到）
+      - 不猜 ancestor（去掉 ../.. fallback——Restrict, don't repair）
+      - 采集失败 → 无锚点 → Compiler 不附 scope → 运行时诚实拒绝
     """
-    name_counts: dict[tuple[str, str], int] = {}
-    text_counts: dict[str, int] = {}
-    for e in state.elements:
-        if "role" in e and e.get("name"):
-            key = (e["role"], e["name"])
-            name_counts[key] = name_counts.get(key, 0) + 1
-        elif e.get("text"):
-            text_counts[e["text"]] = text_counts.get(e["text"], 0) + 1
-    duplicates = {k for k, c in name_counts.items() if c > 1}
-    dup_texts = {t for t, c in text_counts.items() if c > 1}
-    if not duplicates and not dup_texts:
-        return
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for e in candidates:
+        if e.get("kind") != "action":
+            continue
+        role = e.get("role")
+        name = e.get("name")
+        if not role or not name:
+            continue
+        groups.setdefault((role, name), []).append(e)
 
-    seen: dict[tuple[str, str], int] = {}
-    text_seen: dict[str, int] = {}
-    for e in state.elements:
-        anchor = None
+    for (role, name), group in groups.items():
+        if len(group) <= 1:
+            continue
         try:
-            if "role" in e and e.get("name"):
-                key = (e["role"], e["name"])
-                if key not in duplicates or e.get("scope_has_text"):
-                    continue
-                i = seen.get(key, 0)
-                seen[key] = i + 1
-                node = page.get_by_role(e["role"], name=e["name"], exact=True).nth(i)
-            elif e.get("text") and e["text"] in dup_texts and not e.get("scope_has_text"):
-                i = text_seen.get(e["text"], 0)
-                text_seen[e["text"]] = i + 1
-                # 图标前缀在 CSS 伪元素中 → 剥掉装饰后按 DOM 文本精确匹配
-                node = page.get_by_text(
-                    _strip_leading_decoration(e["text"]), exact=True,
-                ).nth(i)
-            else:
-                continue
-            container = node.locator(
-                "xpath=ancestor::*[self::li or self::article or @data-testid"
-                " or @data-product-id or @data-item-id][1]"
-            )
-            container_count = container.count()
-            if container_count == 0:
-                container = node.locator("xpath=../..")
-                container_count = container.count()
-            raw = container.inner_text().strip() if container_count > 0 else ""
-            node_text = node.inner_text().strip()
-            anchor = _pick_anchor_text(
-                [ln.strip() for ln in raw.splitlines() if ln.strip()], node_text,
-            )
+            base = page.get_by_role(role, name=name, exact=True)
+            count = base.count()
         except Exception:
             continue
-        if anchor:
-            e["scope_has_text"] = anchor
+        for i, e in enumerate(group):
+            if e.get("scope_has_text"):
+                continue
+            if i >= count:
+                continue   # 空 locator 防御（防 inner_text 等满超时）
+            try:
+                node = base.nth(i)
+                container = node.locator(
+                    "xpath=ancestor::*[self::li or self::article or @data-testid"
+                    " or @data-product-id or @data-item-id][1]"
+                )
+                if container.count() == 0:
+                    continue   # 无明确业务容器 → 不猜
+                raw = container.inner_text(timeout=300).strip()
+                node_text = node.inner_text(timeout=300).strip()
+                anchor = _pick_anchor_text(
+                    [ln.strip() for ln in raw.splitlines() if ln.strip()],
+                    node_text,
+                )
+            except Exception:
+                continue
+            if anchor:
+                e["scope_has_text"] = anchor
 
 
 # ── decide：LLM 决策（ref 强校验 + exploration_complete）──────────────────────
