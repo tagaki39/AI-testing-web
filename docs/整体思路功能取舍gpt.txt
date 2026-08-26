@@ -36,7 +36,26 @@ A11y/ARIA 页面快照
 → ④ 人工修正
 ```
 
-因为没有可靠的页面结构，所谓“定位降级”只是在多个错误定位器之间切换。
+---
+
+## 实施状态对账（2026-08-26）
+
+| 规划功能 | 状态 | 现状说明 |
+|---|---|---|
+| ① 定位降级链 | ✅ | resolver 多层定位（identity_exact → role/text → scope 消歧） |
+| ② 作用域消歧 | ✅ | scope_has_text + Stable Identity（data-* 稳定业务 identity 进 target） |
+| ③ A11y 树探索 | ✅ | CDP Structured AX（结构化树，替代扁平 aria 快照；PUA 语义归一化） |
+| ④ 人工修正闭环 | ✅ | /api/corrections 端点 + 前端修正输入（corrections 进 LocatorCorrection） |
+| ⑤ 运行时变量 | 🟡 | Data Grounding（${key} 白名单强校验 + input_values 执行时注入）✅；**capture_text 动作未实现**（Planner action 列表无此动作） |
+| ⑥ SSE 日志 | ❌ | **未实现**——前端同步 fetch 等待完整响应，无实时进度 |
+| ⑦ Trace 证据 | ✅ | 逐步 evidence：screenshot + resolve_ms + resolved_by（定位策略命中） |
+| P5 实时 UI | 🟡 | 四步流程（URL→生成→执行→报告）✅；实时进度依赖 SSE，无 |
+| 自动修复 | ✅ | anti_patterns 反模式库（GQ2 自愈重生的负例来源，内存+文件两级） |
+| storage_state 登录态 | ❌ | 未实现 |
+| VLM 视觉兜底 | ❌ | 未实现（当前定位叙事不含视觉） |
+
+**下一项待做：⑥ SSE 日志**（文档预算 0.5~1-2 天）——POST 创建 run → 前端 EventSource 订阅
+`/api/runs/{id}/events`（step_started / step_completed / run_finished），执行进度实时展示。
 
 ---
 
