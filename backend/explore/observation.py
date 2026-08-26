@@ -7,11 +7,90 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from time import perf_counter
+from typing import Literal
 
 from locator.resolver import PRICE_RE, _strip_leading_decoration, choose_scope_text
 from execution.runner import _resolve_locator
 
 _MAX_SNAPSHOT_CHARS = 6000   # 裁剪后快照的最终兜底上限（重组后仍超限才截断）
+
+
+# ── A1：A11y Tree Provider（CDP 结构化观察的数据源）───────────────────────────
+# 原则：全项目不认识 CDP 原始 JSON——归一化锁死在 normalize_cdp_ax_node。
+# AXNodeId 是临时浏览器状态标识，绝不作为 locator（只做树内部引用与诊断）。
+
+@dataclass
+class AXNode:
+    """规范化后的无障碍树节点（结构化 A11y 观察的基础）。"""
+    ax_id: str                       # CDP AXNodeId（仅树内部引用，不做 locator）
+    role: str | None
+    name: str | None
+    parent_ax_id: str | None
+    child_ax_ids: list[str]
+    backend_dom_node_id: int | None  # 仅 runtime bridge / diagnostics
+    ignored: bool
+    focusable: bool = False
+    disabled: bool = False
+    checked: bool | None = None
+    selected: bool | None = None
+    expanded: bool | None = None
+    pressed: bool | None = None
+    level: int = 0
+
+
+def _ax_prop(properties: list[dict], key: str):
+    """从 CDP properties 数组取属性值（无则 None）。"""
+    for p in properties or []:
+        if p.get("name") == key:
+            v = (p.get("value") or {}).get("value")
+            if isinstance(v, bool):
+                return v
+            return v
+    return None
+
+
+def normalize_cdp_ax_node(raw: dict) -> AXNode:
+    """CDP Accessibility.getFullAXTree 单节点 → AXNode（解析唯一入口）。"""
+    return AXNode(
+        ax_id=str(raw.get("nodeId", "")),
+        role=(raw.get("role") or {}).get("value"),
+        name=(raw.get("name") or {}).get("value") or "",
+        parent_ax_id=str(raw["parentId"]) if raw.get("parentId") else None,
+        child_ax_ids=[str(c) for c in raw.get("childIds", [])],
+        backend_dom_node_id=raw.get("backendDOMNodeId"),
+        ignored=bool(raw.get("ignored", False)),
+        focusable=bool(_ax_prop(raw.get("properties", []), "focusable")),
+        disabled=bool(_ax_prop(raw.get("properties", []), "disabled")),
+        checked=_ax_prop(raw.get("properties", []), "checked"),
+        selected=_ax_prop(raw.get("properties", []), "selected"),
+        expanded=_ax_prop(raw.get("properties", []), "expanded"),
+        pressed=_ax_prop(raw.get("properties", []), "pressed"),
+        level=int(_ax_prop(raw.get("properties", []), "level") or 0),
+    )
+
+
+class AccessibilityProvider:
+    """A11y 树观察接口（A1：浏览器观察能力兼容 fallback，非定位猜测）。"""
+
+    def capture(self, page) -> list[AXNode]:
+        raise NotImplementedError
+
+
+class CDPAccessibilityProvider(AccessibilityProvider):
+    """Chromium CDP Accessibility.getFullAXTree → 结构化 AXNode 列表。"""
+
+    def capture(self, page) -> list[AXNode]:
+        session = page.context.new_cdp_session(page)
+        result = session.send("Accessibility.getFullAXTree")
+        return [normalize_cdp_ax_node(n) for n in result.get("nodes", [])]
+
+
+class AriaSnapshotProvider(AccessibilityProvider):
+    """aria_snapshot 兼容 fallback（CDP 不可用时——非 Chromium 或受限环境）。"""
+
+    def capture(self, page) -> list[AXNode]:
+        # 扁平兼容：不建层级，全部作为忽略节点（A2 的 aria legacy 路径接管）
+        return []
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
 _MAX_TEXT_ELEMENTS = 20      # 文本节点最多注入 20 个（防上下文膨胀）
 _MAX_TEXT_LINES = 25         # 智能裁剪：text 行限量
