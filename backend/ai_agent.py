@@ -42,6 +42,7 @@ from dsl import DSLCase, Locator, Scope, validate_case
 from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
 from explore import (
     GOAL_ACTION_PATTERNS, _ACTION_KEYWORDS, explore,
+    missing_verified_goal_actions,
 )
 import anti_patterns
 from grounding import (
@@ -57,6 +58,11 @@ from locator.resolver import (
 # ── 配置（环境变量）───────────────────────────────────────────────────────────
 # os.getenv("名字", 默认值)：读环境变量，没设置就用默认值。
 # .env 文件的值由 main.py 在启动时灌入 os.environ（见 main.py 顶部）。
+
+class ExplorationIncompleteError(Exception):
+    """探索未验证目标动作（history 点过 ≠ 成功状态迁移）——不进入 Planner。
+    S1 第二防线：目标要求 verified outcome 但探索未形成对应转移。"""
+
 
 class OutputBudgetExceededError(Exception):
     """LLM 输出超过 max_tokens 预算（finish_reason=length）——输出失控。
@@ -729,6 +735,15 @@ def _expand_plan_schema(case_dict: dict,
             raise ValueError(
                 f"TRANSITION_OUT_OF_ORDER: {tref} 起点 {edge['from']} "
                 f"≠ 当前状态 {cursor}（路径沿已验证转移边推进）")
+        # S1：pre_actions（该转移前的成功非转移动作，如登录 fill）——
+        # 探索期确定性恢复并绑定到边，Planner 不生成
+        for pa in edge.get("pre_actions") or []:
+            steps.append({
+                "action": pa["action"],
+                "target_ref": pa["target_ref"],
+                "value": pa.get("value"),
+                "observation_ref": edge["from"],
+            })
         steps.append({
             "action": edge["action"],
             "target_ref": edge["target_ref"],
@@ -2009,6 +2024,15 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     # （复用探索结果，不重新探索）→ 二次失败 → 异常冒出 → api 400。
     # 不做负例 few-shot 注入——格式错 retry、grounding 错 replan、
     # 仍错 fail honestly，三层结果就够（反模式库保留作 diagnostics）。
+    # S1 第二防线：目标要求的 verified action 缺失 → 明确失败（不进入
+    # Planner——空图/缺目标边生成 = 让 LLM 编测试）。与 Explorer
+    # completion 共用 missing_verified_goal_actions（同一判断，不写两套）。
+    missing_verified = missing_verified_goal_actions(explore_goal, verified_edges)
+    if missing_verified:
+        raise ExplorationIncompleteError(
+            "探索未验证目标动作: " + ", ".join(missing_verified)
+            + "（history 点过 ≠ 成功状态迁移）")
+
     generation_retries = 0
     anti_pattern_used = 0
     try:

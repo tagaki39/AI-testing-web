@@ -335,6 +335,66 @@ def test_j3_no_action_goal_exempt() -> None:
     assert _validate_completion(state) is None
 
 
+def test_classify_fill_selfloop_no_transition() -> None:
+    """S1-1：fill obs1→obs1 不产生 transition（只进 pending）。"""
+    from explore.explorer import _classify_action_outcome
+    pending, edge = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e3", "${username}", None, [])
+    assert edge is None
+    assert pending == [{"action": "fill", "target_ref": "obs1:e3",
+                        "value": "${username}", "observation_ref": "obs1"}]
+
+
+def test_classify_consecutive_fills_bound_to_next_transition() -> None:
+    """S1-2：两个连续 fill 按原顺序绑定到下一条 obs1→obs2 迁移。"""
+    from explore.explorer import _classify_action_outcome
+    pending, _ = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e3", "${username}", None, [])
+    pending, _ = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e4", "${password}", None, pending)
+    pending, edge = _classify_action_outcome(
+        "click", "obs1", "obs2", "obs1:e5", None, "Login", pending)
+    assert edge is not None
+    assert [p["target_ref"] for p in edge["pre_actions"]] == ["obs1:e3", "obs1:e4"]
+    assert [p["value"] for p in edge["pre_actions"]] == ["${username}", "${password}"]
+    assert pending == []   # 真实迁移落图后消费
+
+
+def test_classify_select_real_transition_not_in_own_pre_actions() -> None:
+    """S1-3：select 造成 obs1→obs2 → 成为 transition；自身不进 pre_actions。"""
+    from explore.explorer import _classify_action_outcome
+    pending, _ = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e3", "${u}", None, [])
+    pending, edge = _classify_action_outcome(
+        "select", "obs1", "obs2", "obs1:e7", "B", None, pending)
+    assert edge is not None and edge["action"] == "select"
+    assert [p["action"] for p in edge["pre_actions"]] == ["fill"]
+    assert pending == []
+
+
+def test_classify_selfloop_click_not_in_pending() -> None:
+    """S1-4：self-loop click（无进展）不进 StateGraph、不进 pending
+    （保留 history 供 no-progress 诊断）。"""
+    from explore.explorer import _classify_action_outcome
+    pending, edge = _classify_action_outcome(
+        "click", "obs1", "obs1", "obs1:e9", None, "Retry", [])
+    assert edge is None
+    assert pending == []
+
+
+def test_classify_fill_then_select_migration() -> None:
+    """S1-5：fill（状态内）+ select（真迁移 obs1→obs2）→
+    select 的 edge.pre_actions=[fill]。"""
+    from explore.explorer import _classify_action_outcome
+    pending, _ = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e3", "${u}", None, [])
+    pending, edge = _classify_action_outcome(
+        "select", "obs1", "obs2", "obs1:e7", "B", None, pending)
+    assert edge is not None
+    assert [p["target_ref"] for p in edge["pre_actions"]] == ["obs1:e3"]
+    assert edge["pre_actions"][0]["observation_ref"] == "obs1"
+
+
 def test_cart_entry_name_semantic_classifier() -> None:
     """购物车入口语义分类：PUA 图标前缀可匹配（BFC：导航 " Cart"），
     但 "Add to cart" 绝不误判（正则保持语义精确）。"""

@@ -25,6 +25,43 @@ from .action_space import _validate_action_target
 from .observation import ExploreState   # 类型注解
 
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
+# S1：状态内可回放动作（from == to 时进 pending，绑定到后续真实迁移）
+_REPLAYABLE_IN_STATE_ACTIONS = {"fill", "select", "check", "press"}
+
+
+def _classify_action_outcome(action_done, from_obs, to_obs, ref, value,
+                             target_name, pending_actions):
+    """S1：动作结果分类（统一标准——按 canonical state 是否改变，不按
+    动作类型）。返回 (更新后的 pending_actions, edge 或 None)。
+
+      from == to（状态内动作）→ 可回放才进 pending，不落图
+      from != to（真实迁移）  → edge（附带 pending 作为 pre_actions）
+                                并清空 pending
+      click self-loop（无进展）→ 不进 StateGraph（保留 history 供
+        no-progress 诊断），pending 不清空
+    """
+    if action_done is None or not from_obs or not to_obs:
+        return pending_actions, None
+    if from_obs == to_obs:
+        if action_done in _REPLAYABLE_IN_STATE_ACTIONS:
+            pending_actions = list(pending_actions) + [{
+                "action": action_done,
+                "target_ref": ref,
+                "value": value,
+                "observation_ref": from_obs,
+            }]
+        return pending_actions, None
+    edge = {
+        "from": from_obs,
+        "action": action_done,
+        "target_ref": ref,
+        "target_name": target_name,
+        "to": to_obs,
+    }
+    if pending_actions:
+        edge["pre_actions"] = list(pending_actions)
+        pending_actions = []
+    return pending_actions, edge
 # ── 探索安全保护（第 6 项：代码层二次拦截，不只靠 Prompt）──────────────
 # press 允许的按键（枚举，防止 LLM 输出"按下回车"/"return" 等让执行器猜）
 _PRESS_KEYS = {"Enter", "Escape", "Tab", "ArrowDown", "ArrowUp"}
@@ -110,6 +147,39 @@ def goal_requires_actions(goal: str) -> bool:
     return any(p.search(goal) for p in GOAL_ACTION_PATTERNS.values())
 
 
+# S1：必须有 verified outcome（from != to 状态迁移）的目标性动作。
+# 独立维护——不把所有 GOAL_ACTION_PATTERNS 默认视为"必须产生状态结果"
+#（search/fill/view 等未来动作不一定要求状态变化）。
+VERIFIED_OUTCOME_REQUIRED_ACTIONS = ("login", "add_to_cart", "checkout")
+
+
+def missing_verified_goal_actions(goal: str,
+                                  transitions: list[dict]) -> list[str]:
+    """目标要求的 verified outcome 缺失清单。
+
+    Explorer completion 与 Planner fail-closed 共用同一判断（不写两套）：
+      verified outcome = from != to 且动作名匹配（点过失败 ≠ 完成——
+      xywhaigc 实测：Login 点击后页面未变，history 有 click 但无转移）。
+    """
+    missing: list[str] = []
+    for label in VERIFIED_OUTCOME_REQUIRED_ACTIONS:
+        pattern = GOAL_ACTION_PATTERNS.get(label)
+        if pattern is None or not pattern.search(goal or ""):
+            continue
+        keywords = _ACTION_KEYWORDS[label]
+        verified = any(
+            t.get("from") != t.get("to")
+            and any(k.replace(" ", "")
+                    in _normalize_semantic_name(t.get("target_name"))
+                    .replace(" ", "").lower()
+                    for k in keywords)
+            for t in (transitions or [])
+        )
+        if not verified:
+            missing.append(label)
+    return missing
+
+
 def _has_cart_entry_transition(state: "ExploreState") -> bool:
     """StateGraph 中是否存在成功的购物车入口 transition。
 
@@ -173,6 +243,16 @@ def _completion_status(state: "ExploreState") -> CompletionStatus:
                 ready=False,
                 reason=(f"探索不充分：目标要求 {label} 动作，但探索未执行过"
                         f"（history 无 {keywords[0]} 的 click）——请继续探索该流程"))
+        # S1：目标性/提交性动作（login/add_to_cart/checkout）必须形成
+        # verified transition——点过失败 ≠ 完成（xywhaigc 实测：Login
+        # 点击后页面未变，history 有 click 但 StateGraph 无转移，
+        # completion 却判 done → Planner 空图生成 → 400 schema 错）
+        missing = missing_verified_goal_actions(state.goal, state.transitions)
+        if missing:
+            return CompletionStatus(
+                ready=False,
+                reason=(f"目标要求的 {missing[0]} 动作尚未形成成功状态迁移"
+                        "（history 点过 ≠ 完成）——请继续探索该流程"))
     # 数量目标：已完成 distinct 业务实体 ≥ 要求
     required = _extract_required_count(state.goal)
     if required is not None:
@@ -642,6 +722,8 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         page = browser.new_page()
         page.set_default_timeout(15000)
 
+        # S1：成功非转移动作收集（fill 等）——绑定到下一个成功转移边
+        pending_actions: list[dict] = []
         state = ExploreState(
             goal=goal,
             entry_url=entry_url,
@@ -870,16 +952,14 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             # observation（_record_page 返回值——matched 或新建）。
             # E1：不能取 observations[-1]——Continue Shopping 关闭模态框
             # 回到旧状态时，[-1] 还是模态框 obs，会记成错误 self-loop。
-            if action_done is not None and from_obs and to_obs:
-                state.transitions.append({
-                    "from": from_obs,
-                    "action": decision["action"],
-                    "target_ref": ref,
-                    # R7.2：target_name——完成校验（购物车入口检测）按
-                    # 成功 transition 语义判定，不靠 URL 启发
-                    "target_name": (element or {}).get("name") if element else None,
-                    "to": to_obs,
-                })
+            # S1（统一标准）：StateGraph 只记录 from != to 的成功迁移——
+            # 不按动作类型一刀切（select/check 也可能真迁移）。
+            pending_actions, edge = _classify_action_outcome(
+                action_done, from_obs, to_obs, ref, decision.get("value"),
+                (element or {}).get("name") if element else None,
+                pending_actions)
+            if edge:
+                state.transitions.append(edge)
 
             # origin 守卫（第 6 项）：点击跨域链接（文档/GitHub/外部认证）
             # → 记录并回退，探索不离开被测站点

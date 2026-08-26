@@ -469,7 +469,12 @@ def test_validate_completion_exemption_and_gate():
     assert _validate_completion(s) is not None      # ≥2 步但 Add to cart 未探索 → 拒绝
     s.history = [{"action": "click", "target_ref": "obs3:e22",
                   "target": {"role": "link", "name": "Add to cart"}}]
-    assert _validate_completion(s) is None          # 目标动作已探索 → 通过
+    # S1：目标性动作还须形成 verified transition（点过失败 ≠ 完成）
+    assert _validate_completion(s) is not None      # 无转移 → 拒绝
+    s.transitions = [{"from": "obs3", "action": "click",
+                      "target_ref": "obs3:e22", "target_name": "Add to cart",
+                      "to": "obs4"}]
+    assert _validate_completion(s) is None          # 已验证转移 → 通过
 
 
 def test_check_goal_coverage_detects_missing_click():
@@ -680,6 +685,44 @@ def main() -> int:
             print(f"FAIL  {name}: {type(exc).__name__}: {exc}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
+
+
+def test_expand_plan_schema_pre_actions():
+    """S1：edge.pre_actions（探索恢复的 fill）确定性插入转移前
+    （登录：fill 用户名/密码 → click Login；Planner 不生成 fill）。"""
+    from ai_agent import _expand_plan_schema
+    edges = [
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e5", "to": "obs2",
+         "pre_actions": [
+             {"action": "fill", "target_ref": "obs1:e3", "value": "${username}"},
+             {"action": "fill", "target_ref": "obs1:e4", "value": "${password}"},
+         ]},
+    ]
+    obs = [
+        {"id": "obs1", "url": "https://x.com/", "elements": [
+            {"ref": "obs1:e3", "kind": "action", "name": "Username"},
+            {"ref": "obs1:e4", "kind": "action", "name": "Password"},
+            {"ref": "obs1:e5", "kind": "action", "name": "Login"},
+        ]},
+        {"id": "obs2", "url": "https://x.com/home", "elements": [
+            {"ref": "obs2:e1", "kind": "action", "name": "Buy"},
+        ]},
+    ]
+    out = _expand_plan_schema({
+        "name": "t", "transition_refs": ["t1"], "assertions": [],
+    }, edges, obs, entry_url="https://x.com/")
+    acts = [(s["action"], s.get("value")) for s in out["steps"]]
+    assert [a for a, _ in acts] == ["goto", "fill", "fill", "click"]
+    assert acts[1] == ("fill", "${username}")
+    assert acts[2] == ("fill", "${password}")
+    assert out["steps"][1]["target_ref"] == "obs1:e3"
+    assert out["steps"][1]["observation_ref"] == "obs1"
+    # 无边 pre_actions → 只展开转移
+    edges2 = [{"from": "obs1", "action": "click", "target_ref": "obs1:e5", "to": "obs2"}]
+    out2 = _expand_plan_schema({
+        "name": "t", "transition_refs": ["t1"], "assertions": [],
+    }, edges2, obs, entry_url="https://x.com/")
+    assert [s["action"] for s in out2["steps"]] == ["goto", "click"]
 
 
 if __name__ == "__main__":

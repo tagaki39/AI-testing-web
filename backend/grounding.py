@@ -94,6 +94,9 @@ class GraphTransition(DSLModel):
     action: str
     target_ref: str
     target_name: str | None = None   # 临时 diagnostic，后续改为派生
+    # S1：该转移前的成功非转移动作（fill/select/check/press）——
+    # 探索期确定性恢复并绑定，Planner 不生成；value 为 ${var} 占位。
+    pre_actions: list[dict] | None = None
     to: str
 
 
