@@ -4,6 +4,7 @@ observation.py — 状态观察（R3 拆分自 explore_flow）
   一个状态只有一个事实源：current_obs 只由 _record_page 设置。
 """
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -126,6 +127,35 @@ class ObservationElement:
     context_role: str | None = None      # 最近语义容器（dialog/listitem/form...）
     context_name: str | None = None
     backend_dom_node_id: int | None = None   # 仅诊断，不作为 locator
+
+
+def semantic_state_signature(elements: list[dict]) -> str | None:
+    """语义状态签名（A4）：action/container 元素的
+    (role, 归一化 name, disabled, checked, expanded, context_role,
+    context_name) 排序后 hash。
+
+    相同业务状态 → 相同 hash（modal 开/关、表单 value 变化不再产生
+    phantom obs）；无 role 元素（纯文本页）→ None（回落全文 hash）。
+    绝不 hash AXNodeId（浏览器临时标识，不稳定）。
+    """
+    items = []
+    for e in elements:
+        role = e.get("role")
+        if not role:
+            continue
+        items.append((
+            role,
+            (e.get("name") or "").strip(),
+            bool(e.get("disabled")),
+            e.get("checked"),
+            e.get("expanded"),
+            e.get("context_role"),
+            e.get("context_name"),
+        ))
+    if not items:
+        return None
+    sig = json.dumps(sorted(items), ensure_ascii=False)
+    return hashlib.sha256(sig.encode()).hexdigest()[:10]
 
 
 def _classify(role: str | None) -> str:
@@ -381,8 +411,11 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     except Exception:
         pass   # CDP 不可用 → 保持扁平（aria legacy）
 
-    # 状态哈希：snapshot 变化 = 页面状态变化（即使 URL 相同）
-    state_hash = hashlib.sha256(snapshot.encode()).hexdigest()[:10]
+    # 状态哈希：A4 优先用语义状态签名（action/container 的 role/name/状态/
+    # 语义父级排序 hash）——相同业务状态匹配回原 obs，减少 phantom states
+    #（文本/输入值变化不再产生新 obs）。CDP 无增强时回落全文 hash。
+    state_hash = semantic_state_signature(elements) or (
+        hashlib.sha256(snapshot.encode()).hexdigest()[:10])
 
     # 当前 snapshot 命中已有 observation → 恢复该状态的 state-scoped
     # 元素表。修复：此前已存在路径会先污染 state.elements（无 obs 前缀

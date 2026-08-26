@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from explore.observation import (   # noqa: E402
     AXNode, CDPAccessibilityProvider, build_observation_elements,
-    normalize_cdp_ax_node,
+    normalize_cdp_ax_node, semantic_state_signature,
 )
 
 
@@ -129,6 +129,50 @@ def test_a2_ignored_nodes_skipped():
     ]
     els = build_observation_elements(nodes)
     assert len(els) == 1 and els[0].role == "button"
+
+
+# ── A4：semantic state signature（相同业务状态 → 相同 hash）──────────────────
+
+def test_a4_same_semantic_tree_same_hash():
+    """相同 action/container 集合（顺序不同）→ 相同 hash。"""
+    a = [
+        {"ref": "e1", "role": "button", "name": "Login"},
+        {"ref": "e2", "role": "textbox", "name": "Username"},
+    ]
+    b = [
+        {"ref": "e9", "role": "textbox", "name": "Username"},
+        {"ref": "e7", "role": "button", "name": "Login"},
+    ]
+    assert semantic_state_signature(a) == semantic_state_signature(b)
+
+
+def test_a4_text_change_no_new_state():
+    """文本/输入值变化不影响语义签名（fill 不产生 phantom obs）。"""
+    base = [{"ref": "e1", "role": "button", "name": "Login"}]
+    with_value = [
+        {"ref": "e1", "role": "button", "name": "Login"},
+        {"ref": "e2", "type": "text", "text": "welcome test1"},
+    ]
+    assert semantic_state_signature(base) == semantic_state_signature(with_value)
+
+
+def test_a4_dialog_state_changes_hash():
+    """dialog 开/关（context_role 变化）→ 不同 hash。"""
+    no_dialog = [
+        {"ref": "e1", "role": "button", "name": "Add to cart"},
+    ]
+    dialog_open = [
+        {"ref": "e1", "role": "button", "name": "Add to cart"},
+        {"ref": "e2", "role": "button", "name": "Continue Shopping",
+         "context_role": "dialog", "context_name": "Added!"},
+    ]
+    assert semantic_state_signature(no_dialog) != semantic_state_signature(dialog_open)
+
+
+def test_a4_no_role_elements_none():
+    """无 role 元素（纯文本页）→ None（回落全文 hash）。"""
+    assert semantic_state_signature([{"ref": "e1", "type": "text", "text": "hello"}]) is None
+    assert semantic_state_signature([]) is None
 
 
 # ── 真实 CDP 冒烟（Chromium 不可用时 SKIP）───────────────────────────────────
