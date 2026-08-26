@@ -909,6 +909,32 @@ def _target_key(step) -> str:
     return str(t)
 
 
+def _target_to_dict(t) -> dict:
+    """把 target（str / Locator 模型 / dict）统一转成 dict。"""
+    if hasattr(t, "model_dump"):
+        return t.model_dump()
+    if isinstance(t, dict):
+        return t
+    return {"text": str(t)}
+
+
+def _normalize_invalid_scopes(case: DSLCase) -> DSLCase:
+    """导航 target 的 scope 一律清空（invariant，不依赖 Repair round）。
+
+    无论 Planner 生成还是 Repair 产生——导航元素（Cart/Products/Home）
+    与商品/价格 scope 语义不兼容，是系统级 locator invariant。
+    """
+    changed = False
+    for step in case.steps:
+        if (step.scope is not None and step.target is not None
+                and is_navigation_target(_target_to_dict(step.target))):
+            step.scope = None
+            changed = True
+    if changed:
+        return validate_case(case.model_dump())
+    return case
+
+
 def _normalize_steps(case: DSLCase) -> tuple[DSLCase, list[int]]:
     """生成后归一化（Planner 输出波动 → 最终 DSL 稳定）：
 
