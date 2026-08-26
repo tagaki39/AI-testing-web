@@ -159,7 +159,17 @@ def _elements_to_prompt(elements: list[dict], state: "ExploreState | None" = Non
             if key in state.failed_actions:
                 continue   # 已确定性失败的 ref 不出现在候选表
         if "role" in e:
-            lines.append(f'{e["ref"]}: {e["role"]} "{e["name"]}"')
+            # 消歧信息（A4.2/A4.1 观察期采集）：商品名/容器锚点优先
+            #（LLM 靠它理解"前两个商品"），无则用 identity（data-product-id）。
+            # 没有它们，6 个同名 "Add to cart" 无法区分——LLM 只会选第一个。
+            line = f'{e["ref"]}: {e["role"]} "{e["name"]}"'
+            anchor = e.get("scope_has_text")
+            ident = e.get("identity") or {}
+            if anchor:
+                line += f' [{anchor}]'
+            elif ident.get("value"):
+                line += f' [id={ident["value"]}]'
+            lines.append(line)
         else:
             lines.append(f'{e["ref"]}: text "{e["text"]}"')
     return "\n".join(lines) if lines else "(当前页面无可操作元素)"
@@ -204,7 +214,97 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
 4. 每一步只做一个动作
 5. 当已收集到生成测试 DSL 所需的全部页面路径和元素时，exploration_complete=true 并输出 finish
 6. 探索阶段禁止执行删除、支付、提交订单、注销等不可逆操作（执行器会二次拦截）
-7. 不得离开入口站点（跨域导航会被回退）"""
+7. 不得离开入口站点（跨域导航会被回退）
+8. 数量完成度（目标里的数量词是硬要求）：
+   - 目标说"前两个商品/2 个/每个"等数量时，必须逐一完成对应的成功动作
+     （如"前两个商品加入购物车"= 需要 2 次不同商品的加购点击，且每次
+     都触发加购成功），全部完成前不得 exploration_complete
+   - 出现模态框/对话框时（可操作元素表会骤减）：目标未完成时优先选择
+     能继续完成目标的动作（如"继续购物/关闭"类）回到业务页面，
+     不要急于进入收尾页面（如购物车）——只有最后一个商品加购后的
+     弹窗才应该选择进入购物车验证"""
+
+
+# ── Policy：目标约束（R6——从 StateGraph 派生，不存第二状态源）───────────────
+# 职责分层：
+#   ActionSpace = 结构合法性（当前页面物理上能做什么）
+#   Policy      = 目标约束（根据用户目标，现在应该允许选什么）
+#   LLM         = 在允许集合里做语义选择
+# "能 derive 的状态不要 store"——完成度直接从成功 transitions 推导，
+# 不引入 required_count/completed_adds 等第二事实源；未来"添加三个角色"
+# "上传四张图片"只是同一个 Policy 规则，不需要新的 guard。
+
+_CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_QTY_PATTERNS = (
+    re.compile(r"前([一二两三四五六七八九十\d]+)个"),
+    re.compile(r"([\d一二两三四五六七八九十]+)\s*个(?:商品|产品|物品)"),
+    re.compile(r"first\s+(\d+)\s+(?:products|items)", re.I),
+    re.compile(r"(\d+)\s+(?:products|items)", re.I),
+)
+
+# 终态动作模式（"进入收尾页面"的信号，通用非站点特判）：
+# View Cart / Checkout / Submit / 结账 / 支付等；"Add to cart" 不误伤
+#（lookbehind 排除 "to cart" 前导词）。
+_TERMINAL_ACTION_RE = re.compile(
+    r"(?<![a-z] )((view\s*)?cart|checkout|submit|place\s*order|pay)\b"
+    r"|下单|结账|支付|结算",
+    re.IGNORECASE,
+)
+
+
+def _extract_required_count(goal: str) -> int | None:
+    """目标数量词 → int（"前两个商品" → 2）；无数量词 → None。"""
+    for pat in _QTY_PATTERNS:
+        m = pat.search(goal or "")
+        if m:
+            raw = m.group(1).strip()
+            if raw.isdigit():
+                return int(raw)
+            if raw in _CN_NUM:
+                return _CN_NUM[raw]
+    return None
+
+
+def _derive_completed_entities(state: "ExploreState") -> set[str]:
+    """从成功转移边派生已完成业务实体（identity 可证才计）。
+
+    成功边 = from≠to（产生真实状态变化的动作；失败/self-loop 排除）。
+    target_ref → 元素表查 identity（data-product-id 等）——不同商品弹
+    相同 modal（无内容区分），只有 identity 能区分实体。
+    """
+    ref_map = {
+        e["ref"]: e
+        for o in state.observations
+        for e in o.get("elements", [])
+    }
+    completed: set[str] = set()
+    for t in state.transitions:
+        if not (t.get("from") and t.get("to") and t.get("from") != t.get("to")):
+            continue
+        ident = (ref_map.get(t.get("target_ref") or "") or {}).get("identity") or {}
+        if ident.get("attr") and ident.get("value"):
+            completed.add(f"{ident['attr']}={ident['value']}")
+    return completed
+
+
+def _apply_goal_constraints(goal: str, state: "ExploreState",
+                            action_space: list[dict]) -> list[dict]:
+    """Policy：目标数量未完成时，interaction root 内终态动作不暴露。
+
+    只作用于 interaction root 打开时（modal/overlay）；数量完成或
+    无数量要求 → 原样返回。完成度从 StateGraph 派生（_derive_completed_entities）。
+    """
+    required = _extract_required_count(goal)
+    if required is None:
+        return action_space
+    if len(_derive_completed_entities(state)) >= required:
+        return action_space
+    return [
+        e for e in action_space
+        if e.get("kind") != "action"
+        or not _TERMINAL_ACTION_RE.search(e.get("name") or "")
+    ]
 
 
 # ── observe / record ───────────────────────────────────────────────────────────
@@ -234,7 +334,8 @@ def _decide(state: ExploreState, llm_call, elements: list[dict] | None = None) -
     )
     try:
         t0 = perf_counter()
-        text = llm_call(prompt, system_prompt=EXPLORE_SYSTEM_PROMPT)
+        text = llm_call(prompt, system_prompt=EXPLORE_SYSTEM_PROMPT,
+                        timeout=EXPLORE_LLM_TIMEOUT_S)   # P0：单次决策 20s 上限
         state.timings["llm_ms"] += int((perf_counter() - t0) * 1000)
         state.llm_calls += 1   # 每次决策尝试都计（预算护栏：坏决策也消耗预算）
         decision = json.loads(re.search(r"\{.*\}", text, re.DOTALL).group(0))
@@ -294,11 +395,14 @@ def _decide(state: ExploreState, llm_call, elements: list[dict] | None = None) -
 
 
 
-MAX_STEPS = 12       # 最多执行 12 个动作（BFC 场景需要 7 个成功动作：
-                     # 首页→Products→Polo→加购×2→Continue Shopping→View Cart，
-                     # 8 步上限会让购物车页探索不到）
-MAX_LLM_CALLS = 16   # 最多 16 次 LLM 决策调用（BFC 实测 8 步探索耗 8-10 次，
-                     # 含决策自纠；12 步动作 + 自纠余量）
+MAX_STEPS = 10       # 最多执行 10 个动作（BFC 正常 7 个：Products→Polo→
+                     # 加购×2→Continue Shopping→View Cart→Cart）
+MAX_LLM_CALLS = 10   # 最多 10 次 LLM 决策调用（10 次还完不成 = 诚实失败）
+MAX_EXPLORE_SECONDS = 60   # P0 硬预算：整个 explore 的 wall-clock deadline
+                           #（BFC 300s 黑洞：LLM 挂起时无上限等待——
+                           # 任何模型抽风都不会无限增长）
+EXPLORE_LLM_TIMEOUT_S = 20   # 探索单次决策 LLM 超时（非长文生成，
+                             # 20s 足够；Planner 保留 60s）
 _DESTRUCTIVE_PATTERNS = (
     "delete", "remove", "pay", "purchase", "submit order",
     "send", "publish", "sign out", "log out", "注销", "删除", "支付",
@@ -366,13 +470,35 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         state.timings["fixed_wait_ms"] += int((perf_counter() - wait_start) * 1000)
         _record_page(state, page)   # 初始 observe：入口页
 
+        started_at = perf_counter()
+        deadline = started_at + MAX_EXPLORE_SECONDS   # P0 硬预算
         while (not state.done
                and state.step_count < MAX_STEPS
-               and state.llm_calls < MAX_LLM_CALLS):
+               and state.llm_calls < MAX_LLM_CALLS
+               and perf_counter() < deadline):
             # R3：ActionSpace——LLM 只能从"当前可操作"的候选中选
             #（模态框遮挡的 Add to cart 不进入候选，模型没权限选错）
             action_space = _build_action_space(state)
+            # R6：Policy——目标约束叠加（数量未完成时 interaction root
+            # 内终态动作不暴露；从 StateGraph 派生，不存第二状态源）
+            if state.interaction_root:
+                action_space = _apply_goal_constraints(
+                    state.goal, state, action_space)
+            # P0 诊断：每次决策打点（卡在 LLM vs 浏览器一目了然）
+            # A4.3：interaction root source（ax dialog / dom_overlay）；
+            # 可点 action 与 evidence 分开计数（evidence 不是 selectable）
+            iroot = (state.interaction_root or {}).get("source")
+            n_act = sum(1 for e in action_space if e.get("kind") == "action")
+            n_ev = len(action_space) - n_act
+            print(f"[EXPLORE] step={state.step_count} llm={state.llm_calls} "
+                  f"interaction_root={iroot} "
+                  f"DECIDE_START selectable_actions={n_act} evidence={n_ev}",
+                  flush=True)
             decision, decision_error = _decide(state, llm_call, elements=action_space)
+            print(f"[EXPLORE] step={state.step_count} llm={state.llm_calls} "
+                  f"DECIDE_DONE action={(decision or {}).get('action')} "
+                  f"ref={(decision or {}).get('target_ref')} "
+                  f"err={(decision_error or '')[:60]}", flush=True)
             if decision is None:
                 # 决策被校验拒绝：把错误反馈进历史，预算内让 LLM 自纠。
                 # 修复：单次坏决策直接夭折整个探索——真实 E2E 中 fill 之后
@@ -495,6 +621,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             else:
                 state.current_url = page.url   # fill 不改页面结构，只同步 URL
                 to_obs = state.current_obs
+
 
             # 认证失败 evidence（死胡同要明确停止，不能原地循环）：
             # 页面出现 "email or password is incorrect" 等信号 → 目标无法

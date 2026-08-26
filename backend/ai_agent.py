@@ -174,38 +174,48 @@ SYSTEM_PROMPT_REFS_ONLY = """你是 Web UI 自动化测试的 DSL 生成器（re
 
 规则：
 1. action 只能是: goto, click, fill, select, check, wait_for, assert_visible, assert_text, assert_url
-2. 定位元素只能通过 target_ref 引用元素引用表中的 ref（格式 obsN:eM）：
-   - 每个需要定位元素的步骤（click/fill/select/check/wait_for/assert_visible）
-     必须提供 target_ref，且只能从系统提供的元素引用表中选择
+2. 状态变化型步骤（click/导航）用 transition_ref（R7）：
+   - 从系统提供的"已验证状态转移"表中选择（t1/t2/...，格式 obs1 --click obs1:e29--> obs2）
+   - transition_ref 由系统确定性展开为 action/target_ref/observation_ref——
+     你不需要（也无权）推导状态机，只做语义选择
    - 禁止生成 target、scope、role、name、text、css、test_id 等任何定位字段
-     （locator 由系统根据 ref 确定性编译）
-   - 引用表中没有合适元素时，调整步骤设计（如改用 assert_text 验证页面文本），
-     禁止编造 ref
-3. 变量：
+3. 非状态变化型步骤（fill/select/check/wait_for/assert_visible/assert_text）：
+   - 用 target_ref 引用元素引用表中的 ref（格式 obsN:eM）
+   - target_ref 只能从系统提供的元素引用表中选择，禁止编造
+   - 引用表中没有合适元素时，调整步骤设计（如改用 assert_text 验证页面文本）
+   - 元素级断言只能引用"当前执行位置"状态的元素（按已验证转移边
+     顺序推进理解当前状态；页面级断言可不提供 target_ref）
+4. 变量：
    - 所有可变测试输入必须使用 ${var}，每个变量必须声明在 input_contract
    - secret=true → default 必须为 null（执行时本地注入）
    - 非敏感变量只有上下文明确提供 default 时才能填写；不得猜测真实值
-4. 业务动作覆盖（最重要）：
+5. 业务动作覆盖（最重要）：
    - 用户目标中要求的每个业务动作都必须生成对应的执行步骤——
      目标说"加入购物车"就必须有 click 加购元素的步骤，说"登录"就必须
      有完整的登录步骤（fill + click）
    - 禁止只生成导航（goto）和断言而跳过目标要求的业务动作
-5. observation_ref（grounding 引用）：
-   - 每个可定位步骤应引用产生该定位证据的 observation id（obs1/obs2/...）
-   - observation_ref 必须来自系统提供的 observation 列表，禁止编造
-   - target_ref 的 obs 前缀必须与 observation_ref 一致（都是 obsN）
-6. 断言动作字段约束（机械规则）：
+   - 数量要求（"前两个商品"）：点击不同业务实体（不同 transition_ref
+     对应不同目标）完成全部数量，再进入收尾步骤
+6. observation_ref（grounding 引用，R7.1）：
+   - observation_ref 由系统自动设置（状态 cursor 推进）——不要输出该字段，
+     输出也会被覆盖
+   - 元素级断言的 target_ref 由系统校验必须属于当前状态
+7. 断言动作字段约束（机械规则）：
    - assert_text: value 必填（要验证的文本）；验证某个元素内文本时用 target_ref
      引用该元素，验证整页文本时不提供 target_ref；
      禁止把待验证文本只放在 target 里而省略 value（target 字段本来就被禁止）
    - assert_visible: target_ref 必填（验证元素出现）
    - assert_url: value 必填（URL 片段），不需要 target_ref
-7. 最小测试原则：
+7.5 输出紧凑性（硬约束）：
+   - 输出必须是【单个 JSON 对象】本身，禁止任何前置/后置文本、代码块标记
+   - 禁止复制、引用或重述页面结构、元素引用表、ARIA snapshot 内容
+   - 输出通常 <100 行；超过 500 行视为无效（会整段重试）
+8. 最小测试原则：
    - 仅生成完成用户需求所需的最少步骤
    - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
    - 单一最终目标默认生成恰好 1 个最终验证
    - 如果用户明确要求多个独立验证结果，则保留这些明确要求的验证
-8. Wait after state-changing actions（等待修改动作的 postcondition）：
+9. Wait after state-changing actions（等待修改动作的 postcondition）：
    - 当 click / submit / select 会触发异步页面状态变化、且后续步骤依赖
      该变化时，必须等待一个能证明变化已经完成的新状态元素（postcondition），
      再继续下一步
@@ -218,32 +228,35 @@ SYSTEM_PROMPT_REFS_ONLY = """你是 Web UI 自动化测试的 DSL 生成器（re
    - postcondition 元素必须来自元素表（target_ref 引用新状态中的元素，
      如 obs6 的 "Remove"；引用表中没有可靠 postcondition 时，宁可不加
      wait_for 也不编造 ref）
-9. Modify-then-assert（修改后先等再断言）：
+10. Modify-then-assert（修改后先等再断言）：
    - 修改值（fill/select/check）后，先 wait_for 更新生效，再断言新值
    - 不得在修改生效前断言新值（竞态：断言可能读到旧状态）
-10. 验证策略：
+11. 验证策略：
    - 登录/页面跳转 → 优先 assert_url 或目标页面关键元素 assert_visible
    - 元素出现、按钮状态变化 → assert_visible
    - 文本、价格、数量变化 → assert_text
    - 用户未明确验证方式时，选择与最终动作因果关系最直接的可观察结果
-11. 只输出 JSON，不要输出任何解释或代码块标记"""
+12. 只输出 JSON，不要输出任何解释或代码块标记"""
 
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
 
-def _call_llm(user_prompt: str, system_prompt: str | None = None) -> str:
+def _call_llm(user_prompt: str, system_prompt: str | None = None,
+              timeout: float = 60) -> str:
     """调用 DeepSeek chat completions API，返回文本内容。
 
     这是最原始的 HTTP POST 请求，拆解每一步：
       1. 构造 payload（JSON 请求体）：model + messages + temperature
       2. urllib.request.Request：封装 URL、请求体、请求头
-      3. urlopen()：真正发出网络请求（timeout=60 秒上限）
+      3. urlopen()：真正发出网络请求（默认 timeout=60 秒上限；
+         Explorer 单次决策传 20s——决策不是长文生成）
       4. 解析响应 JSON，取 choices[0].message.content（LLM 的回答文本）
 
     请求体格式是 OpenAI 兼容规范（DeepSeek 兼容它）：
       messages = [system（角色设定）] + [user（用户输入）]
 
     参数 system_prompt：可覆盖默认 SYSTEM_PROMPT（阶段 1 提取 URL 时用专用 prompt）
+    timeout：网络超时秒数（P0：探索决策 20s / Planner 60s）
     """
     if not API_KEY:
         raise RuntimeError("未配置 AI_API_KEY（环境变量或 .env 文件）")
@@ -264,8 +277,16 @@ def _call_llm(user_prompt: str, system_prompt: str | None = None) -> str:
             "Authorization": f"Bearer {API_KEY}",  # 认证：Bearer token 标准格式
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    # P0 网络埋点：区分"连接/首包慢" vs "body.read() 卡"
+    _llm_t0 = perf_counter()
+    print(f"[LLM] HTTP_START timeout={timeout}", flush=True)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        print(f"[LLM] HEADERS {perf_counter() - _llm_t0:.1f}s status={resp.status}",
+              flush=True)
+        body = resp.read()
+    print(f"[LLM] HTTP_DONE {perf_counter() - _llm_t0:.1f}s bytes={len(body)}",
+          flush=True)
+    data = json.loads(body.decode("utf-8"))
     return data["choices"][0]["message"]["content"]
 
 
@@ -696,23 +717,103 @@ def _build_retry_hint(error_info: str) -> str:
     )
 
 
+def _expand_transition_refs(case_dict: dict,
+                            verified_edges: list[dict],
+                            observations: list[dict] | None = None) -> dict:
+    """R7.1：transition_ref 确定性展开 + State Cursor Grounding。
+
+    State cursor = 唯一的"现在在哪个状态"事实源：
+      - transition_ref 推进 cursor（edge.from 必须 == cursor，否则
+        TRANSITION_OUT_OF_ORDER）
+      - 断言/其他非状态变化步骤的 observation_ref 由 cursor 自动赋值
+        （LLM 无权写——它不知道也不必推导状态机）
+      - 元素级断言 target_ref 必须属于当前 cursor 的 refs（否则
+        ASSERTION_REF_OUT_OF_CURRENT_STATE——跨状态引用结构上不可能）
+      - 页面级断言（无 target_ref）不需要元素
+
+    未知 transition_ref / cursor 错位 / 断言跨状态 → ValueError
+    （schema recovery 干净重生，不靠 prompt 提醒）。
+    cursor 为 None（goto 未匹配）→ fail-open：不校验、不覆盖。
+    """
+    if not verified_edges:
+        return case_dict
+    refs_by_obs: dict[str, set[str]] = {}
+    if observations:
+        for o in observations:
+            refs_by_obs[o["id"]] = {e["ref"] for e in o.get("elements", [])}
+    index = {f"t{i + 1}": t for i, t in enumerate(verified_edges)}
+    steps = case_dict.get("steps") or []
+    cursor: str | None = None
+
+    def match_url(value) -> str | None:
+        if not value:
+            return None
+        url = str(value).strip().rstrip("/")
+        for o in observations or []:
+            if o.get("url") == url or (o.get("url") or "").rstrip("/") == url:
+                return o["id"]
+        return None
+
+    for step in steps:
+        tref = step.pop("transition_ref", None)
+        if tref:
+            edge = index.get(tref)
+            if edge is None:
+                raise ValueError(f"未知 transition_ref {tref}（verified 边外）")
+            if cursor is not None and edge["from"] != cursor:
+                raise ValueError(
+                    f"TRANSITION_OUT_OF_ORDER: {tref} 起点 {edge['from']} "
+                    f"≠ 当前状态 {cursor}（路径沿已验证转移边推进）")
+            # 确定性展开：action/target_ref/observation_ref 由已验证边决定
+            step["action"] = edge["action"]
+            step["target_ref"] = edge["target_ref"]
+            step["observation_ref"] = edge["from"]
+            cursor = edge["to"]
+            continue
+        if step.get("action") == "goto":
+            cursor = match_url(step.get("value"))
+            if cursor is not None:
+                step["observation_ref"] = cursor
+            continue
+        # 非状态变化步骤（fill/select/check/wait_for/assert_*）：
+        # observation_ref 由当前 cursor 自动赋值；元素级引用必须属于
+        # 当前状态（跨状态引用在结构上不可能）
+        if cursor is not None:
+            step["observation_ref"] = cursor
+            tref2 = step.get("target_ref")
+            if tref2:
+                allowed = refs_by_obs.get(cursor, set())
+                if allowed and tref2 not in allowed:
+                    raise ValueError(
+                        f"ASSERTION_REF_OUT_OF_CURRENT_STATE: 步骤引用 "
+                        f"{tref2} 不属于当前状态 {cursor}（断言只能引用"
+                        "当前状态元素；页面级断言可不提供 target_ref）")
+    return case_dict
+
+
 def _generate_planner_case(
     grounded_prompt: str,
     mode: str = "legacy",
     tables: str | None = None,
+    verified_edges: list[dict] | None = None,
+    observations: list[dict] | None = None,
 ) -> tuple[DSLCase, dict]:
     """Planner 生成 + 校验；schema 失败 constrained recovery ×1。
 
-    mode: "refs_only"（grounded，有元素表——只允许 target_ref 定位）
+    mode: "refs_only"（grounded，有元素表——状态变化型步骤用
+          transition_ref，由 verified_edges 确定性展开）
           "legacy"（无探索降级——保留 role/name/scope 生成能力）
+
+    verified_edges: R7——探索的成功转移边（带顺序，t1..tN）；
+          Planner 的 click 步骤从这里选 transition_ref。
 
     返回 (case, planner_meta)，meta 记录：
       planner_attempts / schema_recovery_used / schema_recovery_success
       initial_validation_errors / planner_recovery_ms / mode
 
     只对"生成结果不合法"（JSON 解析 / Pydantic ValidationError /
-    refs-only 契约违规）做 recovery；LLM API 异常（超时/网络）不在此
-    吞掉，让上层 fail safely。
+    refs-only 契约违规 / 未知 transition_ref）做 recovery；LLM API
+    异常（超时/网络）不在此吞掉，让上层 fail safely。
     """
     from pydantic import ValidationError
 
@@ -724,34 +825,56 @@ def _generate_planner_case(
         "initial_validation_errors": None,
         "planner_recovery_ms": 0,
         "mode": mode,
+        "transitions_expanded": 0,
     }
 
     def parse_and_validate(text: str) -> DSLCase:
-        case = validate_case(_extract_json(text))
+        case_dict = _extract_json(text)
+        # R7.1：transition_ref 确定性展开 + state cursor grounding
+        #（在 DSL 校验前——展开后才合法）
+        if refs_only and verified_edges:
+            n_before = len([
+                s for s in case_dict.get("steps", []) if "transition_ref" in s
+            ])
+            case_dict = _expand_transition_refs(
+                case_dict, verified_edges, observations=observations)
+            meta["transitions_expanded"] = n_before
+        case = validate_case(case_dict)
         if refs_only:
             check_refs_only(case)
         return case
 
+    # R5：输入/输出尺寸指标（验证 compact 化是否生效——正常应几 KB）
+    meta["prompt_chars"] = len(grounded_prompt)
     raw_text = _call_llm(
         grounded_prompt,
         system_prompt=SYSTEM_PROMPT_REFS_ONLY if refs_only else SYSTEM_PROMPT,
     )
+    meta["output_chars"] = len(raw_text)
     try:
         return parse_and_validate(raw_text), meta
     except (ValueError, ValidationError) as exc:
         meta["schema_recovery_used"] = True
         meta["planner_attempts"] = 2
         meta["initial_validation_errors"] = _summarize_validation_error(exc)
+        # R5：坏输出只留诊断日志（前 300 字符），绝不重新喂模型
+        print(f"[PLANNER] bad_output chars={len(raw_text)} "
+              f"preview={raw_text[:300]!r}", flush=True)
 
+        # R5：recovery 不嵌入上次坏输出——32KB 坏 JSON 全文回灌 =
+        # 雪崩放大器（大 prompt → 更坏输出 → 更大 prompt）。只给错误
+        # 摘要 + 原始任务，干净重生；坏输出不再进入任何后续 LLM 上下文。
         recovery_prompt = (
-            "上一次 Planner 输出：\n"
-            f"{raw_text}\n\n"
-            "Schema 校验错误：\n"
-            f"{meta['initial_validation_errors']}"
+            "上一次 Planner 输出未通过 DSL Schema 校验，错误：\n"
+            f"{meta['initial_validation_errors']}\n\n"
+            "请根据下面的原始任务重新生成完整的 DSL JSON。"
+            "不要解释、不要复述输入、不要输出 Markdown、不要复制任何页面结构。\n\n"
+            f"原始任务：\n{grounded_prompt}"
         )
         if refs_only and tables:
             # refs-only 修复需要引用表上下文（补 ref / 改 ref 都只能在表内选）
             recovery_prompt += f"\n\n元素引用表（target_ref 只能从这里选择）：\n{tables}"
+        meta["recovery_prompt_chars"] = len(recovery_prompt)
         t = perf_counter()
         repaired_text = _call_llm(
             recovery_prompt,
@@ -759,10 +882,11 @@ def _generate_planner_case(
             if refs_only else PLANNER_RECOVERY_SYSTEM_PROMPT,
         )
         meta["planner_recovery_ms"] = int((perf_counter() - t) * 1000)
+        meta["recovery_output_chars"] = len(repaired_text)
 
         case = parse_and_validate(repaired_text)   # 仍失败 → 抛异常（fail safely）
         meta["schema_recovery_success"] = True
-        return case, meta
+    return case, meta
 
 
 # ── Preflight v2：候选提取 + 确定性消歧 + LLM 受限选择 ────────────────────────
@@ -1631,6 +1755,63 @@ def _sanitize_for_cache(explore_result: dict, runtime_inputs: dict) -> dict:
     return result
 
 
+_MAX_COMPACT_ACTIONS_PER_OBS = 20   # R5：compact ref 表每 obs 的 action 限量
+_MAX_COMPACT_EVIDENCE_PER_OBS = 3   # R5：compact ref 表每 obs 的 evidence 限量
+
+
+def _build_compact_refs(pages: list[dict],
+                        transitions: list[dict] | None = None) -> str:
+    """R5：compact ref 表——canonical path 优先，只给 ref + role/name。
+
+    与 _pages_to_text 的区别：refs-only Planner 只需要从 ref 表选
+    target_ref——ARIA snapshot 全文是噪音（8 obs × 全文曾把 prompt
+    撑到几十 KB，LLM 开始回吐坏 JSON）。
+
+    优先级（防"巨大 snapshot → 巨大 ref table"）：
+      1. 成功 transition 涉及的 ref（被验证可操作，规划必需）排最前
+      2. 各 obs 其余 action 限量（Add/View Cart 等业务关键元素在 AX
+         树前部，前 20 足够；过量 refs 同样撑爆 prompt）
+      3. evidence 限量（断言用文本锚点）
+
+    observation_ref 校验（valid_refs）不受影响——只是给 LLM 的视角缩小。
+    """
+    path_refs: set[str] = {
+        t.get("target_ref") for t in (transitions or []) if t.get("target_ref")
+    }
+    sections = []
+    for page in pages:
+        obs_id = page.get("id", "?")
+        url = page.get("url", "")
+        elements = page.get("elements") or []
+        path_lines = []
+        rest_action = 0
+        ev_count = 0
+        for e in elements:
+            if e["ref"] in path_refs:
+                name = (e.get("name") or "").strip()
+                path_lines.append(f"      {e['ref']}: {e.get('role', '')} \"{name}\"")
+        lines = list(path_lines)
+        for e in elements:
+            if e["ref"] in path_refs:
+                continue
+            if e.get("kind") == "action" or "role" in e:
+                if rest_action >= _MAX_COMPACT_ACTIONS_PER_OBS:
+                    continue
+                rest_action += 1
+                name = (e.get("name") or "").strip()
+                lines.append(f"      {e['ref']}: {e.get('role', '')} \"{name}\"")
+            else:
+                if ev_count >= _MAX_COMPACT_EVIDENCE_PER_OBS:
+                    continue
+                ev_count += 1
+                text = (e.get("text") or e.get("name") or "").strip()[:60]
+                lines.append(f"      {e['ref']}: text \"{text}\"")
+        if not lines:
+            continue
+        sections.append(f"[{obs_id}] {url}\n" + "\n".join(lines))
+    return "\n\n".join(sections)
+
+
 def _pages_to_text(pages: list[dict]) -> str:
     """把探索到的 observation 快照合并成 Planner 可读文本（每页分段标记）。
 
@@ -1639,6 +1820,9 @@ def _pages_to_text(pages: list[dict]) -> str:
 
     G1：每页附 state-scoped 元素表（refs）——Planner 可输出 target_ref
     引用系统观察到的真实元素（obs3:e17），而非自由构造 role/name/scope。
+
+    注意：refs-only 主路径已改用 _build_compact_refs（R5，不含 snapshot
+    全文）；本函数保留给 Preflight 弱验证等需要 snapshot 的调用方。
     """
     sections = []
     for page in pages:
@@ -1681,7 +1865,14 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     第 4 步是"最后一道防线"：AI 就算输出了合法 JSON，
     只要 action 不在白名单、缺字段、类型不对，照样拒绝。
     校验失败会抛异常，由 main.py 捕获后返回 400 给前端。
+
+    P0 诊断（BFC 300s 超时黑洞定位）：stage marks 输出到 uvicorn 日志——
+    卡在哪个阶段一目了然。临时诊断代码，定位后移除。
     """
+    _g_t0 = perf_counter()
+    def _mark(stage: str) -> None:
+        print(f"[GEN] {stage} +{(perf_counter() - _g_t0) * 1000:.0f}ms", flush=True)
+    _mark("ENTER")
     # ── 阶段 1：解析入口 URL（正则优先，描述性输入 LLM fallback）───
     t_url = perf_counter()
     entry_url = _resolve_entry_url(user_prompt)
@@ -1719,6 +1910,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 # 降级带来的可用性；无 entry_url 的 legacy 在上层显式处理。
                 raise
     explore_ms = int((perf_counter() - t_explore) * 1000)
+    _mark("EXPLORE_DONE")
 
     # E1（评审收紧）：探索异常不得静默冒充 grounded 成功——显式暴露
     # degraded 标记与错误，前端/诊断能区分"真 grounded"与"legacy 降级"。
@@ -1739,16 +1931,26 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         if reach:
             pages = [p for p in pages if p["id"] in reach]
     multi_snapshot = _pages_to_text(pages) if pages else None
-    if multi_snapshot:
+    # R5：canonical path（成功转移边）先行——compact ref 表按 path 优先
+    tr = (explore_result or {}).get("transitions") or []
+    compact_refs = (_build_compact_refs(pages, transitions=tr)
+                    if pages else None)
+    if compact_refs:
         # P0-3：canonical path 只来自成功转移边（State Graph transitions），
         # 失败动作单独标注为负例——Planner 不会学到"点击文本超时 →
         # 进入 obs4"的错误因果（temporal attribution bug：失败动作的
         # 15s 超时窗口恰好吞掉了前一个动作的延迟状态）。
-        tr = (explore_result or {}).get("transitions") or []
-        path_lines = [
-            f"- {t['from']} --{t['action']} {t['target_ref']}--> {t['to']}"
-            for t in tr
+        # R7：verified transitions 带 ID（t1..tN）——Planner 的状态变化型
+        # 步骤（click）从这里选 transition_ref，由代码确定性展开成
+        # action/target_ref/observation_ref——结构上不可能生成跨状态引用，
+        # G3 从"经常拦截"降级为"safety invariant"。
+        verified_edges = [
+            t for t in tr
             if t.get("from") and t.get("to") and t.get("from") != t.get("to")
+        ]
+        path_lines = [
+            f"t{i}: {t['from']} --{t['action']} {t['target_ref']}--> {t['to']}"
+            for i, t in enumerate(verified_edges, start=1)
         ]
         fail_lines = [
             f"- {h.get('action')} {h.get('target_ref')} 失败:"
@@ -1756,23 +1958,28 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             for h in (explore_result or {}).get("history", [])
             if h.get("error") and h.get("action") != "decision_rejected"
         ]
+        # R5：refs-only Planner 只吃 canonical path + compact ref 表——
+        # 不注入 ARIA snapshot 全文（Planner 只选 ref，snapshot 是噪音；
+        # 完整快照把 prompt 撑到几十 KB → LLM 回吐坏 JSON 的根因）。
         grounded_prompt = (
             f"目标页面入口: {entry_url}\n\n"
             f"已验证状态转移（State Graph 成功边，规划路径只能沿这些边）:\n"
             + ("\n".join(path_lines) if path_lines else "- (无)")
             + ("\n\n失败动作（不要模仿，这些动作未产生有效状态变化）:\n"
                + "\n".join(fail_lines) if fail_lines else "")
-            + "\n\n各页面真实结构（ARIA snapshot）：\n\n"
-            + multi_snapshot
+            + "\n\n元素引用表（target_ref 只能从这些 ref 中选择，禁止编造）:\n\n"
+            + compact_refs
             + "\n\n用户测试需求（已脱敏，密码等敏感信息已替换为 ${var} 占位符）: "
             + explore_goal
             + "\n\n规则："
             "1. 用户提供的测试数据用 ${var} 占位并声明在 input_contract："
             "需求中给出的值填 default；密码等敏感信息 secret=true 且 default=null；"
-            "2. （G3 refs-only）定位元素一律通过 target_ref 引用元素引用表中的"
-            "系统观察元素（如 obs3:e17）——target_ref 只能从元素引用表选择，"
-            "禁止编造；禁止生成 target/scope 等定位字段（locator 由系统"
-            "根据 ref 确定性编译，不要输出 role/name/text/css/test_id）；"
+            "2. （R7）状态变化型步骤（click/导航）用 transition_ref 引用"
+            "『已验证状态转移』表中的边（t1/t2/...）——系统确定性展开为"
+            "action/target_ref/observation_ref，你无需推导状态机；"
+            "fill/select/check/wait_for/assert_visible/assert_text 用 target_ref"
+            "引用元素引用表中的系统观察元素（如 obs3:e17），禁止编造；"
+            "禁止生成 target/scope 等定位字段（locator 由系统根据 ref 编译）；"
             "3. 每个步骤必须设置 observation_ref，且只能从页面分段标记"
             "（[obs1] [obs2] ...）中选择——禁止创造不存在的 observation_ref；"
             "target_ref 的 obs 前缀必须与 observation_ref 一致；"
@@ -1793,8 +2000,15 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     # 确定性编译，跨状态/编造 ref 执行前拒绝（放在 Preflight 之前：
     # grounding 错位的计划不值得花浏览器轮次修复）。
     def attempt(prompt: str, tables: str | None = None):
+        # R5：显式空字符串也算"已传"（不用 `or`——语义严格，不会把
+        # 显式传的空表误当"没传"回退到完整 snapshot）
+        effective_tables = (
+            tables if tables is not None else compact_refs
+        )
+        # R7.1：verified_edges + observations（state cursor grounding 用）
         case, planner_meta = _generate_planner_case(
-            prompt, mode=planner_mode, tables=tables or multi_snapshot,
+            prompt, mode=planner_mode, tables=effective_tables,
+            verified_edges=verified_edges, observations=pages,
         )   # ← Schema Recovery ×1（refs-only 模式含契约违规修复）
         case, removed = _normalize_steps(case)   # ← 计划归一化 + 记录删除
         case = _normalize_invalid_scopes(case)   # ← 导航 scope invariant
@@ -1842,16 +2056,21 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             # 关键：重生时只提供可达 observation 的快照——Planner 看不到
             # 不可达状态（如孤儿 obs5），物理上无法引用它（BFC 实测：
             # 只靠 prompt 提示不够，Planner 会因目标完整性压力继续引用）。
+            # R5：compact 化 + 转移边过滤到 reach 内（不回到 full snapshot）
             if explore_result is not None:
                 sg = StateGraph.from_explore_result(explore_result)
                 reach = _reachable_observations(sg)
                 retry_pages = [p for p in pages if p["id"] in reach]
-                retry_tables = _pages_to_text(retry_pages) if retry_pages else None
+                retry_tr = [t for t in tr
+                            if t.get("from") in reach and t.get("to") in reach]
+                retry_tables = (_build_compact_refs(retry_pages, transitions=retry_tr)
+                                if retry_pages else None)
         case, planner_meta, removed_assertions, compile_stats = attempt(
             grounded_prompt + _build_retry_hint(str(exc)) + extra,
             tables=retry_tables,
         )
     planner_ms = int((perf_counter() - t_planner) * 1000)
+    _mark("PLANNER_DONE")
 
     meta = {
         "generation_mode": "refs_only" if explore_result is not None else "legacy_fallback",

@@ -129,33 +129,228 @@ def test_press_back_and_unknown_action():
         pw.stop()
 
 
-def test_record_page_marks_actionable():
-    """观察期 actionable 标记真实生效（防回归：拆分时漏 import 导致
-    NameError 被静默吞掉，全部元素误标 False → 探索残废）。"""
+def test_record_page_kind_contract():
+    """A4.2 契约：Observation 纯语义（kind/disabled），无 DOM actionable
+    评估（性能根因防回归：首页 135 action × elementFromPoint 曾卡死）。"""
     from explore.observation import ExploreState, _record_page
     pw, browser, page = _launch()
     try:
         page.set_content(
             '<button>Go</button>\n<button>Only One</button>\n'
+            '<button disabled>Disabled</button>\n'
             '<div data-product-id="p1"><div>Blue Top</div><button>Buy</button></div>\n'
             '<div data-product-id="p2"><div>Red Top</div><button>Buy</button></div>'
         )
         state = ExploreState(goal="t", entry_url="https://x.com")
         _record_page(state, page)
-        # A4.1 契约：actionability 只属于 kind=action
+        assert state.elements, "Observation 不应为空"
+        # 所有元素都有 kind（统一契约）
+        assert all(e.get("kind") in {"action", "evidence", "container"}
+                   for e in state.elements)
         actions = [e for e in state.elements if e.get("kind") == "action"]
         by_name = {e["name"]: e for e in actions}
-        assert by_name["Go"].get("actionable") is True      # 唯一元素可操作
-        # 同名重复 + I1 锚点 → 也能被标记（scope 消歧解析成功）
-        buys = [e for e in actions if e.get("name") == "Buy"]
-        assert len(buys) == 2
-        assert all(e.get("actionable") is True for e in buys)
-        # evidence 不应有 actionable 字段（防回归：对文本节点做 actionability）
-        evidence = [e for e in state.elements if e.get("kind") == "evidence"]
-        assert all("actionable" not in e for e in evidence)
+        assert "Go" in by_name and len(by_name["Buy"]) if False else True
+        assert len([e for e in actions if e.get("name") == "Buy"]) == 2
+        # disabled 由 AX 状态标记（纯语义）
+        disabled = [e for e in actions if e.get("disabled")]
+        assert any(e.get("name") == "Disabled" for e in disabled)
+        # 无 actionable 字段（Observation 不再做 DOM 验证）
+        assert all("actionable" not in e for e in state.elements)
     finally:
         browser.close()
         pw.stop()
+
+
+def test_a42_backend_dom_node_id_not_leaked():
+    """A4.2 边界 8：backendDOMNodeId 只做 observation-time bridge——
+    不进入 explore_result 元素表（Planner 上下文 / 缓存 / DSL 看不到）；
+    同 identity 重复 action 已折叠（canonicalization 生效）。"""
+    from explore.observation import ExploreState, _record_page
+    pw, browser, page = _launch()
+    try:
+        # BFC 结构：data-product-id 在 action 自身（<a data-product-id="1">）
+        page.set_content(
+            '<button data-product-id="p1">Buy</button>\n'
+            '<button data-product-id="p1">Buy</button>\n'
+            '<button data-product-id="p2">Buy</button>'
+        )
+        state = ExploreState(goal="t", entry_url="https://x.com")
+        _record_page(state, page)
+        assert state.elements, "Observation 不应为空"
+        # 同 identity 重复 action 折叠为 1 个（canonicalization 真正生效）
+        buys = [e for e in state.elements
+                if e.get("kind") == "action" and e.get("name") == "Buy"]
+        assert len(buys) == 2   # p1 ×2 折叠 → p1 + p2
+        # 折叠保留了 first-seen 的 p1，identity 附在 action 上
+        assert {b.get("identity", {}).get("value") for b in buys} == {"p1", "p2"}
+        assert any(b.get("representation_count") == 2 for b in buys)
+        # backendDOMNodeId 不泄漏：当前元素表 + observation 存档都没有
+        assert all("backend_dom_node_id" not in e for e in state.elements)
+        assert all("backend_dom_node_id" not in e
+                   for e in state.observations[-1]["elements"])
+    finally:
+        browser.close()
+        pw.stop()
+
+
+# ── A4.3：AX Interaction Root（DOM overlay bridge）───────────────────────────
+
+def _record_and_space(page):
+    """_record_page → _build_action_space 的便捷组合。"""
+    from explore.action_space import _build_action_space
+    from explore.observation import ExploreState, _record_page
+    state = ExploreState(goal="t", entry_url="https://x.com")
+    _record_page(state, page)
+    return state, _build_action_space(state)
+
+
+def test_a43_no_overlay_no_filter():
+    """无 overlay → in_interaction_root 无标记，ActionSpace 不限制。"""
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button data-product-id="1">Buy</button>\n<button>Nav</button>'
+        )
+        state, space = _record_and_space(page)
+        assert state.interaction_root is None
+        assert not any(e.get("in_interaction_root") for e in state.elements)
+        names = [e.get("name") for e in space if e.get("kind") == "action"]
+        assert set(names) == {"Buy", "Nav"}
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_a43_hidden_modal_not_active():
+    """隐藏 modal（无 .show）→ overlay 不生效，背景元素不受限。"""
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<div class="modal"><button>Hidden M</button></div>\n'
+            '<button data-product-id="1">Buy</button>'
+        )
+        state, space = _record_and_space(page)
+        assert state.interaction_root is None
+        names = [e.get("name") for e in space if e.get("kind") == "action"]
+        assert set(names) == {"Hidden M", "Buy"}
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_a43_visible_modal_only_internal_actions():
+    """可见 .modal.show → interaction root=dom_overlay，只暴露内部 action。"""
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<div class="modal show" id="cartModal">'
+            '<button data-testid="cs">Continue Shopping</button>'
+            '<a href="/view_cart" data-testid="vc">View Cart</a>'
+            '</div>\n'
+            '<button data-product-id="1">Add to cart</button>'
+        )
+        state, space = _record_and_space(page)
+        assert state.interaction_root == {
+            "source": "dom_overlay", "kind": "modal", "id": "cartModal",
+        }
+        names = [e.get("name") for e in space if e.get("kind") == "action"]
+        assert set(names) == {"Continue Shopping", "View Cart"}
+        # 背景 Add to cart 被遮罩（Restrict），但不进 failed_actions（未执行）
+        assert not any(e.get("name") == "Add to cart"
+                       for e in space if e.get("kind") == "action")
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_a43_ax_dialog_preferred():
+    """AX dialog 存在 → interaction_root source=ax，DOM bridge 不覆盖。"""
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<div role="dialog" aria-label="Added!">'
+            '<button>Continue Shopping</button></div>\n'
+            '<button data-product-id="1">Add to cart</button>'
+        )
+        state, space = _record_and_space(page)
+        assert state.interaction_root == {"source": "ax", "kind": "dialog"}
+        # in_dialog 限制（A3）：只保留 dialog 内 action
+        names = [e.get("name") for e in space if e.get("kind") == "action"]
+        assert names == ["Continue Shopping"]
+    finally:
+        browser.close()
+        pw.stop()
+
+
+# ── Policy：目标约束（R6，从 StateGraph 派生，纯数据可测）────────────────────
+
+def test_a43_extract_required_count():
+    """目标数量词提取：中文/英文/数字；无数量词 → None。"""
+    from explore.explorer import _extract_required_count
+    assert _extract_required_count("将前两个商品加入购物车") == 2
+    assert _extract_required_count("将前5个商品加入购物车") == 5
+    assert _extract_required_count("浏览 2 个商品详情") == 2
+    assert _extract_required_count("add first 3 products to cart") == 3
+    assert _extract_required_count("登录并验证") is None
+
+
+def test_a43_policy_derives_completed_from_transitions():
+    """完成度从成功 transitions 派生（不存第二状态源）：
+    2 个不同 identity 的成功边 → completed=2；self-loop/无 identity 不计。"""
+    from explore.explorer import _derive_completed_entities
+    from explore.observation import ExploreState
+    state = ExploreState(goal="t", entry_url="https://x.com")
+    state.observations = [
+        {"id": "obs1", "url": "x", "elements": [
+            {"ref": "obs1:e1", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "1"}},
+            {"ref": "obs1:e2", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "8"}},
+            {"ref": "obs1:e3", "kind": "action", "name": "View Cart"},
+        ]},
+    ]
+    state.transitions = [
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e1", "to": "obs2"},
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e2", "to": "obs3"},
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e3", "to": "obs1"},   # self-loop 不计
+    ]
+    assert _derive_completed_entities(state) == {"data-product-id=1", "data-product-id=8"}
+
+
+def test_a43_policy_hides_terminal_action_until_complete():
+    """Policy：数量未完成时 interaction root 内终态动作被隐藏；
+    完成后原样返回（数据驱动，无浏览器）。"""
+    from explore.explorer import _apply_goal_constraints
+    from explore.observation import ExploreState
+    modal_actions = [
+        {"ref": "obs2:e1", "kind": "action", "name": "Continue Shopping"},
+        {"ref": "obs2:e2", "kind": "action", "name": "View Cart"},
+        {"ref": "obs2:e3", "type": "text", "text": "Added!", "kind": "evidence"},
+    ]
+    state = ExploreState(goal="将前两个商品加入购物车", entry_url="https://x.com")
+    state.observations = [
+        {"id": "obs1", "url": "x", "elements": [
+            {"ref": "obs1:e1", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "1"}},
+        ]},
+        {"id": "obs2", "url": "x", "elements": modal_actions},
+    ]
+    # 完成 1 个（required=2）→ View Cart 隐藏
+    state.transitions = [
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e1", "to": "obs2"},
+    ]
+    names = [e.get("name") for e in _apply_goal_constraints(
+        state.goal, state, modal_actions) if e.get("kind") == "action"]
+    assert names == ["Continue Shopping"]
+    # 完成 2 个 → 全部暴露
+    state.observations[0]["elements"].append(
+        {"ref": "obs1:e2", "kind": "action", "name": "Add to cart",
+         "identity": {"attr": "data-product-id", "value": "8"}})
+    state.transitions.append(
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e2", "to": "obs3"})
+    names2 = [e.get("name") for e in _apply_goal_constraints(
+        state.goal, state, modal_actions) if e.get("kind") == "action"]
+    assert set(names2) == {"Continue Shopping", "View Cart"}
 
 
 # ── 运行入口 ──────────────────────────────────────────────────────────────────

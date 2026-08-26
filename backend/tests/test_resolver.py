@@ -26,9 +26,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from locator.resolver import (   # noqa: E402
-    LowConfidenceError, ParsedTarget, build_locator_candidates,
-    build_locator_exact_first, build_locator_for_count,
-    decorated_name_pattern, is_navigation_name, parse_target, snapshot_match,
+    LocatorAmbiguousError, LowConfidenceError, ParsedTarget,
+    build_locator_candidates, build_locator_exact_first,
+    build_locator_for_count, decorated_name_pattern, is_navigation_name,
+    parse_target, snapshot_match,
 )
 
 # FontAwesome 购物车图标（U+F07A，PUA 区）：用 chr() 构造，避免源码含字面 PUA
@@ -414,6 +415,54 @@ def test_text_candidates_strip_icon_prefix():
         # 原样 0 命中；text_clean 命中 2（歧义由裁决层处理）
         assert candidates[0][1].count() == 0
         assert candidates[1][1].count() == 2
+    finally:
+        browser.close()
+        pw.stop()
+
+
+# ── A4.2：identity_exact 可执行性裁决（normal+overlay 双渲染）─────────────────
+
+def test_a42_identity_2_candidates_1_visible_resolved():
+    """identity_exact 命中 2 个 DOM representation（normal+overlay），
+    恰好 1 个可见 → resolved identity_exact（同一业务实体的重复表示
+    不是真歧义；role 全站多命中不唯一）。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button data-product-id="1">Add to cart</button>\n'
+            '<button data-product-id="2">Add to cart</button>\n'
+            '<button data-product-id="1" style="display:none">Add to cart</button>'
+        )
+        strategy, locator = _resolve_locator(
+            page, {"role": "button", "name": "Add to cart",
+                   "identity": {"attr": "data-product-id", "value": "1"}},
+        )
+        assert strategy == "identity_exact"
+        assert locator.count() == 1
+        assert locator.is_visible()
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_a42_identity_2_visible_ambiguous():
+    """identity_exact 命中 2 个且都可见 → AMBIGUOUS（诚实拒绝，不猜）。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button data-product-id="1">Add to cart</button>\n'
+            '<button data-product-id="1">Add to cart</button>'
+        )
+        try:
+            _resolve_locator(
+                page, {"role": "button", "name": "Add to cart",
+                       "identity": {"attr": "data-product-id", "value": "1"}},
+            )
+        except LocatorAmbiguousError:
+            return
+        raise AssertionError("两个可见 identity 候选未被拒绝")
     finally:
         browser.close()
         pw.stop()

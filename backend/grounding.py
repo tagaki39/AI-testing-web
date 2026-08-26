@@ -57,13 +57,16 @@ class GraphElement(DSLModel):
                  的身份证据——是证据不是豁免，运行时仍过全部闸门；
     scope_has_text = I1：容器文本锚点（observation 内同名元素的消歧证据，
                    Compiler 发现同名重复时附加为 scope）。
-    两个新字段可选——旧探索缓存缺字段时取默认值（向后兼容）。
+    identity = A4.2：稳定业务 identity（{attr, value}，如 data-product-id）——
+                   Compiler 确定性编译进 Locator（执行消歧），LLM 不生成。
+    新字段可选——旧探索缓存缺字段时取默认值（向后兼容）。
     """
     ref: str
     role: str | None = None
     name: str | None = None
     text: str | None = None
     verified: bool = False
+    identity: dict | None = None
     scope_has_text: str | None = None
 
 
@@ -113,6 +116,7 @@ class StateGraph(DSLModel):
                         name=e.get("name"), text=e.get("text"),
                         verified=e.get("verified", False),
                         scope_has_text=e.get("scope_has_text"),
+                        identity=e.get("identity"),   # A4.2：稳定业务 identity
                     )
                     for e in o.get("elements", [])
                 ],

@@ -185,6 +185,173 @@ def find_semantic_context(node: AXNode, by_id: dict[str, AXNode]) -> tuple[str |
 
 _MAX_EVIDENCE_ELEMENTS = 20   # evidence 限量（防元素表膨胀 → 评估 O(N) 爆炸）
 
+# ── A4.2 Stable Action Identity ──────────────────────────────────────────────
+# 诊断定案：AutomationExercise 12 个 Add to cart = 6 商品 × 2 DOM 表现
+#（normal + overlay）——data-product-id 在 action 自身。旧 scope_has_text
+#（容器文本）模型过时——改为结构化 stable identity + duplicate canonicalization。
+# backendDOMNodeId 仅 observation-time bridge，绝不进入 DSL/缓存长期事实。
+
+_IDENTITY_ATTRS = ("data-testid", "data-test", "data-qa", "data-cy")
+
+
+def extract_stable_identity(attrs: dict) -> dict | None:
+    """从 DOM attributes 提取稳定 identity（通用规则，无站点特判）：
+    优先 data-testid/test/qa/cy，其次 data-*-id。"""
+    for attr in _IDENTITY_ATTRS:
+        if attrs.get(attr):
+            return {"attr": attr, "value": attrs[attr]}
+    for attr, value in attrs.items():
+        if attr.startswith("data-") and attr.endswith("-id") and value:
+            return {"attr": attr, "value": value}
+    return None
+
+
+def _dom_identity_via_backend(page, backend_dom_node_id) -> dict | None:
+    """backendDOMNodeId → 当前页面精确 DOM node → 稳定 identity。
+    仅 observation-time bridge；结果只保存 identity（attr/value）。"""
+    if not backend_dom_node_id:
+        return None
+    try:
+        session = page.context.new_cdp_session(page)
+        resolved = session.send("DOM.resolveNode",
+                                {"backendNodeId": backend_dom_node_id})
+        obj = resolved.get("object") or {}
+        if not obj.get("objectId"):
+            return None
+        attrs = session.send("Runtime.callFunctionOn", {
+            "objectId": obj["objectId"],
+            "functionDeclaration": """function() {
+                const attrs = {};
+                for (const a of this.attributes) attrs[a.name] = a.value;
+                return attrs;
+            }""",
+            "returnByValue": True,
+        })
+        raw = (attrs.get("result") or {}).get("value") or {}
+        return extract_stable_identity(raw)
+    except Exception:
+        return None
+
+
+def _detect_dom_overlay(page, elements: list[dict]) -> tuple[set[str], dict | None]:
+    """A4.3：DOM interaction-root bridge（AX 缺 dialog 语义时的最小兼容）。
+
+    AutomationExercise 的 Bootstrap modal 零 ARIA（无 role=dialog /
+    aria-modal），Raw AX 无 dialog 容器 → A3 的 context_role 限制失效，
+    背景 Add to cart 继续暴露给 LLM（8 连 ACTION_FAILED 浪费探索预算）。
+    通用判定（非站点特判，事实标准选择器 + 可见性过滤）：
+    可见的交互覆盖层（.modal.show / dialog[open] / [role=dialog][aria-modal]）。
+
+    返回 (overlay 内 action ref 集合, overlay 描述 dict)；
+    无 overlay → (set(), None)。描述只进 observation metadata——
+    不冒充 AX 语义（不写 context_role="dialog"）。
+
+    性能：一次 evaluate 判 overlay 存在性（无 → 零成本）；
+    存在时逐 action resolveNode（毫秒级 CDP 轻调用，无等待）×
+    一次批量 contains 判定（多 objectId 单次 callFunctionOn）。
+    """
+    actions = [e for e in elements
+               if e.get("kind") == "action" and e.get("backend_dom_node_id")]
+    if not actions:
+        return set(), None
+    try:
+        session = page.context.new_cdp_session(page)
+        # 1. 可见 overlay（返回 objectId + 描述；null → 无 overlay）
+        ov = session.send("Runtime.evaluate", {
+            "expression": """(() => {
+                const ov = document.querySelector(
+                    '.modal.show, dialog[open], [role="dialog"][aria-modal="true"], [aria-modal="true"]');
+                if (!ov) return null;
+                const r = ov.getBoundingClientRect();
+                if (!(r.width > 0 && r.height > 0)) return null;
+                return { id: ov.id || null, cls: ov.className || null };
+            })()""",
+            "returnByValue": True,
+        })
+        ov_desc = (ov.get("result") or {}).get("value")
+        if not ov_desc:
+            return set(), None
+        # 再拿 overlay 的 objectId（归属判定用）
+        ov2 = session.send("Runtime.evaluate", {
+            "expression": """(() => {
+                const ov = document.querySelector(
+                    '.modal.show, dialog[open], [role="dialog"][aria-modal="true"], [aria-modal="true"]');
+                if (!ov) return null;
+                const r = ov.getBoundingClientRect();
+                return (r.width > 0 && r.height > 0) ? ov : null;
+            })()""",
+        })
+        ov_obj = (ov2.get("result") or {}).get("objectId")
+        if not ov_obj:
+            return set(), None
+        # 2. backendDOMNodeId → objectId（observation-time bridge 的最后用途）
+        object_ids: list[str] = []
+        for e in actions:
+            try:
+                r = session.send("DOM.resolveNode",
+                                 {"backendNodeId": e["backend_dom_node_id"]})
+                obj = r.get("object") or {}
+                if obj.get("objectId"):
+                    object_ids.append(obj["objectId"])
+            except Exception:
+                pass
+        if not object_ids:
+            return set(), None
+        # 3. 一次批量判定 overlay 归属（this = overlay 容器）
+        verdict = session.send("Runtime.callFunctionOn", {
+            "objectId": ov_obj,
+            "functionDeclaration":
+                "function(...els) { return els.map(el => this.contains(el)); }",
+            "arguments": [{"objectId": o} for o in object_ids],
+            "returnByValue": True,
+        })
+        raw = (verdict.get("result") or {}).get("value") or []
+        refs = {e["ref"] for e, inside in zip(actions, raw) if inside}
+        desc = {"source": "dom_overlay", "kind": "modal",
+                "id": ov_desc.get("id") or None}
+        return refs, desc if refs else None
+    except Exception:
+        return set(), None
+
+
+def canonicalize_actions(elements: list[dict],
+                         identity_map: dict[str, dict]) -> list[dict]:
+    """A4.2：同一 (role, name, identity) 的重复 action 折叠为一个业务动作。
+
+    规则：
+      - 只折叠「有 stable identity 且相同」的重复（无 identity 绝不猜着合）
+      - 保留 first-seen 顺序（文档/业务顺序，不排序）
+      - 折叠后记录 representation_count（调试/诊断）
+    """
+    seen: set = set()
+    counts: dict[tuple, int] = {}
+    for e in elements:
+        ident = identity_map.get(e["ref"])
+        if e.get("kind") == "action" and ident:
+            k = (e.get("role"), (e.get("name") or "").strip(),
+                 ident["attr"], ident["value"])
+            counts[k] = counts.get(k, 0) + 1
+    out: list[dict] = []
+    for e in elements:
+        ident = identity_map.get(e["ref"])
+        key = None
+        if e.get("kind") == "action" and ident:
+            key = (e.get("role"), (e.get("name") or "").strip(),
+                   ident["attr"], ident["value"])
+            if key in seen:
+                continue   # canonical duplicate
+            seen.add(key)
+        out.append(e)
+    for e in out:
+        ident = identity_map.get(e["ref"])
+        if e.get("kind") == "action" and ident:
+            k = (e.get("role"), (e.get("name") or "").strip(),
+                 ident["attr"], ident["value"])
+            e["identity"] = ident
+            if counts.get(k, 1) > 1:
+                e["representation_count"] = counts[k]
+    return out
+
 
 def build_observation_elements(ax_nodes: list[AXNode]) -> list[ObservationElement]:
     """AX 树 → 结构化元素列表（扁平 ref 序列 + 层级/kind/语义上下文）。
@@ -239,8 +406,10 @@ _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
 _MAX_TEXT_ELEMENTS = 20      # 文本节点最多注入 20 个（防上下文膨胀）
 _MAX_TEXT_LINES = 25         # 智能裁剪：text 行限量
 _MAX_OTHER_LINES = 40        # 智能裁剪：非交互语义行（heading/banner 等容器）限量
-_MAX_OBSERVATIONS = 12       # 总 observation 上限（防膨胀）
-_MAX_OBSERVATIONS_PER_URL = 5   # 同 URL 最多 5 个状态（登录表单 fill 的
+_MAX_OBSERVATIONS = 12       # 总 observation 上限（防膨胀）。
+# R6：per-URL cap 已删除——URL ≠ State（BFC 加购循环同 URL 有列表↔modal
+# 多个合法状态），且已有 MAX_STEPS/MAX_LLM_CALLS/MAX_EXPLORE_SECONDS/
+# 总上限四重保险，per-URL 是第五重且会误杀正常业务。
 # 可交互元素角色（element ref 表只收录这些——LLM 只能操作这些）
 _INTERACTIVE_ROLES = {
     "button", "link", "textbox", "checkbox", "radio", "combobox",
@@ -294,6 +463,10 @@ class ExploreState:
     step_count: int = 0                # 已执行动作数
     llm_calls: int = 0                 # 已用 LLM 调用数
     done: bool = False                 # 探索是否完成
+    # A4.3：当前 observation 的 interaction root 描述（AX dialog 时
+    # source="ax"；DOM overlay bridge 时 source="dom_overlay"）。只进
+    # observation metadata，不冒充 AX 语义。
+    interaction_root: dict | None = None
     # 计时（Speed v1：定位耗时构成，决定下一刀砍哪）
     # R3 细分：observe（aria 抓取+解析） / action_space（评估过滤） /
     # settle（稳定轮询） / llm / browser_action / fixed_wait
@@ -411,8 +584,12 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     # 却是 text——"aria 表 + CDP 打补丁"的匹配投影会丢 actionable ancestor）：
     # CDP AX Tree 是 ObservationElement 的唯一事实源；aria_snapshot 仅
     # provider fallback（One source of truth）。
+    t_obs = perf_counter()
+    print(f"[OBS] START", flush=True)
     try:
         ax_nodes = CDPAccessibilityProvider().capture(page)
+        print(f"[OBS] AX_CAPTURE {(perf_counter() - t_obs) * 1000:.0f}ms raw={len(ax_nodes)}",
+              flush=True)
         structured = build_observation_elements(ax_nodes) if ax_nodes else []
         if structured:
             elements = [
@@ -429,10 +606,18 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
                 }
                 for e in structured
             ]
+            _actions = sum(1 for e in structured if e.kind == "action")
+            _evs = sum(1 for e in structured if e.kind == "evidence")
+            _cons = sum(1 for e in structured if e.kind == "container")
+            print(f"[OBS] PROJECT {(perf_counter() - t_obs) * 1000:.0f}ms "
+                  f"total={len(elements)} actions={_actions} "
+                  f"containers={_cons} evidence={_evs}", flush=True)
         else:
             elements = _parse_elements(snapshot)   # CDP 不可用 → aria legacy
+            print("[OBS] PROJECT aria_fallback", flush=True)
     except Exception:
         elements = _parse_elements(snapshot)   # CDP 不可用 → aria legacy
+        print("[OBS] PROJECT aria_fallback(exc)", flush=True)
 
     # 状态哈希：A4 优先用语义状态签名（action/container 的 role/name/状态/
     # 语义父级排序 hash）——相同业务状态匹配回原 obs，减少 phantom states
@@ -454,15 +639,15 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
         state.current_obs = matched["id"]   # R3：current_obs 唯一事实源
         return matched["id"]   # E1：transition 的 to 用实际所在状态
 
-    same_url_count = sum(1 for o in state.observations if o["url"] == url)
-    if (len(state.observations) >= _MAX_OBSERVATIONS
-            or same_url_count >= _MAX_OBSERVATIONS_PER_URL):
-        # 观察预算满：不给当前状态一个"裸元素表"（无 state owner）。
+    if len(state.observations) >= _MAX_OBSERVATIONS:
+        # 观察预算满（R6：仅总上限——URL ≠ State，同 URL 多状态是
+        # 合法业务（列表↔modal 循环），per-URL cap 会误杀）。
+        # 不给当前状态一个"裸元素表"（无 state owner）。
         # 停止探索（主循环检测 done），比带着无主元素继续决策安全。
         state.history.append({
             "url": url,
             "action": "observation_cap",
-            "error": "观察预算已满（total/per-url 上限），停止探索",
+            "error": "观察预算已满（total 上限），停止探索",
         })
         state.done = True
         return None
@@ -483,33 +668,85 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
         e for e in elements
         if e.get("kind") == "action" and not e.get("context_role")
     ]
+    print(f"[OBS] LEGACY_SCOPE candidates={len(legacy_candidates)} "
+          f"{(perf_counter() - t_obs) * 1000:.0f}ms", flush=True)
     if legacy_candidates:
         _attach_legacy_dom_scope(page, legacy_candidates)
+    print(f"[OBS] LEGACY_SCOPE_DONE {(perf_counter() - t_obs) * 1000:.0f}ms",
+          flush=True)
 
-    # R3：观察期可操作性评估（Page Explorer 输出 actionable 标记——
-    # 参考项目 page_explorer 的 verified 标记模式）。模态框打开时
-    # 被遮挡的 Add to cart 标记 actionable=False → ActionSpace 直接
-    # 过滤，模型看不到它（Restrict, don't repair）。
-    # 性能边界（评审）：这层是 cheap/synchronous/best-effort——
-    # 只做 elementFromPoint 毫秒级判断，绝不 trial（全量 trial 会
-    # 被遮挡元素拖到秒级）。允许 false positive（执行失败再删 candidate）。
-    t_as = perf_counter()
-    # 惰性导入（R3.1 修复）：action_space 依赖本模块的 ExploreState
-    #（类型注解），模块级导入会成环。拆分时漏掉的 import 导致 NameError
-    # 被 except 静默吞掉——全部元素被误标 actionable=False，
-    # ActionSpace 过滤所有 role 元素 → 探索残废（实测 actionable=True: 0）。
-    from .action_space import _locator_for_element, validate_actionability
-    for e in state.elements:
-        # A4.1 责任边界（性能根因）：只有 kind=action 才做 actionability
-        # 评估——evidence/container 不评估、不设 actionable 字段
-        #（否则 CDP 结构化后的全量元素 × 协议往返 = 秒级爆炸）。
-        if e.get("kind") == "action":
-            try:
-                _, _, loc = _locator_for_element(page, e)
-                e["actionable"], _ = validate_actionability(page, loc, "click")
-            except Exception:
-                e["actionable"] = False
-    state.timings["action_space_ms"] += int((perf_counter() - t_as) * 1000)
+    # A4.2：只对「role+name 重复且 AX context 仍不能消歧」的 action
+    # 做 identity enrichment（backendDOMNodeId bridge）→ canonicalize。
+    t_id = perf_counter()
+    counts: dict[tuple, int] = {}
+    for e in elements:
+        if e.get("kind") == "action" and e.get("name") and not e.get("context_role"):
+            k = (e.get("role"), (e.get("name") or "").strip())
+            counts[k] = counts.get(k, 0) + 1
+    identity_map: dict[str, dict] = {}
+    for e in elements:
+        if e.get("kind") == "action" and e.get("name") and not e.get("context_role"):
+            k = (e.get("role"), (e.get("name") or "").strip())
+            if counts.get(k, 0) <= 1:
+                continue   # 唯一 action 不需要 identity（非重复）
+            ident = _dom_identity_via_backend(page, e.get("backend_dom_node_id"))
+            if ident:
+                identity_map[e["ref"]] = ident
+    enriched = len(identity_map)
+    canonical_dropped = 0
+    if identity_map:
+        pre_count = len(elements)
+        elements = canonicalize_actions(elements, identity_map)
+        canonical_dropped = pre_count - len(elements)
+        state.elements = elements   # 折叠后的元素表接管（same dict 引用，
+                                    # refs/identity 已在原 dict 上生效）
+        print(f"[OBS] IDENTITY enriched={enriched} "
+              f"canonical_dropped={canonical_dropped} "
+              f"{(perf_counter() - t_obs) * 1000:.0f}ms", flush=True)
+    # A4.2 metrics（累计——多次观测的聚合值，验收读"全程"而非最后一次）
+    state.timings["identity_enrich_ms"] = \
+        state.timings.get("identity_enrich_ms", 0) + int((perf_counter() - t_id) * 1000)
+    state.timings["identity_nodes_enriched"] = \
+        state.timings.get("identity_nodes_enriched", 0) + enriched
+    state.timings["canonical_duplicates_removed"] = \
+        state.timings.get("canonical_duplicates_removed", 0) + canonical_dropped
+
+    # A4.3：DOM interaction-root bridge（AX 缺 dialog 语义时的最小兼容）。
+    # 有 AX dialog（context_role）→ 走纯 AX（ActionSpace 的 in_dialog）；
+    # 无 → 查可见 overlay（Bootstrap .modal.show 等事实标准），overlay 内
+    # 的 action 标记 in_interaction_root——ActionSpace 只暴露它们（Restrict）。
+    # 标记语义：interaction_root 是 observation metadata（source=ax 或
+    # dom_overlay），action 上只标 in_interaction_root（不写 AX 字段）。
+    state.interaction_root = None
+    if any(e.get("context_role") == "dialog" for e in elements):
+        state.interaction_root = {"source": "ax", "kind": "dialog"}
+    else:
+        t_ov = perf_counter()
+        overlay_refs, ov_desc = _detect_dom_overlay(page, elements)
+        if overlay_refs:
+            for e in elements:
+                if e["ref"] in overlay_refs:
+                    e["in_interaction_root"] = True
+            state.interaction_root = ov_desc
+            print(f"[OBS] INTERACTION_ROOT source={ov_desc['source']} "
+                  f"overlay_actions={len(overlay_refs)} "
+                  f"{(perf_counter() - t_ov) * 1000:.0f}ms", flush=True)
+
+    # A4.2（性能根因）：删除 Observation 全量 DOM actionability 验证——
+    # 首页 1927 AX 节点 → 135 个 action × elementFromPoint 协议往返
+    # → socket 压垮卡死。AX kind/disabled/tree 已足够决定 ActionSpace
+    #（纯内存过滤）；"是否真能点"由选中后的 Playwright 实际执行权威
+    # 回答（失败 → failed_actions → 本状态删 ref）。
+    # actionable 字段退出 Observation（Observation = cheap + semantic，
+    # Execution = strict + authoritative）。
+    # A4.2 边界 8：backendDOMNodeId 只做 observation-time bridge——
+    # identity 提取（_dom_identity_via_backend）完成后从元素表移除，
+    # 绝不进入 explore_result / 缓存 / Planner 上下文 / DSL。
+    for e in elements:
+        e.pop("backend_dom_node_id", None)
+    print(f"[OBS] ACTIONABILITY_SKIPPED {(perf_counter() - t_obs) * 1000:.0f}ms",
+          flush=True)
+    print(f"[OBS] DONE {(perf_counter() - t_obs) * 1000:.0f}ms", flush=True)
 
     state.observations.append({
         "id": obs_id,
@@ -518,6 +755,7 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
         "state_hash": state_hash,
         "snapshot": state.snapshot,
         "elements": state.elements,   # G1：observations 携带 state-scoped refs
+        "interaction_root": state.interaction_root,   # A4.3：AX dialog / DOM overlay
     })
 
     # invariant：state.elements 的每个 ref 都必须有明确 state identity
@@ -588,18 +826,33 @@ def _attach_legacy_dom_scope(page, candidates: list[dict]) -> None:
                 continue   # 空 locator 防御（防 inner_text 等满超时）
             try:
                 node = base.nth(i)
+                # A4.2（微诊断定案）：identity 可能在 action 自身
+                #（<a data-product-id="1">Add to cart</a>）——必须
+                # ancestor-or-self，否则 container=0 → scope 全丢 →
+                # 执行时 12 个 Add to cart 歧义。
                 container = node.locator(
-                    "xpath=ancestor::*[self::li or self::article or @data-testid"
-                    " or @data-product-id or @data-item-id][1]"
+                    "xpath=ancestor-or-self::*[self::li or self::article "
+                    " or @data-testid or @data-product-id or @data-item-id][1]"
                 )
                 if container.count() == 0:
-                    continue   # 无明确业务容器 → 不猜
+                    continue   # 无明确业务容器 → 不猜（Restrict）
                 raw = container.inner_text(timeout=300).strip()
                 node_text = node.inner_text(timeout=300).strip()
                 anchor = _pick_anchor_text(
                     [ln.strip() for ln in raw.splitlines() if ln.strip()],
                     node_text,
                 )
+                if anchor is None:
+                    # 容器是 self（identity 在 action 自身），inner_text
+                    # 只有按钮文本（商品名在父容器 productinfo）——
+                    # 向上取父级文本提取锚点（仍非猜测：父容器是明确业务卡）。
+                    parent = node.locator("xpath=..")
+                    if parent.count():
+                        raw2 = parent.inner_text(timeout=300).strip()
+                        anchor = _pick_anchor_text(
+                            [ln.strip() for ln in raw2.splitlines() if ln.strip()],
+                            node_text,
+                        )
             except Exception:
                 continue
             if anchor:

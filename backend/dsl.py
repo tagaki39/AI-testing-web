@@ -60,6 +60,9 @@ class Locator(DSLModel):
     test_id: str | None = None   # data-testid 属性值
     text: str | None = None      # 可见文本
     css: str | None = None       # CSS 选择器
+    identity: dict | None = None  # A4.2：稳定业务 identity（{attr, value}）——
+                                   # 如 {"attr": "data-product-id", "value": "1"}。
+                                   # 由 Compiler 从观察元素确定性编译，LLM 不生成。
 
     @model_validator(mode="after")
     def _require_one_field(self) -> "Locator":

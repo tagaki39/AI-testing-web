@@ -120,7 +120,7 @@ def _decide_state() -> ExploreState:
 
 def test_c_unknown_runtime_key_rejected() -> None:
     """${username} 不在白名单（{email, password}）→ 决策拒绝。"""
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "fill", "target_ref": "obs2:e10", "value": "${username}"}'
     decision, err = _decide(_decide_state(), llm)
     assert decision is None, "未知 key 必须被拒"
@@ -129,7 +129,7 @@ def test_c_unknown_runtime_key_rejected() -> None:
 
 def test_d_literal_value_rejected() -> None:
     """真实值（test123@example.com）→ 决策拒绝（模型不得输出真实值）。"""
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return ('{"action": "fill", "target_ref": "obs2:e10", '
                 '"value": "test123@example.com"}')
     decision, err = _decide(_decide_state(), llm)
@@ -139,7 +139,7 @@ def test_d_literal_value_rejected() -> None:
 
 def test_c2_known_key_passes() -> None:
     """${email} 在白名单 → 决策通过（对照：校验不放跑真占位符）。"""
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "fill", "target_ref": "obs2:e10", "value": "${email}"}'
     decision, err = _decide(_decide_state(), llm)
     assert decision is not None, f"合法占位符被误拒: {err}"
@@ -174,7 +174,7 @@ def test_h3_text_click_rejected_in_decide() -> None:
         "id": "obs1", "url": "https://x.com", "state_hash": "h",
         "elements": state.elements,
     }]
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs1:e1"}'
     decision, err = _decide(state, llm)
     assert decision is None, "click text 必须被拒"
@@ -189,7 +189,7 @@ def test_h4_button_click_passes() -> None:
         "id": "obs1", "url": "https://x.com", "state_hash": "h",
         "elements": state.elements,
     }]
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs1:e2"}'
     decision, err = _decide(state, llm)
     assert decision is not None, f"合法点击被误拒: {err}"
@@ -282,7 +282,7 @@ def test_i5_blacklisted_ref_rejected_by_validator() -> None:
     }]
     state.failed_actions.add(("obs4", "click", "obs4:e25"))
     state.current_obs = "obs4"
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs4:e25"}'
     decision, err = _decide(state, llm, elements=[
         e for e in state.elements if (state.current_obs, "click", e["ref"])
@@ -409,7 +409,7 @@ def test_f_self_loop_same_action_rejected() -> None:
     state.transitions.append({
         "from": "obs2", "action": "click", "target_ref": "obs2:e12", "to": "obs2",
     })
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs2:e12"}'
     decision, err = _decide(state, llm)
     assert decision is None, "self-loop 重复必须被拒"
@@ -423,7 +423,7 @@ def test_f2_self_loop_different_action_passes() -> None:
         "from": "obs2", "action": "click", "target_ref": "obs2:e12", "to": "obs2",
     })
     state.elements.append({"ref": "obs2:e10", "role": "textbox", "name": "Email"})
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "fill", "target_ref": "obs2:e10", "value": "${email}"}'
     decision, err = _decide(state, llm)
     assert decision is not None, f"换动作被误拒: {err}"
@@ -435,7 +435,7 @@ def test_f3_progress_transition_not_rejected() -> None:
     state.transitions.append({
         "from": "obs2", "action": "click", "target_ref": "obs2:e12", "to": "obs3",
     })
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs2:e12"}'
     decision, err = _decide(state, llm)
     assert decision is not None, f"有进展的重复被误拒: {err}"
@@ -455,10 +455,10 @@ def test_g2_auth_failure_false_positive_avoided() -> None:
     assert not _detect_auth_failure("")
 
 def test_e_observation_cap_stops_exploration() -> None:
-    """per-url cap=5：第 6 个不同状态 → done=True + 记录原因，
-    不再继续带无主元素决策。"""
+    """R6：只保留 total cap（12）——同 URL 多状态是合法业务（列表↔modal
+    循环），per-URL cap 已删。第 13 个状态 → done=True + 记录原因。"""
     state = ExploreState(goal="login", entry_url="https://x.com")
-    for i in range(6):
+    for i in range(13):
         _record_page(state, _MockPage("https://x.com", f'- button "B{i}"\n'))
     assert state.done, "观察预算满必须停止探索"
     assert any(h.get("action") == "observation_cap" for h in state.history)

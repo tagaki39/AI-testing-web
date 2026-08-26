@@ -52,11 +52,16 @@ def _build_action_space(state: ExploreState) -> list[dict]:
         return list(state.elements)
     obs_id = state.current_obs
     # A3：active dialog → interaction root = dialog subtree（CDP 结构化
-    # context 附加；检测不到时回落到旧行为——elementFromPoint 兜底）
+    # context 附加；检测不到时回落到旧行为）
     in_dialog = any(
         e.get("context_role") == "dialog"
         for e in state.elements if "role" in e
     )
+    # A4.3：DOM overlay interaction root（AX 缺 dialog 语义时的兼容
+    # bridge）——overlay 内 action 有 in_interaction_root 标记 → 只暴露它们。
+    overlay_refs = {e["ref"] for e in state.elements if e.get("in_interaction_root")}
+    # A4.2：纯内存过滤（无 DOM roundtrip）——kind/disabled/树关系
+    # 决定 ActionSpace；"是否真能点"由选中后的执行权威回答。
     usable: list[dict] = []
     for e in state.elements:
         if (obs_id, "click", e["ref"]) in state.failed_actions:
@@ -64,14 +69,16 @@ def _build_action_space(state: ExploreState) -> list[dict]:
         if "role" not in e:
             usable.append(e)   # 文本元素保留（wait_for/定位参考用）
             continue
+        if e.get("kind") == "action" and e.get("disabled"):
+            continue   # AX disabled 状态（纯语义，无 DOM 查询）
         # dialog 限制只针对 action（evidence/文本保留——断言用）
         if in_dialog and e.get("kind") == "action" \
                 and e.get("context_role") != "dialog":
             continue   # dialog 打开时，dialog 外 action 被遮罩（Restrict）
-        # 观察期已评估的 actionable 标记（R3：不预测，用 Page Explorer 输出）；
-        # 无标记的元素保守剔除（防御：观察期评估失败 = 不可操作）
-        if e.get("actionable"):
-            usable.append(e)
+        if overlay_refs and e.get("kind") == "action" \
+                and e["ref"] not in overlay_refs:
+            continue   # A4.3：overlay 打开时，overlay 外 action 被遮罩
+        usable.append(e)
     return usable
 
 

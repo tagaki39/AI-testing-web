@@ -43,7 +43,10 @@ def _element_to_locator(element) -> Locator:
     文本节点（text）       → 文本定位（无语义元素的兜底）
     """
     if element.role:
-        return Locator(role=element.role, name=element.name)
+        # A4.2：稳定 identity（data-product-id 等）确定性编译进 Locator——
+        # 由观察元素携带（GraphElement.identity），LLM 不生成。
+        identity = getattr(element, "identity", None)
+        return Locator(role=element.role, name=element.name, identity=identity)
     return Locator(text=element.text)
 
 

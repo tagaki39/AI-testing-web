@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from explore.observation import (   # noqa: E402
     AXNode, CDPAccessibilityProvider, build_observation_elements,
+    canonicalize_actions, extract_stable_identity,
     normalize_cdp_ax_node, semantic_state_signature,
 )
 
@@ -173,6 +174,72 @@ def test_a4_no_role_elements_none():
     """无 role 元素（纯文本页）→ None（回落全文 hash）。"""
     assert semantic_state_signature([{"ref": "e1", "type": "text", "text": "hello"}]) is None
     assert semantic_state_signature([]) is None
+
+
+# ── A4.2：Stable Action Identity（canonicalization 单元）─────────────────────
+
+def _action(ref, name="Add to cart", role="button"):
+    return {"ref": ref, "role": role, "name": name, "kind": "action"}
+
+
+def test_a42_extract_stable_identity():
+    """identity 提取：data-testid/test/qa/cy 优先；data-*-id 兜底；无 → None。"""
+    assert extract_stable_identity(
+        {"data-testid": "add-1", "data-product-id": "9"}
+    ) == {"attr": "data-testid", "value": "add-1"}
+    assert extract_stable_identity({"data-product-id": "1"}) \
+        == {"attr": "data-product-id", "value": "1"}
+    assert extract_stable_identity({"data-price": "29.99"}) is None
+    assert extract_stable_identity({}) is None
+
+
+def test_a42_duplicate_same_identity_collapse():
+    """同一 (role, name, identity) 的重复 action → 折叠为一个
+    （BFC：Add × 12 → canonical × 6 的折叠规则）。"""
+    elements = [_action("e1"), _action("e2"), _action("e3")]
+    identity_map = {e["ref"]: {"attr": "data-product-id", "value": "1"}
+                    for e in elements}
+    out = canonicalize_actions(elements, identity_map)
+    assert len(out) == 1
+    assert out[0]["ref"] == "e1"   # first-seen
+    assert out[0]["identity"] == {"attr": "data-product-id", "value": "1"}
+    assert out[0]["representation_count"] == 3
+
+
+def test_a42_different_identity_kept():
+    """同 role/name、不同 identity（6 个商品的同按钮名）→ 全部保留（不猜着合）。"""
+    elements = [_action(f"e{i}") for i in range(1, 7)]
+    identity_map = {e["ref"]: {"attr": "data-product-id", "value": str(i)}
+                    for i, e in enumerate(elements, start=1)}
+    out = canonicalize_actions(elements, identity_map)
+    assert len(out) == 6
+    assert all(e.get("representation_count") is None for e in out)
+    assert all(e["identity"] == {"attr": "data-product-id", "value": e["ref"][1:]}
+               for e in out)
+
+
+def test_a42_no_identity_no_collapse():
+    """无 stable identity → 绝不猜着合（原样保留，运行时诚实拒绝）。"""
+    elements = [_action("e1"), _action("e2")]
+    out = canonicalize_actions(elements, {})
+    assert len(out) == 2
+    assert all("identity" not in e for e in out)
+
+
+def test_a42_first_seen_order_preserved():
+    """折叠保留 first-seen 顺序（文档/业务序，不排序）：A, A', B → A, B。"""
+    elements = [
+        _action("e1"), _action("e2"),
+        {"ref": "e3", "role": "link", "name": "Remove", "kind": "action"},
+        _action("e4"),
+    ]
+    identity_map = {
+        "e1": {"attr": "data-product-id", "value": "1"},
+        "e2": {"attr": "data-product-id", "value": "1"},
+        "e4": {"attr": "data-product-id", "value": "8"},
+    }
+    out = canonicalize_actions(elements, identity_map)
+    assert [e["ref"] for e in out] == ["e1", "e3", "e4"]
 
 
 # ── 真实 CDP 冒烟（Chromium 不可用时 SKIP）───────────────────────────────────
