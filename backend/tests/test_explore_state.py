@@ -40,6 +40,7 @@ from explore import (   # noqa: E402
     _is_repeated_no_progress, _record_page, _validate_action_target,
     _validate_completion, validate_actionability,
 )
+from explore.action_space import _build_action_space   # noqa: E402
 
 
 # ── page mock（_record_page 只依赖 url / title / locator("body").aria_snapshot）──
@@ -342,6 +343,49 @@ def test_k2_no_false_positive() -> None:
     assert not _detect_error_page("welcome to the page, content loaded")
     assert not _detect_error_page("")
     assert not _detect_error_page("价格 500 元，库存充足")
+
+
+# ── L：A3 ActionSpace dialog restriction（模态框场景验收核心）─────────────────
+
+def test_a3_dialog_limits_action_space() -> None:
+    """dialog 打开时，ActionSpace 只含 dialog 内 action（View Cart /
+    Continue Shopping），dialog 外 Add to cart 不暴露。"""
+    state = ExploreState(goal="buy", entry_url="https://x.com")
+    state.elements = [
+        {"ref": "obs4:e35", "role": "link", "name": "View Cart",
+         "actionable": True, "context_role": "dialog", "context_name": "Added!"},
+        {"ref": "obs4:e36", "role": "button", "name": "Continue Shopping",
+         "actionable": True, "context_role": "dialog", "context_name": "Added!"},
+        {"ref": "obs4:e25", "role": "link", "name": "Add to cart",
+         "actionable": True},   # dialog 外（无 context）
+        {"ref": "obs4:e30", "type": "text", "text": "Blue Top"},
+    ]
+    state.observations = [{
+        "id": "obs4", "url": "https://x.com", "state_hash": "h",
+        "elements": state.elements,
+    }]
+    state.current_obs = "obs4"
+    space = _build_action_space(state)
+    refs = [e["ref"] for e in space]
+    assert "obs4:e35" in refs and "obs4:e36" in refs   # dialog 内 action
+    assert "obs4:e25" not in refs                       # dialog 外被排除
+    assert "obs4:e30" in refs                           # 文本 evidence 保留
+
+
+def test_a3_no_dialog_no_restriction() -> None:
+    """无 dialog 上下文 → 全部 actionable 元素正常暴露。"""
+    state = ExploreState(goal="buy", entry_url="https://x.com")
+    state.elements = [
+        {"ref": "obs2:e10", "role": "link", "name": "Add to cart", "actionable": True},
+        {"ref": "obs2:e4", "role": "link", "name": "Cart", "actionable": True},
+    ]
+    state.observations = [{
+        "id": "obs2", "url": "https://x.com", "state_hash": "h",
+        "elements": state.elements,
+    }]
+    state.current_obs = "obs2"
+    space = _build_action_space(state)
+    assert len(space) == 2
 
 
 # ── F/G：no-progress guard + auth failure（Transition/Progress Validation）────

@@ -51,6 +51,12 @@ def _build_action_space(state: ExploreState) -> list[dict]:
     if not state.current_obs:
         return list(state.elements)
     obs_id = state.current_obs
+    # A3：active dialog → interaction root = dialog subtree（CDP 结构化
+    # context 附加；检测不到时回落到旧行为——elementFromPoint 兜底）
+    in_dialog = any(
+        e.get("context_role") == "dialog"
+        for e in state.elements if "role" in e
+    )
     usable: list[dict] = []
     for e in state.elements:
         if (obs_id, "click", e["ref"]) in state.failed_actions:
@@ -58,6 +64,8 @@ def _build_action_space(state: ExploreState) -> list[dict]:
         if "role" not in e:
             usable.append(e)   # 文本元素保留（wait_for/定位参考用）
             continue
+        if in_dialog and e.get("context_role") != "dialog":
+            continue   # dialog 打开时，dialog 外元素被遮罩（Restrict）
         # 观察期已评估的 actionable 标记（R3：不预测，用 Page Explorer 输出）；
         # 无标记的元素保守剔除（防御：观察期评估失败 = 不可操作）
         if e.get("actionable"):
