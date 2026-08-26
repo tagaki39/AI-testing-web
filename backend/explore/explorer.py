@@ -780,16 +780,6 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             if state.interaction_root:
                 action_space = _apply_modal_constraints(
                     state.goal, state, action_space)
-            # P0 诊断：每次决策打点（卡在 LLM vs 浏览器一目了然）
-            # A4.3：interaction root source（ax dialog / dom_overlay）；
-            # 可点 action 与 evidence 分开计数（evidence 不是 selectable）
-            iroot = (state.interaction_root or {}).get("source")
-            n_act = sum(1 for e in action_space if e.get("kind") == "action")
-            n_ev = len(action_space) - n_act
-            print(f"[EXPLORE] step={state.step_count} llm={state.llm_calls} "
-                  f"interaction_root={iroot} "
-                  f"DECIDE_START selectable_actions={n_act} evidence={n_ev}",
-                  flush=True)
             # S1-P0（0/1/N 决策）：单候选 → 确定性执行（不调用 LLM——
             # 模型只解决真正存在语义选择的问题；modal 被 Policy 限制后
             # 只剩 1 个可选动作时，让它"选择"唯一选项是纯浪费）。
@@ -805,10 +795,6 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             else:
                 decision, decision_error = _decide(
                     state, llm_call, elements=action_space)
-            print(f"[EXPLORE] step={state.step_count} llm={state.llm_calls} "
-                  f"DECIDE_DONE action={(decision or {}).get('action')} "
-                  f"ref={(decision or {}).get('target_ref')} "
-                  f"err={(decision_error or '')[:60]}", flush=True)
             if decision is None:
                 # 决策被校验拒绝：把错误反馈进历史，预算内让 LLM 自纠。
                 # 修复：单次坏决策直接夭折整个探索——真实 E2E 中 fill 之后

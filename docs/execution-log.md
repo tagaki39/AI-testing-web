@@ -1,5 +1,40 @@
 # Execution Log（执行日志）
 
+## 2026-08-26 — P3 + 清理 + 最终回归（`6d51837` → 最终确认）
+
+### P3：低价值动作拦截（`6d51837`）
+
+- **textbox/searchbox 不支持 click**：fill() 本身完成 focus，先 click 文本框是
+  低价值动作（浪费预算，LLM 常误用）。能力矩阵 `ACTION_CAPABILITIES` 收紧。
+- **重复同值 fill 拦截**：同一 ref 已成功 fill 相同值且期间无状态迁移 →
+  NO_PROGRESS 拒绝（确定性判断，不进 LLM 预算）。
+- 效果：SauceDemo 6/6、BFC 10/10、xywhaigc 6/6 回归通过。
+
+### 收尾清理（dead-code audit，只删除不重构）
+
+- 删除 BFC 300s 超时定位埋点：`[GEN]` stage marks、`[LLM]` HTTP 计时、
+  `[EXPLORE]` DECIDE 打点、`[OBS]` 全量性能埋点（A4.1 性能根因已修复，
+  计时器变量仅服务于 print，一并删除；`identity_enrich_ms` 等 metrics 保留）。
+- 删除临时诊断文件：`_diag_stability.py`、`_*_prompt.json`、`_*_result.json`、
+  `bfc_result.json`、`server.log`。
+- 修正 `target_name` 过时注释（原标注"临时 diagnostic"——实际已被 R7.2
+  购物车入口校验使用，防止后续审计误删）。
+
+### 最终回归（冻结基线后唯一一次完整验证）
+
+| 场景 | 结果 | 关键指标 |
+|---|---|---|
+| AutomationExercise BFC | ✅ | 探索 7 步/5 llm/done=True；case 10 步；执行 10/10 |
+| SauceDemo 登录+加购 | ✅ | 探索 4 步/done=True；case 6 步；执行 6/6 |
+| xywhaigc 登录 | ✅ | 探索 3 步/3 llm/done=True；case 6 步；执行 6/6（真实登录） |
+| 单元测试 | ✅ | 173/173 passed |
+
+**冻结基线确认：** 主链路（Observation → ActionSpace → Goal Policy → 0/1/N 决策
+→ StateGraph → Planner → Compiler → Resolver → Runner）自 `7be9638` 起未再
+改动，`6d51837`（P3）+ 本清理均为收尾，无功能变更。
+
+---
+
 ## 2026-08-26 — A4.x → S1 收尾：主链路冻结基线（`7be9638`）
 
 ### 本轮功能基线

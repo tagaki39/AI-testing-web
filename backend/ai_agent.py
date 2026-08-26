@@ -238,15 +238,8 @@ def _call_llm(user_prompt: str, system_prompt: str | None = None,
             "Authorization": f"Bearer {API_KEY}",  # 认证：Bearer token 标准格式
         },
     )
-    # P0 网络埋点：区分"连接/首包慢" vs "body.read() 卡"
-    _llm_t0 = perf_counter()
-    print(f"[LLM] HTTP_START timeout={timeout}", flush=True)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        print(f"[LLM] HEADERS {perf_counter() - _llm_t0:.1f}s status={resp.status}",
-              flush=True)
         body = resp.read()
-    print(f"[LLM] HTTP_DONE {perf_counter() - _llm_t0:.1f}s bytes={len(body)}",
-          flush=True)
     data = json.loads(body.decode("utf-8"))
     choice = data["choices"][0]
     # S4：输出超预算（finish_reason=length）→ 明确失败（output runaway
@@ -1140,13 +1133,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     只要 action 不在白名单、缺字段、类型不对，照样拒绝。
     校验失败会抛异常，由 main.py 捕获后返回 400 给前端。
 
-    P0 诊断（BFC 300s 超时黑洞定位）：stage marks 输出到 uvicorn 日志——
-    卡在哪个阶段一目了然。临时诊断代码，定位后移除。
     """
-    _g_t0 = perf_counter()
-    def _mark(stage: str) -> None:
-        print(f"[GEN] {stage} +{(perf_counter() - _g_t0) * 1000:.0f}ms", flush=True)
-    _mark("ENTER")
     # ── 阶段 1：解析入口 URL（正则优先，描述性输入 LLM fallback）───
     t_url = perf_counter()
     entry_url = _resolve_entry_url(user_prompt)
@@ -1184,7 +1171,6 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 # 降级带来的可用性；无 entry_url 的 legacy 在上层显式处理。
                 raise
     explore_ms = int((perf_counter() - t_explore) * 1000)
-    _mark("EXPLORE_DONE")
 
     # E1（评审收紧）：探索异常不得静默冒充 grounded 成功——显式暴露
     # degraded 标记与错误，前端/诊断能区分"真 grounded"与"legacy 降级"。
@@ -1354,7 +1340,6 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             tables=retry_tables,
         )
     planner_ms = int((perf_counter() - t_planner) * 1000)
-    _mark("PLANNER_DONE")
 
     meta = {
         "generation_mode": "refs_only" if explore_result is not None else "legacy_fallback",

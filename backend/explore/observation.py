@@ -616,12 +616,8 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     # 却是 text——"aria 表 + CDP 打补丁"的匹配投影会丢 actionable ancestor）：
     # CDP AX Tree 是 ObservationElement 的唯一事实源；aria_snapshot 仅
     # provider fallback（One source of truth）。
-    t_obs = perf_counter()
-    print(f"[OBS] START", flush=True)
     try:
         ax_nodes = CDPAccessibilityProvider().capture(page)
-        print(f"[OBS] AX_CAPTURE {(perf_counter() - t_obs) * 1000:.0f}ms raw={len(ax_nodes)}",
-              flush=True)
         structured = build_observation_elements(ax_nodes) if ax_nodes else []
         if structured:
             elements = [
@@ -638,18 +634,10 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
                 }
                 for e in structured
             ]
-            _actions = sum(1 for e in structured if e.kind == "action")
-            _evs = sum(1 for e in structured if e.kind == "evidence")
-            _cons = sum(1 for e in structured if e.kind == "container")
-            print(f"[OBS] PROJECT {(perf_counter() - t_obs) * 1000:.0f}ms "
-                  f"total={len(elements)} actions={_actions} "
-                  f"containers={_cons} evidence={_evs}", flush=True)
         else:
             elements = _parse_elements(snapshot)   # CDP 不可用 → aria legacy
-            print("[OBS] PROJECT aria_fallback", flush=True)
     except Exception:
         elements = _parse_elements(snapshot)   # CDP 不可用 → aria legacy
-        print("[OBS] PROJECT aria_fallback(exc)", flush=True)
 
     # 状态哈希：A4 优先用语义状态签名（action/container 的 role/name/状态/
     # 语义父级排序 hash）——相同业务状态匹配回原 obs，减少 phantom states
@@ -700,12 +688,8 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
         e for e in elements
         if e.get("kind") == "action" and not e.get("context_role")
     ]
-    print(f"[OBS] LEGACY_SCOPE candidates={len(legacy_candidates)} "
-          f"{(perf_counter() - t_obs) * 1000:.0f}ms", flush=True)
     if legacy_candidates:
         _attach_legacy_dom_scope(page, legacy_candidates)
-    print(f"[OBS] LEGACY_SCOPE_DONE {(perf_counter() - t_obs) * 1000:.0f}ms",
-          flush=True)
 
     # A4.2：只对「role+name 重复且 AX context 仍不能消歧」的 action
     # 做 identity enrichment（backendDOMNodeId bridge）→ canonicalize。
@@ -732,9 +716,6 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
         canonical_dropped = pre_count - len(elements)
         state.elements = elements   # 折叠后的元素表接管（same dict 引用，
                                     # refs/identity 已在原 dict 上生效）
-        print(f"[OBS] IDENTITY enriched={enriched} "
-              f"canonical_dropped={canonical_dropped} "
-              f"{(perf_counter() - t_obs) * 1000:.0f}ms", flush=True)
     # A4.2 metrics（累计——多次观测的聚合值，验收读"全程"而非最后一次）
     state.timings["identity_enrich_ms"] = \
         state.timings.get("identity_enrich_ms", 0) + int((perf_counter() - t_id) * 1000)
@@ -753,16 +734,12 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     if any(e.get("context_role") == "dialog" for e in elements):
         state.interaction_root = {"source": "ax", "kind": "dialog"}
     else:
-        t_ov = perf_counter()
         overlay_refs, ov_desc = _detect_dom_overlay(page, elements)
         if overlay_refs:
             for e in elements:
                 if e["ref"] in overlay_refs:
                     e["in_interaction_root"] = True
             state.interaction_root = ov_desc
-            print(f"[OBS] INTERACTION_ROOT source={ov_desc['source']} "
-                  f"overlay_actions={len(overlay_refs)} "
-                  f"{(perf_counter() - t_ov) * 1000:.0f}ms", flush=True)
 
     # A4.2（性能根因）：删除 Observation 全量 DOM actionability 验证——
     # 首页 1927 AX 节点 → 135 个 action × elementFromPoint 协议往返
@@ -776,9 +753,6 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     # 绝不进入 explore_result / 缓存 / Planner 上下文 / DSL。
     for e in elements:
         e.pop("backend_dom_node_id", None)
-    print(f"[OBS] ACTIONABILITY_SKIPPED {(perf_counter() - t_obs) * 1000:.0f}ms",
-          flush=True)
-    print(f"[OBS] DONE {(perf_counter() - t_obs) * 1000:.0f}ms", flush=True)
 
     state.observations.append({
         "id": obs_id,
