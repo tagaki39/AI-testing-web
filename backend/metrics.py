@@ -86,6 +86,9 @@ def _explore_metrics(gens: list[dict]) -> dict:
     explores = [g.get("explore") for g in gens if g.get("explore")]
     hits = sum(1 for g in gens if g.get("cache_hit"))
     done = sum(1 for e in explores if e.get("done"))
+    terminations = Counter(
+        e.get("termination_reason") or "legacy_unknown" for e in explores
+    )
     return {
         "cache_hit": _rate(hits, len(gens)),
         "runs": len(explores),
@@ -93,6 +96,7 @@ def _explore_metrics(gens: list[dict]) -> dict:
         "avg_pages": sum(e.get("pages_visited", 0) for e in explores) / len(explores) if explores else None,
         "avg_steps": sum(e.get("steps_used", 0) for e in explores) / len(explores) if explores else None,
         "avg_llm_calls": sum(e.get("llm_calls", 0) for e in explores) / len(explores) if explores else None,
+        "terminations": dict(terminations),
     }
 
 
@@ -156,8 +160,11 @@ def _gen_timing_metrics(gens: list[dict]) -> dict:
         ("planner_ms", "Planner"),
         ("preflight_ms", "Preflight"),
     ):
-        vals = [g.get("timings", {}).get(key) for g in gens
-                if isinstance(g.get("timings", {}).get(key), int)]
+        # 失败生成会按设计记录 timings=null；历史日志也可能缺少该字段。
+        # 只聚合结构完整的计时对象，不能让一次失败记录打断整份报告。
+        vals = [timings.get(key) for g in gens
+                if isinstance((timings := g.get("timings")), dict)
+                and isinstance(timings.get(key), int)]
         out[label] = (vals, _pct(vals, 50), _pct(vals, 95))
     return out
 
@@ -193,6 +200,7 @@ def main() -> int:
         print(f"  缓存命中率            : {em['cache_hit']}")
         print(f"  探索完成率            : {em['done']}（{em['runs']} 轮）")
         print(f"  平均 pages/steps/LLM  : {em['avg_pages'] or '-'} / {em['avg_steps'] or '-'} / {em['avg_llm_calls'] or '-'}")
+        print(f"  终止原因分布          : {em['terminations']}")
 
         tm = _gen_timing_metrics(gens)
         print("\n【生成链路耗时（p50 / p95, ms）】")

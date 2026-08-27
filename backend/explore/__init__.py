@@ -6,8 +6,8 @@ explore/ — bounded exploration 包
     explorer.py      主循环 + LLM 决策策略（observe → choose → execute → transition）
 """
 from .observation import (
-    ExploreState, _parse_elements, _record_page, _observe, _safe_title,
-    _attach_legacy_dom_scope, _observe_until_stable,
+    ExploreState, TerminationReason, _parse_elements, _record_page, _observe,
+    _safe_title, _attach_legacy_dom_scope, _observe_until_stable,
 )
 from .action_space import (
     ACTION_CAPABILITIES, _build_action_space, _locator_for_element,
@@ -26,7 +26,7 @@ from .explorer import (
 from execution.action_executor import EXPLORE_ACTION_TIMEOUT_MS
 
 __all__ = [
-    "ExploreState", "explore", "_decide", "_record_page", "_observe",
+    "ExploreState", "TerminationReason", "explore", "_decide", "_record_page", "_observe",
     "_build_action_space", "validate_actionability", "_validate_action_target",
     "_validate_completion", "_detect_auth_failure", "_is_repeated_no_progress",
     "GOAL_ACTION_PATTERNS", "_ACTION_KEYWORDS", "DECIDE_PROMPT",

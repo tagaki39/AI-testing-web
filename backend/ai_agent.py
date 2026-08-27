@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from compiler import compile_targets
 from dsl import DSLCase, validate_case
-from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
+from explore_cache import is_cacheable_trace, load as cache_load, save as cache_save
 from explore import (
     GOAL_ACTION_PATTERNS, _ACTION_KEYWORDS, explore,
     missing_verified_goal_actions,
@@ -1149,7 +1149,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     cache_hit = False
     auth_profile = "authenticated" if runtime_inputs else "anonymous"
     if entry_url:
-        cached = cache_load(entry_url, auth_profile)
+        cached = cache_load(entry_url, auth_profile, explore_goal)
         if cached:
             explore_result = cached
             pages = cached.get("observations", [])
@@ -1159,11 +1159,14 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
                 pages = explore_result.get("observations", [])   # ← observations 模型
                 # 保存前脱敏：history 的 value 还原为 ${var}（缓存不落盘真实凭据）
-                # 缓存门槛（GQ 决策 2）：done=True，或已执行 ≥2 步——
-                # saucedemo 的 done=False/steps=4 探索产出了 7/7 计划（好探索
-                # 被拒缓存是浪费）；steps=1 的浅探索仍拒缓存（历史毒化案例）。
-                if explore_result.get("done") or explore_result.get("steps_used", 0) >= 2:
-                    cache_save(entry_url, auth_profile, _sanitize_for_cache(explore_result, runtime_inputs))
+                # S2-P0：StateGraph/history 是目标相关轨迹。只有代码可证明
+                # GOAL_COMPLETE 的结果可按目标指纹缓存；MODEL_FINISH、错误页、
+                # 认证失败和预算耗尽均不可复用。
+                if is_cacheable_trace(explore_result):
+                    cache_save(
+                        entry_url, auth_profile, explore_goal,
+                        _sanitize_for_cache(explore_result, runtime_inputs),
+                    )
             except Exception:
                 # R4（评审）：探索失败不再静默降级 legacy——Grounded mode
                 # 下 Explore fail → generate fail（fail honestly）。
@@ -1357,6 +1360,9 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             "steps_used": (explore_result or {}).get("steps_used", 0),
             "llm_calls": (explore_result or {}).get("llm_calls", 0),
             "done": (explore_result or {}).get("done", False),
+            "termination_reason": (
+                (explore_result or {}).get("termination_reason")
+            ),
             "transitions": (explore_result or {}).get("transitions", []),   # G2：状态转移边
         } if explore_result else None,
         "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）

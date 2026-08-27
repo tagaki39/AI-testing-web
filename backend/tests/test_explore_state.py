@@ -36,7 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from explore import (   # noqa: E402
-    ExploreState, _decide, _detect_auth_failure, _detect_error_page,
+    ExploreState, TerminationReason, _decide, _detect_auth_failure, _detect_error_page,
     _is_repeated_no_progress, _record_page, _validate_action_target,
     _validate_completion, validate_actionability,
 )
@@ -334,6 +334,84 @@ def test_j3_no_action_goal_exempt() -> None:
     state = ExploreState(goal="verify page contains welcome", entry_url="https://x.com")
     state.step_count = 0
     assert _validate_completion(state) is None
+
+
+def _completed_login_state(goal: str) -> ExploreState:
+    """构造已有 verified login transition 的最小完成状态。"""
+    state = ExploreState(goal=goal, entry_url="https://x.com")
+    state.step_count = 2
+    state.history = [
+        {"action": "fill", "target_ref": "obs1:e1", "value": "${username}"},
+        {"action": "click", "target_ref": "obs1:e2",
+         "target": {"role": "button", "name": "登录"}},
+    ]
+    state.transitions = [
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e2",
+         "target_name": "登录", "to": "obs2"},
+    ]
+    state.current_obs = "obs2"
+    return state
+
+
+def test_j3a_login_only_is_deterministically_ready() -> None:
+    """纯登录目标证据齐备后可以由程序自动完成。"""
+    from explore.explorer import _completion_status
+    status = _completion_status(_completed_login_state("登录系统"))
+    assert status.ready
+    assert not status.unknown
+
+
+def test_j3b_login_with_further_action_is_unknown_not_ready() -> None:
+    """登录成功不代表后续生成任务完成；应交还 LLM 继续语义探索。"""
+    from explore.explorer import _completion_status
+    state = _completed_login_state("登录后进入图片生成页面，填写提示词并生成图片")
+    status = _completion_status(state)
+    assert not status.ready
+    assert status.unknown
+    assert _validate_completion(state) is None  # UNKNOWN 时允许模型选择 finish
+
+
+def test_j3c_missing_login_evidence_remains_incomplete() -> None:
+    """三态不能放松硬门：未验证登录时仍必须禁止 finish。"""
+    from explore.explorer import _completion_status
+    state = ExploreState(
+        goal="登录后进入图片生成页面，生成图片", entry_url="https://x.com")
+    state.step_count = 3
+    status = _completion_status(state)
+    assert not status.ready
+    assert not status.unknown
+    assert _validate_completion(state) is not None
+
+
+def test_j3d_termination_reason_is_separate_from_done() -> None:
+    """done 只表示停止；结构化 reason 才表达停止语义。"""
+    state = ExploreState(goal="login", entry_url="https://x.com")
+    assert not state.done and state.termination_reason is None
+    state.terminate(TerminationReason.AUTH_REJECTED)
+    assert state.done
+    assert state.termination_reason == TerminationReason.AUTH_REJECTED
+
+
+def test_singleton_click_only_role_is_deterministic() -> None:
+    """唯一 checkbox 只有 click 能力，可安全跳过 LLM。"""
+    from explore.explorer import _deterministic_singleton_decision
+    decision = _deterministic_singleton_decision([
+        {"ref": "obs1:e1", "kind": "action", "role": "checkbox", "name": "Remember"},
+    ])
+    assert decision == {"action": "click", "target_ref": "obs1:e1"}
+
+
+def test_singleton_textbox_or_button_does_not_assume_click() -> None:
+    """textbox/button 有多个动作语义，必须交给决策层。"""
+    from explore.explorer import _deterministic_singleton_decision
+    textbox = [
+        {"ref": "obs1:e1", "kind": "action", "role": "textbox", "name": "Prompt"},
+    ]
+    button = [
+        {"ref": "obs1:e2", "kind": "action", "role": "button", "name": "Generate"},
+    ]
+    assert _deterministic_singleton_decision(textbox) is None
+    assert _deterministic_singleton_decision(button) is None
 
 
 def test_classify_fill_selfloop_no_transition() -> None:
@@ -654,6 +732,7 @@ def test_e_observation_cap_stops_exploration() -> None:
     for i in range(13):
         _record_page(state, _MockPage("https://x.com", f'- button "B{i}"\n'))
     assert state.done, "观察预算满必须停止探索"
+    assert state.termination_reason == TerminationReason.OBSERVATION_LIMIT
     assert any(h.get("action") == "observation_cap" for h in state.history)
 
 

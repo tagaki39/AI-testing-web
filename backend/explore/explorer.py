@@ -11,11 +11,15 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 from execution.action_executor import execute_action
+from goal_contract import GoalContractError, build_goal_contract
 from .observation import (
-    ExploreState, _observe, _observe_after_action, _record_page,
+    ExploreState, TerminationReason, _observe, _observe_after_action,
+    _record_page,
 )
+from .progress import GoalProgress, derive_milestone_progress
 from .action_space import (
-    _build_action_space, _locator_for_element, _validate_action_target,
+    ACTION_CAPABILITIES, _build_action_space, _locator_for_element,
+    _validate_action_target,
 )
 
 _MAX_HISTORY = 3     # 决策上下文只看最近 3 步历史
@@ -117,6 +121,23 @@ def _is_repeated_no_progress(state: "ExploreState", action: str, ref: str) -> bo
         return False
     return prev["action"] == action and prev["target_ref"] == ref
 
+
+def _deterministic_singleton_decision(action_space: list[dict]) -> dict | None:
+    """唯一元素只有唯一动作能力时，返回可确定执行的完整决策。
+
+    当前是 ActionCandidate 接管前的过渡实现：checkbox/radio 等 click-only
+    角色可跳过 LLM；button/link/textbox 等多动作角色必须交给决策层，避免
+    “唯一 textbox → 自动 click”的确定性错误。
+    """
+    selectable = [e for e in action_space if e.get("kind") == "action"]
+    if len(selectable) != 1:
+        return None
+    element = selectable[0]
+    capabilities = ACTION_CAPABILITIES.get(element.get("role"), set())
+    if capabilities != {"click"}:
+        return None
+    return {"action": "click", "target_ref": element["ref"]}
+
 # ── GQ：目标动作表（保守 allowlist，人为维护）──────────────────────────
 # 用于两处：① 探索完成性校验（goal 要求操作时，0/1 步宣告完成无效）
 # ② 生成期目标覆盖检查（ai_agent._check_goal_coverage 引用同表）。
@@ -134,6 +155,28 @@ _ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
     "login": ("login", "sign in", "登录", "登陆", "登入"),
     "checkout": ("checkout", "结算", "结账", "去结算"),
 }
+
+# goal 中的"进一步动作"动词（三必选之外的多阶段信号）——
+# 命中 → 确定性 completion 无法证明完整覆盖 → UNKNOWN（LLM 语义决定 finish）。
+# 排除收尾/描述性动词（验证/查看/确认/打开/点击/浏览）——"点击登录"的
+# 点击由 login pattern 覆盖，不算多阶段信号。S2-P1 Goal Contract 接管后删除。
+_FURTHER_ACTION_RE = re.compile(
+    r"(进入|前往|跳转|填写|输入|选择|生成|提交|搜索|筛选|上传|创建|发布|播放|下载)")
+
+
+def _goal_fully_covered_by_deterministic_model(goal: str) -> bool:
+    """goal 是否完全属于确定性 completion 支持的目标族。
+
+    支持族：login-only / 加购族（add_to_cart + 数量 + 购物车验证）——
+    现有 verified 模型能完整证明覆盖。其余多阶段目标（进入 X 页面、
+    填写表单、生成/提交/筛选）→ False → completion 返回 UNKNOWN，
+    是否完成交由 LLM 语义判断（避免 login 验证后 auto_finish 截断
+    后续目标——xywhaigc 图片生成实测：6/6 全过但只完成了登录）。
+    """
+    rest = goal or ""
+    for pat in GOAL_ACTION_PATTERNS.values():
+        rest = pat.sub("", rest)
+    return not _FURTHER_ACTION_RE.search(rest)
 
 
 def goal_requires_actions(goal: str) -> bool:
@@ -276,13 +319,30 @@ def _completion_status(state: "ExploreState") -> CompletionStatus:
         if cur is None or not cur.get("elements"):
             return CompletionStatus(
                 ready=False, reason="购物车终态缺少观察证据（elements 为空）")
+    # 三态 Completion（评审：login verified 不等于整个目标完成）：
+    # 目标完全属于确定性支持族 → READY（auto_finish）；
+    # 目标含未建模的后续操作（进入 X 页面/填写/生成…）→ UNKNOWN——
+    # 不 auto_finish，把"是否完成"交给 LLM 语义判断。
+    if not _goal_fully_covered_by_deterministic_model(state.goal):
+        return CompletionStatus(
+            ready=False, unknown=True,
+            reason="目标包含确定性 completion 尚未建模的后续操作——由模型判断完成时机")
     return CompletionStatus(ready=True, reason="goal evidence collected")
 
 
 def _validate_completion(state: "ExploreState") -> str | None:
-    """薄包装：_completion_status 的 ready → None（兼容既有调用方）。"""
+    """三态薄包装（兼容既有调用方）：
+
+      READY     → None（auto_finish + LLM finish 均可用）
+      UNKNOWN   → None（不 auto_finish；LLM 可见 finish，语义决定）
+      INCOMPLETE → reason（finish 禁用，继续探索）
+    """
     status = _completion_status(state)
-    return None if status.ready else status.reason
+    if status.ready:
+        return None
+    if status.unknown:
+        return None
+    return status.reason
 
 def _elements_to_prompt(elements: list[dict], state: "ExploreState | None" = None) -> str:
     """元素表 → 决策上下文（紧凑格式）。
@@ -724,6 +784,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         "pages": [{url, title, snapshot}],   # 多页面快照（喂给 Planner）
         "history": [{url, action, target_ref, value}],  # 探索路径
         "steps_used": int, "llm_calls": int, "done": bool,
+        "termination_reason": str,
       }
 
     预算耗尽 / 决策失败 / exploration_complete → 停止探索。
@@ -762,7 +823,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             # Planner 被乱走边误导选入计划 → 断言 cursor 错位）
             completion = _completion_status(state)
             if completion.ready:
-                state.done = True
+                state.terminate(TerminationReason.GOAL_COMPLETE)
                 state.history.append({
                     "action": "auto_finish",
                     "observation_ref": state.current_obs,
@@ -785,12 +846,8 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             # 只剩 1 个可选动作时，让它"选择"唯一选项是纯浪费）。
             # finish 判定不在此路径：完成校验由探索结束的
             # _validate_completion 兜底（单候选多做一步无害）。
-            selectable = [e for e in action_space if e.get("kind") == "action"]
-            if len(selectable) == 1:
-                decision = {
-                    "action": "click",
-                    "target_ref": selectable[0]["ref"],
-                }
+            decision = _deterministic_singleton_decision(action_space)
+            if decision is not None:
                 decision_error = None
             else:
                 decision, decision_error = _decide(
@@ -822,7 +879,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                         "error": completion_error,
                     })
                     continue
-                state.done = True
+                state.terminate(TerminationReason.MODEL_FINISH)
                 break
 
             # 执行动作（失败记录进历史，继续下一轮）
@@ -934,7 +991,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                     "action": "auth_rejected",
                     "error": "页面出现认证失败提示，测试目标无法继续——停止探索",
                 })
-                state.done = True
+                state.terminate(TerminationReason.AUTH_REJECTED)
                 break
 
             # 错误页 honest stop（R5：xywhaigc 案例——登录后 404，探索
@@ -947,7 +1004,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                     "error": "页面为错误页（404/500）——测试目标无法继续，"
                              "停止探索（GOAL_NOT_REACHED）",
                 })
-                state.done = True
+                state.terminate(TerminationReason.ERROR_PAGE)
                 break
 
             # G2：记录状态转移边（obs3 --click e17--> obs4）。
@@ -976,6 +1033,8 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                 page.wait_for_timeout(300)
                 _record_page(state, page)
 
+        if not state.done:
+            state.terminate(TerminationReason.BUDGET_EXHAUSTED)
         browser.close()
 
     state.timings["explore_total_ms"] = (
@@ -990,5 +1049,8 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         "steps_used": state.step_count,
         "llm_calls": state.llm_calls,
         "done": state.done,
+        "termination_reason": (
+            state.termination_reason.value if state.termination_reason else None
+        ),
         "timings": state.timings,
     }

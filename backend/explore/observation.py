@@ -7,8 +7,12 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from time import perf_counter
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from goal_contract import GoalContract
 
 from locator.resolver import PRICE_RE, _strip_leading_decoration, choose_scope_text
 from execution.runner import _resolve_locator
@@ -476,6 +480,22 @@ def _observe_after_action(page, before_url: str, before_snapshot: str,
         page.wait_for_timeout(150)
     return latest
 
+class TerminationReason(str, Enum):
+    """探索停止原因；``done`` 只表示循环停止，不表达成功或失败。"""
+
+    GOAL_COMPLETE = "goal_complete"
+    MODEL_FINISH = "model_finish"
+    READY_FOR_RUNNER = "ready_for_runner"
+    AUTH_REJECTED = "auth_rejected"
+    ERROR_PAGE = "error_page"
+    OBSERVATION_LIMIT = "observation_limit"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    MILESTONE_STALLED = "milestone_stalled"
+    CAPABILITY_MISSING = "capability_missing"
+    ACTION_FAILED = "action_failed"
+    GOAL_CONTRACT_INVALID = "goal_contract_invalid"
+
+
 @dataclass
 class ExploreState:
     """探索状态。"""
@@ -495,6 +515,8 @@ class ExploreState:
     step_count: int = 0                # 已执行动作数
     llm_calls: int = 0                 # 已用 LLM 调用数
     done: bool = False                 # 探索是否完成
+    termination_reason: TerminationReason | None = None
+    goal_contract: "GoalContract | None" = None  # 静态契约；进度始终动态推导
     # A4.3：当前 observation 的 interaction root 描述（AX dialog 时
     # source="ax"；DOM overlay bridge 时 source="dom_overlay"）。只进
     # observation metadata，不冒充 AX 语义。
@@ -506,6 +528,11 @@ class ExploreState:
         "llm_ms": 0, "browser_action_ms": 0, "fixed_wait_ms": 0,
         "observation_ms": 0, "action_space_ms": 0, "settle_ms": 0,
     })
+
+    def terminate(self, reason: TerminationReason) -> None:
+        """以结构化原因停止探索。"""
+        self.done = True
+        self.termination_reason = reason
 
 
 # ── element ref 解析（aria_snapshot → 带编号的元素表）───────────────────────────
@@ -669,7 +696,7 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
             "action": "observation_cap",
             "error": "观察预算已满（total 上限），停止探索",
         })
-        state.done = True
+        state.terminate(TerminationReason.OBSERVATION_LIMIT)
         return None
 
     state.snapshot = snapshot

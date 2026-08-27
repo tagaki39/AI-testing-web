@@ -27,6 +27,7 @@ import json
 import os
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -67,6 +68,41 @@ ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "artifacts"
 # 消费即弃（重连时由状态补发最终事件，幂等）。
 _RUNS: dict[str, dict] = {}
 _RUNS_LOCK = threading.Lock()
+_RUN_RETENTION_SECONDS = 60 * 60
+_MAX_RETAINED_RUNS = 100
+
+
+def _prune_runs_locked(now: float | None = None) -> None:
+    """回收已结束的内存 run；调用方必须持有 ``_RUNS_LOCK``。
+
+    正在运行的任务永不回收。终态任务默认保留一小时供 SSE 重连；超过
+    数量上限时，再从最老的终态任务开始淘汰。惰性清理避免为本地 demo
+    额外维护一个后台清理线程。
+    """
+    current = time.monotonic() if now is None else now
+    terminal = {"done", "error"}
+    expired = [
+        run_id for run_id, state in _RUNS.items()
+        if state.get("status") in terminal
+        and current - (state.get("finished_at")
+                       or state.get("created_at", current))
+        >= _RUN_RETENTION_SECONDS
+    ]
+    for run_id in expired:
+        _RUNS.pop(run_id, None)
+
+    overflow = len(_RUNS) - _MAX_RETAINED_RUNS
+    if overflow <= 0:
+        return
+    oldest_terminal = sorted(
+        (
+            (state.get("finished_at") or state.get("created_at", current), run_id)
+            for run_id, state in _RUNS.items()
+            if state.get("status") in terminal
+        ),
+    )
+    for _, run_id in oldest_terminal[:overflow]:
+        _RUNS.pop(run_id, None)
 
 
 def _json_sse(item: dict) -> str:
@@ -171,15 +207,21 @@ def api_execute(req: ExecuteRequest):
         raise HTTPException(status_code=400, detail=f"执行失败: {str(exc)[:300]}")
     run_id = uuid4().hex[:12]
     events: queue.Queue = queue.Queue()
-    state = {"status": "running", "events": events, "report": None, "error": None}
+    state = {
+        "status": "running", "events": events, "report": None, "error": None,
+        "created_at": time.monotonic(), "finished_at": None,
+    }
     with _RUNS_LOCK:
+        _prune_runs_locked(state["created_at"])
         _RUNS[run_id] = state
 
     def _worker() -> None:
         try:
             report = execute_case(case, req.input_values, on_event=events.put)
-            state["report"] = report
-            state["status"] = "done"
+            with _RUNS_LOCK:
+                state["report"] = report
+                state["status"] = "done"
+                state["finished_at"] = time.monotonic()
             events.put({"type": "run_finished", "report": report})
             _append_timing({
                 "type": "execute",
@@ -197,8 +239,10 @@ def api_execute(req: ExecuteRequest):
                 ],
             })
         except Exception as exc:
-            state["error"] = str(exc)[:300]
-            state["status"] = "error"
+            with _RUNS_LOCK:
+                state["error"] = str(exc)[:300]
+                state["status"] = "error"
+                state["finished_at"] = time.monotonic()
             events.put({"type": "run_error", "error": state["error"]})
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -213,7 +257,8 @@ def api_run_events(run_id: str):
     再关闭（EventSource 自动重连不会丢最终结果）。队列空闲时发
     心跳注释帧保活（不产生 data 事件）。
     """
-    state = _RUNS.get(run_id)
+    with _RUNS_LOCK:
+        state = _RUNS.get(run_id)
 
     def _stream():
         if state is None:

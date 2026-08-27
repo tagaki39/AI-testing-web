@@ -10,16 +10,18 @@ explore_cache.py — 探索结果缓存（Speed v1）
 
 【设计（小而安全）】
   1. 内存 + 文件两级（backend/.cache/explore/*.json），不用 DB
-  2. key = origin + auth_profile（不只 URL——同一 URL 可能对应
-     未登录/已登录/不同状态）
+  2. key = origin + auth_profile + 脱敏目标指纹 + schema version；
+     目标相关 StateGraph/history 绝不跨目标复用
   3. 缓存内容脱敏：history 的 value 还原为 ${var} 占位，
      绝不落盘真实凭据（Secrets 边界）
-  4. TTL=1h；ENABLED 开关；stale 由 Preflight 兜底（Speed C）
+  4. TTL=1h；schema version 负责结构失效，目标指纹负责语义隔离
 ══════════════════════════════════════════════════════════════════════
 """
 
 import json
+import hashlib
 import logging
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -29,25 +31,49 @@ logger = logging.getLogger("explore_cache")
 CACHE_DIR = Path(__file__).resolve().parents[1] / ".cache" / "explore"
 TTL_SECONDS = 3600          # 1h（比 4h 保守，配合 stale guard）
 ENABLED = True
+CACHE_SCHEMA_VERSION = "s2"
+GOAL_COMPLETE_REASON = "goal_complete"
 
 _memory: dict[str, dict] = {}   # 内存级缓存 {key: {"data": ..., "created_at": ...}}
 
 
-def _cache_key(entry_url: str, auth_profile: str) -> str:
-    """缓存 key：origin + auth_profile（防跨站点/跨登录态串缓存）。"""
-    origin = urlparse(entry_url).netloc
-    return f"{origin}__{auth_profile}"
+def _normalize_goal(goal: str) -> str:
+    """稳定化已脱敏目标文本，避免空白/大小写差异制造重复条目。"""
+    return " ".join((goal or "").casefold().split())
+
+
+def goal_fingerprint(goal: str) -> str:
+    """已脱敏目标的短 SHA-256 指纹；不把目标原文写入文件名。"""
+    return hashlib.sha256(_normalize_goal(goal).encode("utf-8")).hexdigest()[:12]
+
+
+def _cache_key(entry_url: str, auth_profile: str, goal: str) -> str:
+    """缓存 key：站点 + 登录态 + 目标 + schema，避免跨目标/版本串缓存。"""
+    origin = urlparse(entry_url).netloc.casefold()
+    safe_origin = re.sub(r"[^a-z0-9._-]+", "_", origin).strip("_") or "unknown"
+    safe_profile = re.sub(
+        r"[^a-z0-9._-]+", "_", (auth_profile or "anonymous").casefold()
+    ).strip("_") or "anonymous"
+    return (
+        f"{safe_origin}__{safe_profile}__{goal_fingerprint(goal)}__"
+        f"{CACHE_SCHEMA_VERSION}"
+    )
+
+
+def is_cacheable_trace(data: dict | None) -> bool:
+    """只有确定性证明目标完成的探索轨迹可复用。"""
+    return bool(data) and data.get("termination_reason") == GOAL_COMPLETE_REASON
 
 
 def _fresh(entry: dict) -> bool:
     return (time.time() - entry.get("created_at", 0)) < TTL_SECONDS
 
 
-def load(entry_url: str, auth_profile: str) -> dict | None:
+def load(entry_url: str, auth_profile: str, goal: str) -> dict | None:
     """内存 → 文件 → None。过期视为 miss。"""
     if not ENABLED:
         return None
-    key = _cache_key(entry_url, auth_profile)
+    key = _cache_key(entry_url, auth_profile, goal)
 
     entry = _memory.get(key)
     if entry and _fresh(entry):
@@ -65,11 +91,11 @@ def load(entry_url: str, auth_profile: str) -> dict | None:
     return None
 
 
-def save(entry_url: str, auth_profile: str, data: dict) -> None:
-    """写内存 + 文件。data 必须已脱敏（见 ai_agent._sanitize_for_cache）。"""
-    if not ENABLED:
+def save(entry_url: str, auth_profile: str, goal: str, data: dict) -> None:
+    """写入已证明完成的脱敏轨迹；其他终止原因一律拒绝缓存。"""
+    if not ENABLED or not is_cacheable_trace(data):
         return
-    key = _cache_key(entry_url, auth_profile)
+    key = _cache_key(entry_url, auth_profile, goal)
     entry = {"data": data, "created_at": time.time()}
     _memory[key] = entry
     try:
@@ -97,9 +123,9 @@ def clear_all() -> None:
                 logger.warning("[CACHE] clear failed %s err=%r", p.name, exc)
 
 
-def invalidate(entry_url: str, auth_profile: str) -> None:
+def invalidate(entry_url: str, auth_profile: str, goal: str) -> None:
     """删除缓存（stale guard 用：Preflight 发现缓存证据过期时）。"""
-    key = _cache_key(entry_url, auth_profile)
+    key = _cache_key(entry_url, auth_profile, goal)
     _memory.pop(key, None)
     try:
         (CACHE_DIR / f"{key}.json").unlink(missing_ok=True)
