@@ -31,7 +31,7 @@ logger = logging.getLogger("explore_cache")
 CACHE_DIR = Path(__file__).resolve().parents[1] / ".cache" / "explore"
 TTL_SECONDS = 3600          # 1h（比 4h 保守，配合 stale guard）
 ENABLED = True
-CACHE_SCHEMA_VERSION = "s2"
+CACHE_SCHEMA_VERSION = "s2-contract-v2"
 GOAL_COMPLETE_REASON = "goal_complete"
 
 _memory: dict[str, dict] = {}   # 内存级缓存 {key: {"data": ..., "created_at": ...}}

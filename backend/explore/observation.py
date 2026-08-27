@@ -6,6 +6,7 @@ observation.py — 状态观察（R3 拆分自 explore_flow）
 import hashlib
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from time import perf_counter
@@ -517,6 +518,7 @@ class ExploreState:
     done: bool = False                 # 探索是否完成
     termination_reason: TerminationReason | None = None
     goal_contract: "GoalContract | None" = None  # 静态契约；进度始终动态推导
+    current_milestone_id: str | None = None   # S2-P1：当前里程碑（provenance）
     # A4.3：当前 observation 的 interaction root 描述（AX dialog 时
     # source="ax"；DOM overlay bridge 时 source="dom_overlay"）。只进
     # observation metadata，不冒充 AX 语义。
@@ -703,6 +705,9 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     state.elements = elements
     obs_id = f"obs{len(state.observations) + 1}"
     state.current_obs = obs_id   # R3：current_obs 唯一事实源
+    # S2-P3：contenteditable DOM Bridge——AX 未暴露的富文本输入框投影为
+    # textbox（在加 obs 前缀前追加，ref 用 ce 前缀避免与 AX 元素冲突）
+    _bridge_contenteditable(page, elements)
     # G1：state-scoped ref——元素 ref 从页面级 "e1" 升级为状态级 "obs3:e1"。
     # Planner 引用 obs3:e17 时，系统知道 belongs_to=obs3（state identity）。
     for element in state.elements:
@@ -796,6 +801,130 @@ def _record_page(state: ExploreState, page, snapshot: str | None = None) -> None
     assert all(":" in e["ref"] for e in state.elements), (
         f"_record_page 后存在无 state 前缀的 ref: {state.elements[:5]}")
     return obs_id
+
+
+def _bridge_contenteditable(page, elements: list[dict]) -> None:
+    """S2-P3：DOM 批量查询补充 AX 未暴露的 contenteditable → textbox。
+
+    仅接受：可见、未禁用、未被现有 textbox 元素覆盖、可生成全局唯一 selector。
+    名称序：aria-label → placeholder → 关联 label → 最近父容器短标题。
+    selector 序：data-test* → id → 页面唯一 contenteditable；否则拒绝
+    （绝不使用 nth()）。CSS 由 Observation 生成，LLM 无权生成。
+    失败静默（bridge 是补充，不影响 AX 主链）。
+    """
+    try:
+        found = page.evaluate("""() => {
+            const base = '[contenteditable="true"], [contenteditable=""]';
+            const visible = Array.from(document.querySelectorAll(base)).filter(el => {
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0
+                    && el.getClientRects().length > 0
+                    && style.display !== 'none' && style.visibility !== 'hidden'
+                    && el.getAttribute('aria-disabled') !== 'true'
+                    && !el.closest('[inert]');
+            });
+            return visible.map(el => {
+                const esc = value => CSS.escape(String(value));
+                // 名称提取优先级（S2-P3 评审）：
+                //   aria-label → aria-labelledby → placeholder → label → generic nearby →
+                //   framework fallback（el-form-item__label）→ "输入框"
+                const labelledBy = (el.getAttribute('aria-labelledby') || '')
+                    .split(/\\s+/).filter(Boolean)
+                    .map(id => document.getElementById(id)?.textContent?.trim() || '')
+                    .filter(Boolean).join(' ');
+                const label = el.closest('label') || (el.id
+                    ? document.querySelector(`label[for="${esc(el.id)}"]`)
+                    : null);
+                let nearby = '';
+                const ancLabel = el.parentElement
+                    ? el.parentElement.querySelector('.rich-prompt-input__placeholder, [class*="placeholder"]')
+                    : null;
+                // 占位符 div 只当短标题用（>20 字是长提示语，不是字段名——
+                // 留给 framework fallback 的 el-form-item__label）
+                if (ancLabel) {
+                    const t = ancLabel.textContent.trim();
+                    if (t.length <= 20) nearby = t;
+                }
+                let anc = el.parentElement;
+                for (let depth = 0; anc && depth < 3 && !nearby; depth++, anc = anc.parentElement) {
+                    if (anc.querySelector(':scope > span')) {
+                        nearby = anc.querySelector(':scope > span').textContent.trim();
+                    }
+                    if (!nearby && anc.previousElementSibling) {
+                        nearby = anc.previousElementSibling.textContent.trim();
+                    }
+                }
+                if (!nearby) {
+                    // Element Plus compatibility fallback（不升级为核心规则）
+                    const formLabel = el.closest('.el-form-item');
+                    if (formLabel) {
+                        const fl = formLabel.querySelector('.el-form-item__label');
+                        if (fl) nearby = fl.textContent.trim();
+                    }
+                }
+                // 名称清洗：去掉尾部冒号/星号/空白（"提示词:" → "提示词"）
+                nearby = nearby.replace(/[:：*]+$/, '').trim();
+                let selector = '';
+                for (const attr of ['data-testid', 'data-test', 'data-qa', 'data-cy']) {
+                    const value = el.getAttribute(attr);
+                    if (!value) continue;
+                    const candidate = `[${attr}="${esc(value)}"]`;
+                    if (document.querySelectorAll(candidate).length === 1) {
+                        selector = candidate;
+                        break;
+                    }
+                }
+                if (!selector && el.id) {
+                    const candidate = `#${esc(el.id)}`;
+                    if (document.querySelectorAll(candidate).length === 1) {
+                        selector = candidate;
+                    }
+                }
+                if (!selector && visible.length === 1) {
+                    // :visible 防止隐藏 contenteditable 让运行时 locator 重新变多。
+                    selector = '[contenteditable="true"]:visible, '
+                        + '[contenteditable=""]:visible';
+                }
+                return {
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    labelledBy,
+                    placeholder: el.getAttribute('placeholder') || '',
+                    labelText: label ? label.textContent.trim() : '',
+                    nearby: nearby.slice(0, 20),
+                    selector,
+                };
+            });
+        }""")
+    except Exception:
+        return
+    candidates = [item for item in (found or []) if item.get("selector")]
+    existing_counts = Counter(
+        str(e.get("name") or "").strip().casefold()
+        for e in elements if e.get("role") == "textbox"
+    )
+    for item in candidates:
+        name = (item["ariaLabel"] or item["labelledBy"] or item["placeholder"]
+                or item["labelText"] or item["nearby"] or "输入框").strip()
+        normalized_name = name.casefold()
+        if not name:
+            continue
+        # name 只能用于证明“整组已被 AX 覆盖”。如果同名 DOM/AX 数量不等，
+        # 无法判断哪个底层节点缺失，Restrict-first：整组拒绝，不误补/误删。
+        if existing_counts.get(normalized_name, 0):
+            continue
+        element = {
+            "ref": f"ce{len(elements) + 1}",   # 占位；_record_page 加 obs 前缀
+            "role": "textbox",
+            "name": name,
+            "kind": "action",
+            "disabled": False,
+            "context_role": None,
+            "context_name": None,
+            "parent_ref": None,
+        }
+        element["css"] = item["selector"]
+        elements.append(element)
 
 
 def _safe_title(page) -> str:

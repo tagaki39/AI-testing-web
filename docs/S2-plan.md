@@ -41,7 +41,7 @@ S2 不做：
   ↓
 数据提取与脱敏
   ↓
-Goal Contract（一次生成；只描述阶段，不生成 locator/ref/DSL）
+Goal Contract（请求开始时生成，最多 1 次受限重试；只描述阶段，不生成 locator/ref/DSL）
   ↓
 derive_milestone_progress(contract, state)（纯函数）
   ↓
@@ -124,7 +124,9 @@ Milestone: id / type / intent / target_terms / field_terms / value_ref / executi
 GoalContract: version / milestones
 ```
 
-允许的 milestone type：`auth / navigate / input / ready / side_effect / verify`。
+允许的 milestone type：
+`auth / navigate / input / action / terminal_action / verify`。
+`READY_FOR_RUNNER` 是 Progress 派生状态，不是 LLM 可输出的 milestone。
 Contract 不得包含 target_ref、CSS、XPath、role/name locator 或 DSL steps。
 
 非敏感 literal 必须是原始目标的原文子串，否则拒绝或降级为无默认值变量。
@@ -133,9 +135,9 @@ Contract 不得包含 target_ref、CSS、XPath、role/name locator 或 DSL steps
 
 - auth：verified login transition
 - navigate：当前 Observation 或 verified transition 的目标语义
-- input：成功 history/pre_action 的 fill
-- ready：当前 Observation 中已启用的目标动作
-- side_effect：Explorer 只推导到 ready
+- input：带 `milestone_id + value_ref + ok=true` 的成功 fill evidence
+- action：verified transition（例如 Add to cart）
+- terminal_action：当前 Observation 中目标动作可接管时派生 READY_FOR_RUNNER
 - verify：Runner postcondition
 
 接管后删除 `_FURTHER_ACTION_RE` 和
@@ -169,7 +171,8 @@ selector 顺序：test-id 属性 → id → 页面唯一 contenteditable；否�
 
 ### S2-P4 — Runner-only terminal side effect
 
-Explorer：登录 → 导航 → 填值 → 验证终端按钮 ready → `READY_FOR_RUNNER`。
+Explorer：登录 → 导航 → 填值 → 验证 `terminal_action` 可接管 →
+`READY_FOR_RUNNER`。
 
 Runner：只点击一次终端动作，第一阶段只验证任务卡/排队中/生成中状态，
 不等待最终资源完全生成。

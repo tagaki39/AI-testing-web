@@ -1,12 +1,48 @@
 # Execution Log（执行日志）
 
+## 2026-08-27 — Contract v2 语义收敛 + S2-P3 bridge 加固
+
+### 结果
+
+- Goal Contract 最多执行 1 次 constrained retry；两次仍不合法时 fail-closed，
+  不再静默回退旧 Completion。Contract 调用计入探索的总 `llm_calls`，并拆分
+  暴露 `contract_llm_calls` / `decision_llm_calls`。
+- Contract 升级为 `s2.v2`，移除 LLM-visible 的 `ready/side_effect`，改为
+  `action/terminal_action`；缓存 schema 同步升级，旧轨迹自动失效。
+- 增加 type-specific invariant：一个 milestone 一个 obligation；每个 input
+  只能有一个字段和一个 value_ref；auth/navigate/action 不携带输入值，
+  terminal_action/verify 强制 runner。
+- 增加薄 goal-coverage invariant：login → auth、add_to_cart → explorer action、
+  checkout/generate/submit/publish/pay/delete → terminal_action；缺失、重复、
+  类型错误和已支持语义的错误顺序全部 fail-closed。
+- Contract 里程碑完成不再绕过数量、购物车终态和 verified transition 等硬约束。
+  成功动作把 `milestone_id + ok` 固化进 history；input progress 只认
+  milestone_id/action/value/ok，不再做字段同义词回推。
+- 首个及连续 `navigate` 均保留：没有 entry URL 证据时不猜测它是冗余步骤。
+- `terminal_action` 与 `verify` 强制 `execution=runner`。Explorer 只产生
+  `READY_FOR_RUNNER` readiness；终端动作历史和任意页面元素都不能冒充成功。
+- Runner 接管证据不足时以 `MILESTONE_STALLED` 停止，禁止 Explorer 继续猜测
+  并误触终端副作用。动作语义由 Contract/Explorer 共用的小型注册表维护。
+- P3 contenteditable bridge 只接受可见、未禁用且全局唯一的 test-id/id selector；
+  页面唯一 fallback 使用 `:visible`，同名多节点不再按 name 互相吞掉，
+  AX/DOM 部分重叠时 fail-closed。
+
+### 回归
+
+- 新增 Contract v2/Progress 与 contenteditable bridge 定向测试，覆盖合法但语义
+  缺步骤、原子性、错误顺序、错误字段、Runner 边界、受限重试、隐藏节点、
+  同名多输入框和 selector 唯一性。
+- 最终完整后端测试：`210 passed in 20.90s`。
+
+---
+
 ## 2026-08-27 — S2-P1：Goal Contract + Milestone Progress
 
 ### 实现
 
-- **Goal Contract 一次生成**（build_goal_contract，LLM 1 次调用）：描述目标阶段
-  （auth/navigate/input/ready/side_effect/verify），不生成 locator/ref/DSL；
-  失败不重试不猜测 → 降级为无 contract（三态 Completion 兜底）。
+- **Goal Contract 请求开始时生成**：描述目标阶段
+  （auth/navigate/input/ready/side_effect/verify），不生成 locator/ref/DSL。
+  本节记录的是最初实现；当前重试与失败策略以上方“稳定性收紧”为准。
 - **derive_milestone_progress 纯函数接管完成判定**：全部 milestone 完成 =
   READY（auto_finish）；当前里程碑未完成 = 继续探索。替换"login verified →
   直接收尾"的截断行为。
@@ -21,7 +57,8 @@
 - `_norm` 去全部空白（"登 录" 与 "登录" 等价——auth 判定漏配）。
 - navigate = 历史事实（探索发现过目标页即完成，不锚定当前状态；入口
   goto 的初始 obs 也算）；≤2 字动词性 term（"打开"）过滤后视为已通过。
-- verify 与已完成里程碑业务关联（"验证登录成功" ← auth 完成后即满足）。
+- 本条属于最初实现；当前 verify 只由 Runner postcondition 判定，Explorer
+  不再通过已完成里程碑或任意页面元素推断验证成功。
 - LLM 复制整句为 term 时元素名反向子串兜底。
 
 ### 回归

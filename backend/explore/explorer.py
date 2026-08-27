@@ -11,12 +11,17 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 from execution.action_executor import execute_action
-from goal_contract import GoalContractError, build_goal_contract
+from goal_semantics import (
+    ACTION_ALIASES,
+    FIELD_ALIASES_BY_KEY,
+    GOAL_SEMANTIC_PATTERNS,
+    normalize_semantic_text,
+)
 from .observation import (
     ExploreState, TerminationReason, _observe, _observe_after_action,
     _record_page,
 )
-from .progress import GoalProgress, derive_milestone_progress
+from .progress import derive_milestone_progress
 from .action_space import (
     ACTION_CAPABILITIES, _build_action_space, _locator_for_element,
     _validate_action_target,
@@ -138,22 +143,88 @@ def _deterministic_singleton_decision(action_space: list[dict]) -> dict | None:
         return None
     return {"action": "click", "target_ref": element["ref"]}
 
+
+def _element_semantic_text(element: dict | None) -> str:
+    element = element or {}
+    return " ".join(filter(None, [
+        str(element.get("name") or ""),
+        str(element.get("context_name") or ""),
+        str(element.get("scope_has_text") or ""),
+    ]))
+
+
+def _validate_milestone_decision(
+    state: "ExploreState", decision: dict, element: dict | None,
+) -> str | None:
+    """动作生成时绑定并校验当前 obligation；history 不再事后猜归属。"""
+    if state.goal_contract is None or decision.get("action") in {"finish", "back"}:
+        return None
+    progress = derive_milestone_progress(state.goal_contract, state)
+    milestone = progress.current_milestone
+    if milestone is None:
+        return None
+
+    action = decision.get("action")
+    element_text = _element_semantic_text(element)
+    if milestone.type == "input":
+        if action != "fill" or decision.get("value") != milestone.value_ref:
+            return (f"当前 {milestone.id} 是 input，只允许 fill "
+                    f"{milestone.value_ref}")
+        match = _PLACEHOLDER_RE.fullmatch(milestone.value_ref or "")
+        key = match.group(1) if match else ""
+        aliases = FIELD_ALIASES_BY_KEY.get(key, ())
+        expected = tuple(milestone.field_terms) + tuple(aliases)
+        haystack = normalize_semantic_text(element_text)
+        if not any(normalize_semantic_text(term) in haystack for term in expected):
+            return (f"当前 {milestone.id} 要求字段 {milestone.field_terms[0]!r}，"
+                    f"目标元素 {element_text!r} 不匹配")
+        return None
+
+    if milestone.type == "auth":
+        if action not in {"click", "press"} \
+                or not any(normalize_semantic_text(term)
+                           in normalize_semantic_text(element_text)
+                           for term in tuple(milestone.target_terms)
+                           + ACTION_ALIASES["login"]):
+            return f"当前 {milestone.id} 是 auth，只允许执行登录提交动作"
+        return None
+
+    if milestone.type in {"navigate", "action"}:
+        if action not in {"click", "press"} \
+                or not _matches_milestone_target(element_text, milestone.target_terms):
+            return (f"当前 {milestone.id} 是 {milestone.type}，目标元素必须匹配 "
+                    f"{milestone.target_terms[0]!r}")
+        return None
+
+    return f"当前 {milestone.id} 必须由 Runner 接管，Explorer 禁止执行"
+
+
+def _matches_milestone_target(value: object, terms: list[str]) -> bool:
+    normalized = normalize_semantic_text(value)
+    if any(normalize_semantic_text(term) in normalized for term in terms):
+        return True
+    return any(
+        any(normalize_semantic_text(term) in normalize_semantic_text(alias)
+            or normalize_semantic_text(alias) in normalize_semantic_text(term)
+            for term in terms)
+        and any(normalize_semantic_text(alias) in normalized for alias in aliases)
+        for aliases in ACTION_ALIASES.values()
+    )
+
 # ── GQ：目标动作表（保守 allowlist，人为维护）──────────────────────────
 # 用于两处：① 探索完成性校验（goal 要求操作时，0/1 步宣告完成无效）
 # ② 生成期目标覆盖检查（ai_agent._check_goal_coverage 引用同表）。
 # 只认明确动作动词；goal 不命中任何 pattern → 不检查（fail-open）。
 GOAL_ACTION_PATTERNS: dict[str, "re.Pattern"] = {
-    "add_to_cart": re.compile(r"(加入购物车|加购|add\s+to\s+cart)", re.IGNORECASE),
-    "login": re.compile(r"(登录|login|sign\s*in)", re.IGNORECASE),
-    "checkout": re.compile(r"(结算|下单|checkout)", re.IGNORECASE),
+    label: GOAL_SEMANTIC_PATTERNS[label]
+    for label in ("add_to_cart", "login", "checkout")
 }
 
 # 动作 label → 探索 history 中必须出现的关键词（target name，casefold 匹配）
 # 真实网站验证（xywhaigc 登录页按钮是中文"登录"）：必须覆盖中英文。
 _ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "add_to_cart": ("add to cart", "加入购物车", "加入購物車"),
-    "login": ("login", "sign in", "登录", "登陆", "登入"),
-    "checkout": ("checkout", "结算", "结账", "去结算"),
+    label: ACTION_ALIASES[label]
+    for label in ("add_to_cart", "login", "checkout")
 }
 
 # goal 中的"进一步动作"动词（三必选之外的多阶段信号）——
@@ -241,10 +312,14 @@ class CompletionStatus:
     """
 
     def __init__(self, ready: bool, reason: str | None = None,
-                 unknown: bool = False):
+                 unknown: bool = False, *, halt: bool = False,
+                 termination_reason: TerminationReason =
+                 TerminationReason.GOAL_COMPLETE):
         self.ready = ready
         self.reason = reason
         self.unknown = unknown
+        self.halt = halt
+        self.termination_reason = termination_reason
 
 
 def _completion_status(state: "ExploreState") -> CompletionStatus:
@@ -254,18 +329,34 @@ def _completion_status(state: "ExploreState") -> CompletionStatus:
     不是"历史上发生过"——进过购物车又离开 ≠ 完成（离开后 StateGraph
     会包含乱走边，Planner 被误导选入计划 → 断言 cursor 错位）。
     """
-    # S2-P1：Goal Contract 存在 → 完成判定由 milestone 进度接管
-    #（全部 milestone 完成 = READY；否则当前里程碑未完成 = 继续探索）。
-    # 这是对"login 验证后 auto_finish 截断后续目标"的正式替代。
+    # S2-P1：Contract 负责证明阶段覆盖，但不能绕过旧有的数量、购物车、
+    # verified transition 等硬门。Runner milestone 只到 readiness，不冒充完成。
+    contract_complete = False
     if state.goal_contract is not None:
         progress = derive_milestone_progress(state.goal_contract, state)
-        if progress.complete:
-            return CompletionStatus(ready=True, reason="goal milestones complete")
+        if progress.ready_for_runner:
+            return CompletionStatus(
+                ready=True,
+                reason="Explorer 证据已齐备，等待 Runner 执行终端动作/断言",
+                termination_reason=TerminationReason.READY_FOR_RUNNER,
+            )
         cur = progress.current_milestone
-        return CompletionStatus(
-            ready=False,
-            reason=(f"当前里程碑 {cur.id}（{cur.type}: {cur.intent}）未完成"
-                    "——继续探索该阶段"))
+        if cur is not None and cur.execution == "runner":
+            # Restrict-first：Contract 已进入 Runner 边界但目标动作尚未形成
+            # 可证明 readiness 时，禁止 Explorer 继续猜测并误触副作用。
+            return CompletionStatus(
+                ready=False,
+                halt=True,
+                reason=(f"Runner 里程碑 {cur.id}（{cur.type}: {cur.intent}）"
+                        "缺少当前页面可证明的接管证据"),
+                termination_reason=TerminationReason.MILESTONE_STALLED,
+            )
+        if not progress.complete:
+            return CompletionStatus(
+                ready=False,
+                reason=(f"当前里程碑 {cur.id}（{cur.type}: {cur.intent}）未完成"
+                        "——继续探索该阶段"))
+        contract_complete = True
     if not goal_requires_actions(state.goal):
         return CompletionStatus(ready=True, reason="goal 无操作要求")
     if state.step_count < 2:
@@ -335,6 +426,9 @@ def _completion_status(state: "ExploreState") -> CompletionStatus:
     # 目标完全属于确定性支持族 → READY（auto_finish）；
     # 目标含未建模的后续操作（进入 X 页面/填写/生成…）→ UNKNOWN——
     # 不 auto_finish，把"是否完成"交给 LLM 语义判断。
+    if contract_complete:
+        return CompletionStatus(
+            ready=True, reason="goal milestones and hard invariants complete")
     if not _goal_fully_covered_by_deterministic_model(state.goal):
         return CompletionStatus(
             ready=False, unknown=True,
@@ -797,7 +891,8 @@ def _within_origin(url: str, entry_url: str) -> bool:
 # ── 主入口 ──────────────────────────────────────────────────────────────────────
 
 def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = None,
-            contract: "GoalContract | None" = None) -> dict:
+            contract: "GoalContract | None" = None,
+            initial_llm_calls: int = 0) -> dict:
     """bounded exploration 主循环。
 
     参数:
@@ -807,9 +902,9 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                      签名: llm_call(prompt, system_prompt) -> str
       runtime_inputs: 本地运行时值（账号密码等，fill 时注入，不进 LLM）
       contract:      S2 Goal Contract（一次生成的目标阶段契约）。存在时
-                     完成判定由 derive_milestone_progress 接管（全部
-                     milestone 完成 → READY），并为决策提供当前里程碑
-                     上下文；缺失（生成失败降级）时回退三态 Completion。
+                      milestone 覆盖与旧有硬约束共同决定完成状态。
+      initial_llm_calls: 进入 Explorer 前已消耗的 Contract LLM 调用数，
+                      纳入同一个 MAX_LLM_CALLS 预算。
 
     返回:
       {
@@ -834,6 +929,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             # Data Grounding：模型只能引用这些 ${key}（keys 不含真实值）
             input_keys=set(runtime_inputs) if runtime_inputs else set(),
             goal_contract=contract,   # S2-P1：静态契约；进度始终动态推导
+            llm_calls=max(0, initial_llm_calls),
         )
         t0 = perf_counter()
         page.goto(entry_url, wait_until="domcontentloaded")
@@ -856,13 +952,30 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             # Planner 被乱走边误导选入计划 → 断言 cursor 错位）
             completion = _completion_status(state)
             if completion.ready:
-                state.terminate(TerminationReason.GOAL_COMPLETE)
+                state.terminate(completion.termination_reason)
                 state.history.append({
                     "action": "auto_finish",
                     "observation_ref": state.current_obs,
                     "reason": completion.reason,
                 })
                 break
+            if completion.halt:
+                state.terminate(completion.termination_reason)
+                state.history.append({
+                    "action": "milestone_stalled",
+                    "observation_ref": state.current_obs,
+                    "reason": completion.reason,
+                })
+                break
+            # S2-P1 provenance：当前里程碑（执行动作时绑定到 history）
+            if state.goal_contract is not None:
+                _progress = derive_milestone_progress(state.goal_contract, state)
+                state.current_milestone_id = (
+                    _progress.current_milestone.id
+                    if _progress.current_milestone else None
+                )
+            else:
+                state.current_milestone_id = None
             # R3：ActionSpace——LLM 只能从"当前可操作"的候选中选
             #（模态框遮挡的 Add to cart 不进入候选，模型没权限选错）
             action_space = _build_action_space(state)
@@ -880,6 +993,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             # finish 判定不在此路径：完成校验由探索结束的
             # _validate_completion 兜底（单候选多做一步无害）。
             decision = _deterministic_singleton_decision(action_space)
+            deterministic_decision = decision is not None
             if decision is not None:
                 decision_error = None
             else:
@@ -898,6 +1012,24 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                 # R3（评审瘦身）：拒绝不设单独 stalled 机制——统一
                 # SafetyController 语义：llm_calls 预算耗尽即停（bounded）。
                 # 候选表已过滤黑名单 ref，模型有足够空间转向合法动作。
+                continue
+
+            decision_element = next((
+                e for e in action_space
+                if e.get("ref") == decision.get("target_ref")
+            ), None)
+            milestone_error = _validate_milestone_decision(
+                state, decision, decision_element)
+            if milestone_error is not None:
+                state.history.append({
+                    "url": state.current_url,
+                    "action": "decision_rejected",
+                    "milestone_id": state.current_milestone_id,
+                    "error": milestone_error,
+                })
+                if deterministic_decision:
+                    state.terminate(TerminationReason.MILESTONE_STALLED)
+                    break
                 continue
 
             if decision.get("exploration_complete") or decision.get("action") == "finish":
@@ -946,6 +1078,8 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                         "action": decision.get("action"),
                         "target_ref": ref,
                         "target": target,
+                        "milestone_id": state.current_milestone_id,
+                        "ok": False,
                         "error": f"LOCATOR_FAILED: {str(exc)[:100]}",
                     })
             if decision.get("action") == "back" or locator is not None:
@@ -963,6 +1097,11 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                         "target_ref": ref,
                         "target": target,          # 解析后的 target（Planner 可读）
                         "value": decision.get("value"),
+                        # S2-P1 provenance：该动作为哪个里程碑执行——
+                        # Progress 按 typed execution evidence 推导，
+                        # 不事后 NLP 重猜（"账号" vs "账户"）
+                        "milestone_id": state.current_milestone_id,
+                        "ok": True,
                     })
                 else:
                     if from_obs:
@@ -972,6 +1111,8 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                         "action": decision.get("action"),
                         "target_ref": ref,
                         "target": target,
+                        "milestone_id": state.current_milestone_id,
+                        "ok": False,
                         "error": (f"{result.code}: {result.message}"
                                   if result.code else (result.message or "")),
                     })
@@ -1052,6 +1193,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
                 (element or {}).get("name") if element else None,
                 pending_actions)
             if edge:
+                edge["milestone_id"] = state.current_milestone_id
                 state.transitions.append(edge)
 
             # origin 守卫（第 6 项）：点击跨域链接（文档/GitHub/外部认证）
@@ -1081,6 +1223,8 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         "history": state.history,
         "steps_used": state.step_count,
         "llm_calls": state.llm_calls,
+        "contract_llm_calls": max(0, initial_llm_calls),
+        "decision_llm_calls": max(0, state.llm_calls - max(0, initial_llm_calls)),
         "done": state.done,
         "termination_reason": (
             state.termination_reason.value if state.termination_reason else None

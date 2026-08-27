@@ -68,6 +68,7 @@ class GraphElement(DSLModel):
     verified: bool = False
     identity: dict | None = None
     scope_has_text: str | None = None
+    css: str | None = None   # S2-P3：Observation 生成的稳定 CSS（contenteditable bridge）
 
 
 class GraphObservation(DSLModel):
@@ -123,6 +124,7 @@ class StateGraph(DSLModel):
                         verified=e.get("verified", False),
                         scope_has_text=e.get("scope_has_text"),
                         identity=e.get("identity"),   # A4.2：稳定业务 identity
+                        css=e.get("css"),             # S2-P3：contenteditable bridge
                     )
                     for e in o.get("elements", [])
                 ],

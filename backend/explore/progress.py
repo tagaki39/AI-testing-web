@@ -8,11 +8,15 @@ from dataclasses import dataclass
 from typing import Literal
 
 from goal_contract import GoalContract, Milestone
+from goal_semantics import ACTION_ALIASES
 
 
-MilestoneStatus = Literal["completed", "current", "pending"]
+MilestoneStatus = Literal[
+    "completed", "current", "ready_for_runner", "pending",
+]
 
 _AUTH_TERMS = ("login", "sign in", "登录", "登陆", "登入")
+_ACTION_TERM_GROUPS = tuple(ACTION_ALIASES.values())
 
 
 @dataclass(frozen=True)
@@ -28,10 +32,12 @@ class GoalProgress:
     milestones: tuple[MilestoneProgress, ...]
     current_milestone: Milestone | None
     complete: bool
+    ready_for_runner: bool = False
 
     def as_dict(self) -> dict:
         return {
             "complete": self.complete,
+            "ready_for_runner": self.ready_for_runner,
             "current_milestone": (
                 self.current_milestone.id if self.current_milestone else None
             ),
@@ -58,22 +64,23 @@ def _contains_term(value: object, terms: list[str] | tuple[str, ...]) -> bool:
     return any(_norm(term) in haystack for term in terms if _norm(term))
 
 
-def _contains_reverse_term(value: object, terms: list[str] | tuple[str, ...]) -> bool:
-    """反向包含：文本行（元素名/URL 片段，≥2 字）是某个 term 的子串。
-
-    navigate 场景：LLM 复制整句为 term（"进入图片生成页面"），
-    页面元素名是它的子串（"图片生成"）——正向匹配失败时用反向兜底。
-    原始文本按行分割（_norm 去空白后无法分词，不能复用）。
-    """
-    lines = [line.strip() for line in str(value or "").splitlines()
-             if len(line.strip()) >= 2]
-    normed_terms = [t for t in (_norm(term) for term in terms) if t]
-    return any(
-        _norm(line) in term
-        for term in normed_terms
-        for line in lines
-        if _norm(line)
-    )
+def _matches_action_terms(value: object,
+                          terms: list[str] | tuple[str, ...]) -> bool:
+    """动作名受控同义匹配；只用于当前可操作元素，不扩散到页面证据。"""
+    if _contains_term(value, terms):
+        return True
+    normalized_terms = tuple(_norm(term) for term in terms if _norm(term))
+    haystack = _norm(value)
+    for group in _ACTION_TERM_GROUPS:
+        aliases = tuple(_norm(alias) for alias in group)
+        goal_in_group = any(
+            alias in term or term in alias
+            for term in normalized_terms
+            for alias in aliases
+        )
+        if goal_in_group and any(alias in haystack for alias in aliases):
+            return True
+    return False
 
 
 def _verified_transitions(state) -> list[dict]:
@@ -83,15 +90,6 @@ def _verified_transitions(state) -> list[dict]:
     ]
 
 
-def _ref_elements(state) -> dict[str, dict]:
-    return {
-        element.get("ref", ""): element
-        for observation in state.observations
-        for element in observation.get("elements", [])
-        if element.get("ref")
-    }
-
-
 def _current_observation(state) -> dict:
     return next((
         observation for observation in state.observations
@@ -99,83 +97,88 @@ def _current_observation(state) -> dict:
     ), {})
 
 
-def _observation_evidence_text(observation: dict) -> str:
-    parts = [observation.get("url", ""), observation.get("title", "")]
-    for element in observation.get("elements", []):
-        if element.get("kind") != "action":
-            parts.extend([
-                element.get("name", ""), element.get("text", ""),
-                element.get("context_name", ""),
-            ])
-    return "\n".join(str(part) for part in parts if part)
-
-
-def _action_text(history_item: dict, ref_map: dict[str, dict]) -> str:
-    element = ref_map.get(history_item.get("target_ref") or "", {})
-    target = history_item.get("target") or {}
-    if isinstance(target, dict):
-        target_text = " ".join(str(value) for value in target.values())
-    else:
-        target_text = str(target)
-    return " ".join(filter(None, [
-        str(element.get("name") or ""),
-        str(element.get("context_name") or ""),
-        target_text,
-    ]))
-
-
-def _derive_fact(milestone: Milestone, state,
-                 completed_terms: tuple[str, ...] = ()) -> tuple[bool, tuple[str, ...]]:
+def _derive_fact(milestone: Milestone, state) -> tuple[bool, tuple[str, ...]]:
     transitions = _verified_transitions(state)
-    ref_map = _ref_elements(state)
-    current = _current_observation(state)
 
     if milestone.type == "auth":
         terms = tuple(milestone.target_terms) or _AUTH_TERMS
         matched = next((
             transition for transition in transitions
-            if _contains_term(transition.get("target_name"), terms + _AUTH_TERMS)
+            if transition.get("milestone_id") == milestone.id
+            and _contains_term(transition.get("target_name"), terms + _AUTH_TERMS)
         ), None)
         return (matched is not None, (f"transition:{matched.get('id', '?')}",)
                 if matched else ())
 
     if milestone.type == "navigate":
-        # 动词性导航 term（"打开"等 ≤2 字）是入口描述，不构成导航目标——
-        # 过滤后为空 → 视为已通过（不阻塞进度）
-        meaningful = [t for t in milestone.target_terms if len(_norm(t)) > 2]
-        if not meaningful:
-            return True, ("intrinsic",)
-        # navigate 是历史事实：探索发现过目标页即完成（不锚定当前状态——
-        # 离开目标页不应撤销"曾到达"的完成；入口 goto 的初始 obs 也算）
+        # typed evidence：navigate 完成 = 已真实到达目标页（URL/title
+        # 页面身份证据），且只认入口 obs 或 verified transition.to 的 obs
+        #（侧边栏菜单词一直存在 ≠ 到达——不匹配任意元素文本）。
         for observation in state.observations:
-            text = _observation_evidence_text(observation)
-            if _contains_term(text, meaningful) \
-                    or _contains_reverse_term(text, meaningful):
+            is_entry = observation["id"] == (state.observations[0].get("id") if state.observations else None)
+            is_reached = any(
+                t.get("to") == observation["id"] and t.get("from") != t.get("to")
+                for t in transitions
+            )
+            if not (is_entry or is_reached):
+                continue
+            text = f"{observation.get('url', '')}\n{observation.get('title', '')}"
+            if _contains_term(text, milestone.target_terms):
                 return True, (f"observation:{observation['id']}",)
+        # verified 导航 transition（点击导航项含目标词 → to 即目标页）
         matched = next((
             transition for transition in transitions
-            if _contains_term(transition.get("target_name"), meaningful)
+            if transition.get("from") != transition.get("to")
+            and transition.get("milestone_id") == milestone.id
+            and _contains_term(transition.get("target_name"),
+                               milestone.target_terms)
         ), None)
         return (matched is not None, (f"transition:{matched.get('id', '?')}",)
                 if matched else ())
 
     if milestone.type == "input":
         for index, item in enumerate(state.history):
-            if item.get("action") != "fill" or item.get("error"):
-                continue
-            field_matches = not milestone.field_terms or _contains_term(
-                _action_text(item, ref_map), milestone.field_terms)
-            value_matches = not milestone.value_ref or \
-                item.get("value") == milestone.value_ref
-            if field_matches and value_matches:
+            # provenance 在动作执行成功时固化；不从字段同义词反推归属。
+            if item.get("milestone_id") == milestone.id \
+                    and item.get("action") == "fill" \
+                    and item.get("value") == milestone.value_ref \
+                    and item.get("ok") is True:
                 return True, (f"history:{index}",)
         return False, ()
 
-    if milestone.type == "ready":
+    if milestone.type == "action":
+        matched = next((
+            transition for transition in transitions
+            if transition.get("milestone_id") == milestone.id
+            and _matches_action_terms(
+                transition.get("target_name"), milestone.target_terms)
+        ), None)
+        return (matched is not None, (f"transition:{matched.get('id', '?')}",)
+                if matched else ())
+
+    if milestone.type == "terminal_action":
+        # Runner-only 里程碑永远不能由 Explorer history 标记完成。
+        return False, ()
+
+    if milestone.type == "verify":
+        # 验证结果只能由 Runner postcondition 产生，Explorer 不宣告通过。
+        return False, ()
+
+    return False, ()
+
+
+def _runner_readiness(milestone: Milestone, state) -> tuple[bool, tuple[str, ...]]:
+    """判断 Runner 是否已有足够输入接管，不把 readiness 冒充完成事实。"""
+    current = _current_observation(state)
+    if milestone.type == "verify":
+        # Planner 可以从当前 Observation 编译 postcondition；这不代表断言已通过。
+        return (bool(current), (f"observation:{state.current_obs}",)
+                if current else ())
+    if milestone.type == "terminal_action":
         matched = next((
             element for element in state.elements
             if element.get("kind") == "action" and not element.get("disabled")
-            and _contains_term(
+            and _matches_action_terms(
                 " ".join(filter(None, [
                     str(element.get("name") or ""),
                     str(element.get("context_name") or ""),
@@ -185,34 +188,6 @@ def _derive_fact(milestone: Milestone, state,
         ), None)
         return (matched is not None, (f"element:{matched.get('ref')}",)
                 if matched else ())
-
-    if milestone.type == "side_effect":
-        # P1 兼容桥：契约已经声明 runner-only；P4 接管前，现有 Explorer
-        # 仍可能执行该动作。这里只从成功 history 推导，不触发副作用。
-        for index, item in enumerate(state.history):
-            if item.get("error") or item.get("action") not in {
-                "click", "check", "select", "press",
-            }:
-                continue
-            if _contains_term(_action_text(item, ref_map), milestone.target_terms):
-                return True, (f"history:{index}",)
-        return False, ()
-
-    if milestone.type == "verify":
-        text = _observation_evidence_text(current)
-        if _contains_term(text, milestone.target_terms):
-            return True, (f"observation:{state.current_obs}",)
-        # 验证目标与已完成里程碑的业务关联：如"验证登录成功"——
-        # auth 登录完成后即满足（页面未必有"登录成功"文本）
-        if completed_terms and any(
-            _norm(term) in _norm(completed)
-            or _norm(completed) in _norm(term)
-            for term in milestone.target_terms
-            for completed in completed_terms
-        ):
-            return True, ("linked-milestone",)
-        return False, ()
-
     return False, ()
 
 
@@ -221,19 +196,35 @@ def derive_milestone_progress(contract: GoalContract, state) -> GoalProgress:
     progress: list[MilestoneProgress] = []
     current: Milestone | None = None
     blocked = False
-    completed_terms: list[str] = []
+    ready_for_runner = False
     for milestone in contract.milestones:
-        complete, evidence = _derive_fact(
-            milestone, state, tuple(completed_terms))
-        if not blocked and complete:
+        if blocked:
+            progress.append(MilestoneProgress(
+                milestone_id=milestone.id,
+                type=milestone.type,
+                status="pending",
+            ))
+            continue
+        if milestone.execution == "runner":
+            ready, evidence = _runner_readiness(milestone, state)
+            status = "ready_for_runner" if ready else "current"
+            current = milestone
+            ready_for_runner = ready
+            blocked = True
+            progress.append(MilestoneProgress(
+                milestone_id=milestone.id,
+                type=milestone.type,
+                status=status,
+                evidence=evidence if ready else (),
+            ))
+            continue
+        complete, evidence = _derive_fact(milestone, state)
+        if complete:
             status: MilestoneStatus = "completed"
-            completed_terms.extend(milestone.target_terms)
-        elif not blocked:
+        else:
             status = "current"
             current = milestone
             blocked = True
-        else:
-            status = "pending"
         progress.append(MilestoneProgress(
             milestone_id=milestone.id,
             type=milestone.type,
@@ -244,5 +235,5 @@ def derive_milestone_progress(contract: GoalContract, state) -> GoalProgress:
         milestones=tuple(progress),
         current_milestone=current,
         complete=current is None,
+        ready_for_runner=ready_for_runner,
     )
-

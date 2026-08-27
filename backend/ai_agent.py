@@ -1148,6 +1148,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     explore_result = None
     pages = []
     cache_hit = False
+    contract_llm_calls = 0
     auth_profile = "authenticated" if runtime_inputs else "anonymous"
     if entry_url:
         cached = cache_load(entry_url, auth_profile, explore_goal)
@@ -1157,18 +1158,21 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             cache_hit = True
         else:
             try:
-                # S2-P1：Goal Contract 一次生成（描述目标阶段，不生成 locator）。
-                # 失败不重试不猜测——降级为无 contract（三态 Completion 兜底）。
-                contract = None
-                try:
-                    contract = build_goal_contract(
-                        explore_goal, _call_llm,
-                        set(runtime_inputs) if runtime_inputs else None)
-                except Exception:
-                    contract = None
+                # S2-P1：Goal Contract 一次生成（内部 constrained retry ×1）。
+                # 两次不合法 → GoalContractError 向上抛（fail closed——
+                # 不静默降级旧 completion 模式，保持 S2 控制平面一致）。
+                def _contract_llm_call(*args, **kwargs):
+                    nonlocal contract_llm_calls
+                    contract_llm_calls += 1
+                    return _call_llm(*args, **kwargs)
+
+                contract = build_goal_contract(
+                    explore_goal, _contract_llm_call,
+                    set(runtime_inputs) if runtime_inputs else None)
                 explore_result = explore(
                     explore_goal, entry_url, _call_llm, runtime_inputs,
-                    contract=contract)
+                    contract=contract,
+                    initial_llm_calls=contract_llm_calls)
                 pages = explore_result.get("observations", [])   # ← observations 模型
                 # 保存前脱敏：history 的 value 还原为 ${var}（缓存不落盘真实凭据）
                 # S2-P0：StateGraph/history 是目标相关轨迹。只有代码可证明
@@ -1371,6 +1375,16 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             "pages_visited": len(pages),
             "steps_used": (explore_result or {}).get("steps_used", 0),
             "llm_calls": (explore_result or {}).get("llm_calls", 0),
+            "contract_llm_calls": (
+                (explore_result or {}).get("contract_llm_calls", 0)
+            ),
+            "decision_llm_calls": (
+                (explore_result or {}).get(
+                    "decision_llm_calls",
+                    max(0, (explore_result or {}).get("llm_calls", 0)
+                        - (explore_result or {}).get("contract_llm_calls", 0)),
+                )
+            ),
             "done": (explore_result or {}).get("done", False),
             "termination_reason": (
                 (explore_result or {}).get("termination_reason")

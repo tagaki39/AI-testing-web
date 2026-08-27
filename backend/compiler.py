@@ -66,7 +66,16 @@ def _element_to_locator(element) -> Locator:
         # A4.2：稳定 identity（data-product-id 等）确定性编译进 Locator——
         # 由观察元素携带（GraphElement.identity），LLM 不生成。
         identity = getattr(element, "identity", None)
-        return Locator(role=role, name=name, identity=identity)
+        # S2-P3：contenteditable bridge 元素无稳定 identity 时用 Observation
+        # 生成的 css（AX 语义定位对无 ARIA role 的 contenteditable 无效）。
+        css = getattr(element, "css", None)
+        if identity:
+            return Locator(role=role, name=name, identity=identity)
+        if css:
+            # DOM bridge 的 CSS 是 Observation 验证过的唯一定位证据；
+            # 不同时携带 role/name，避免 Resolver 以更高评分选中别的语义节点。
+            return Locator(css=css)
+        return Locator(role=role, name=name)
     if text:
         return Locator(text=text)
     raise ValueError("元素缺少可编译的定位信息")

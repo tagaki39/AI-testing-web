@@ -98,6 +98,12 @@ def _locator_for_element(page, element: dict) -> tuple[dict, dict | None, object
     ident = element.get("identity") or {}
     if ident.get("attr") and ident.get("value"):
         target["identity"] = ident
+    # S2-P3：contenteditable bridge 元素（无 ARIA role 的 textbox）——
+    # 用 Observation 生成的 css 定位（语义定位对 contenteditable 无效）
+    if not ident.get("attr") and element.get("css"):
+        # Bridge CSS 已在 Observation 阶段证明唯一；它必须是执行期唯一
+        # locator 证据，不能让 role/name 的高评分候选抢先命中别的节点。
+        target = {"css": element["css"]}
     scope = {"has_text": element["scope_has_text"]} if element.get("scope_has_text") else None
     _, locator = _resolve_locator(page, target, scope=scope)
     return target, scope, locator
