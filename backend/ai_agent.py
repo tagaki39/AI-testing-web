@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field, ValidationError
 from compiler import compile_targets
 from dsl import DSLCase, validate_case
 from explore_cache import is_cacheable_trace, load as cache_load, save as cache_save
+from goal_contract import build_goal_contract
 from explore import (
     GOAL_ACTION_PATTERNS, _ACTION_KEYWORDS, explore,
     missing_verified_goal_actions,
@@ -1156,7 +1157,18 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             cache_hit = True
         else:
             try:
-                explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
+                # S2-P1：Goal Contract 一次生成（描述目标阶段，不生成 locator）。
+                # 失败不重试不猜测——降级为无 contract（三态 Completion 兜底）。
+                contract = None
+                try:
+                    contract = build_goal_contract(
+                        explore_goal, _call_llm,
+                        set(runtime_inputs) if runtime_inputs else None)
+                except Exception:
+                    contract = None
+                explore_result = explore(
+                    explore_goal, entry_url, _call_llm, runtime_inputs,
+                    contract=contract)
                 pages = explore_result.get("observations", [])   # ← observations 模型
                 # 保存前脱敏：history 的 value 还原为 ${var}（缓存不落盘真实凭据）
                 # S2-P0：StateGraph/history 是目标相关轨迹。只有代码可证明
@@ -1364,6 +1376,11 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 (explore_result or {}).get("termination_reason")
             ),
             "transitions": (explore_result or {}).get("transitions", []),   # G2：状态转移边
+            # S2-P1：Goal Contract 与里程碑进度（诊断/验收）
+            "goal_contract": (explore_result or {}).get("goal_contract"),
+            "milestone_progress": (
+                (explore_result or {}).get("milestone_progress")
+            ),
         } if explore_result else None,
         "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）
         # G3/R1 指标（ROADMAP §8）：ref 校验覆盖 + 确定性编译产出

@@ -254,6 +254,18 @@ def _completion_status(state: "ExploreState") -> CompletionStatus:
     不是"历史上发生过"——进过购物车又离开 ≠ 完成（离开后 StateGraph
     会包含乱走边，Planner 被误导选入计划 → 断言 cursor 错位）。
     """
+    # S2-P1：Goal Contract 存在 → 完成判定由 milestone 进度接管
+    #（全部 milestone 完成 = READY；否则当前里程碑未完成 = 继续探索）。
+    # 这是对"login 验证后 auto_finish 截断后续目标"的正式替代。
+    if state.goal_contract is not None:
+        progress = derive_milestone_progress(state.goal_contract, state)
+        if progress.complete:
+            return CompletionStatus(ready=True, reason="goal milestones complete")
+        cur = progress.current_milestone
+        return CompletionStatus(
+            ready=False,
+            reason=(f"当前里程碑 {cur.id}（{cur.type}: {cur.intent}）未完成"
+                    "——继续探索该阶段"))
     if not goal_requires_actions(state.goal):
         return CompletionStatus(ready=True, reason="goal 无操作要求")
     if state.step_count < 2:
@@ -393,6 +405,7 @@ DECIDE_PROMPT = """你是 Web 页面探索器。目标：收集足够信息来�
 
 当前状态：
 - 用户目标: {goal}
+- 当前里程碑（S2：目标阶段进度——先完成当前里程碑再考虑后续）: {current_milestone}
 - 当前页面状态: {current_obs}（元素表属于此状态）
 - 当前 URL: {url}
 - 可用 Runtime Input Keys: {input_keys}
@@ -614,6 +627,19 @@ def _apply_modal_constraints(goal: str, state: "ExploreState",
 
 # ── observe / record ───────────────────────────────────────────────────────────
 
+def _milestone_prompt_context(state: "ExploreState") -> str:
+    """当前里程碑 → 决策上下文行（无 contract → 空占位）。"""
+    if state.goal_contract is None:
+        return "（无——按用户目标自由探索）"
+    progress = derive_milestone_progress(state.goal_contract, state)
+    cur = progress.current_milestone
+    if cur is None:
+        return "（全部里程碑已完成，等待完成判定）"
+    terms = "、".join(cur.target_terms) or "（无）"
+    return (f"{cur.id} {cur.type}: {cur.intent}（目标词: {terms}"
+            f"{'，执行: runner' if cur.execution == 'runner' else ''}）")
+
+
 def _decide(state: ExploreState, llm_call, elements: list[dict] | None = None) -> tuple[dict | None, str | None]:
     """调 LLM 决定下一步，返回 (决策, 校验错误)。
 
@@ -636,6 +662,7 @@ def _decide(state: ExploreState, llm_call, elements: list[dict] | None = None) -
 
     prompt = DECIDE_PROMPT.format(
         goal=state.goal,
+        current_milestone=_milestone_prompt_context(state),
         current_obs=state.current_obs or "?",
         url=state.current_url,
         input_keys=", ".join(sorted(state.input_keys)) if state.input_keys else "(无)",
@@ -769,7 +796,8 @@ def _within_origin(url: str, entry_url: str) -> bool:
 
 # ── 主入口 ──────────────────────────────────────────────────────────────────────
 
-def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = None) -> dict:
+def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = None,
+            contract: "GoalContract | None" = None) -> dict:
     """bounded exploration 主循环。
 
     参数:
@@ -778,6 +806,10 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
       llm_call:      LLM 调用函数（由 ai_agent 注入，避免循环依赖）
                      签名: llm_call(prompt, system_prompt) -> str
       runtime_inputs: 本地运行时值（账号密码等，fill 时注入，不进 LLM）
+      contract:      S2 Goal Contract（一次生成的目标阶段契约）。存在时
+                     完成判定由 derive_milestone_progress 接管（全部
+                     milestone 完成 → READY），并为决策提供当前里程碑
+                     上下文；缺失（生成失败降级）时回退三态 Completion。
 
     返回:
       {
@@ -801,6 +833,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
             entry_url=entry_url,
             # Data Grounding：模型只能引用这些 ${key}（keys 不含真实值）
             input_keys=set(runtime_inputs) if runtime_inputs else set(),
+            goal_contract=contract,   # S2-P1：静态契约；进度始终动态推导
         )
         t0 = perf_counter()
         page.goto(entry_url, wait_until="domcontentloaded")
@@ -1042,7 +1075,7 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         + state.timings["fixed_wait_ms"] + state.timings["observation_ms"]
     )
 
-    return {
+    result = {
         "observations": state.observations,
         "transitions": state.transitions,   # G2：状态转移边
         "history": state.history,
@@ -1054,3 +1087,10 @@ def explore(goal: str, entry_url: str, llm_call, runtime_inputs: dict | None = N
         ),
         "timings": state.timings,
     }
+    # S2-P1：契约与里程碑进度进结果（meta 展示/验收/诊断）
+    if state.goal_contract is not None:
+        result["goal_contract"] = json.loads(
+            state.goal_contract.model_dump_json(ensure_ascii=False))
+        result["milestone_progress"] = (
+            derive_milestone_progress(state.goal_contract, state).as_dict())
+    return result

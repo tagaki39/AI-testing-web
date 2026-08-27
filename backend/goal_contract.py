@@ -107,10 +107,11 @@ GOAL_CONTRACT_PROMPT = """把下面的已脱敏 Web 测试目标拆成顺序 mil
 1. milestone id 必须是连续的 m1..mN，最多 8 个。
 2. target_terms/field_terms 只能逐字复制目标中出现的非敏感短语，不得翻译或补写。
 3. value_ref 只能引用上面列出的 Runtime Input Keys；没有则为 null。
-4. 登录/认证用 auth；进入目标页面用 navigate；填写字段用 input；目标按钮可用用 ready。
+4. 登录/认证用 auth；进入目标页面用 navigate（target_terms 只填页面名词短语，如"图片生成"，禁止动词开头整句）；填写字段用 input；目标按钮可用用 ready。
 5. 生成、发布、支付、删除、提交等终端副作用用 side_effect，execution 必须是 runner。
 6. 结果验证用 verify；其余 milestone 的 execution 为 explorer。
 7. 禁止输出 target_ref、selector、css、xpath、locator、DSL step、真实凭据或目标外文本。
+8. 入口 URL 的打开（goto）不是 milestone——navigate 只描述入口之后的目标页面跳转。
 """
 
 

@@ -1,5 +1,47 @@
 # Execution Log（执行日志）
 
+## 2026-08-27 — S2-P1：Goal Contract + Milestone Progress
+
+### 实现
+
+- **Goal Contract 一次生成**（build_goal_contract，LLM 1 次调用）：描述目标阶段
+  （auth/navigate/input/ready/side_effect/verify），不生成 locator/ref/DSL；
+  失败不重试不猜测 → 降级为无 contract（三态 Completion 兜底）。
+- **derive_milestone_progress 纯函数接管完成判定**：全部 milestone 完成 =
+  READY（auto_finish）；当前里程碑未完成 = 继续探索。替换"login verified →
+  直接收尾"的截断行为。
+- **决策上下文加当前里程碑**：DECIDE_PROMPT 显示 `m3 input: ...（目标词: ...）`，
+  引导 LLM 聚焦当前阶段（xywhaigc 图片生成实测：不再乱点模板库/重置参数）。
+- **contract 与进度进 explore 结果/meta**（goal_contract + milestone_progress）。
+- **契约 prompt 规则**：navigate target_terms 填页面名词短语（禁动词整句）；
+  入口 URL 的打开（goto）不是 milestone。
+
+### 进度判定修复（实测驱动）
+
+- `_norm` 去全部空白（"登 录" 与 "登录" 等价——auth 判定漏配）。
+- navigate = 历史事实（探索发现过目标页即完成，不锚定当前状态；入口
+  goto 的初始 obs 也算）；≤2 字动词性 term（"打开"）过滤后视为已通过。
+- verify 与已完成里程碑业务关联（"验证登录成功" ← auth 完成后即满足）。
+- LLM 复制整句为 term 时元素名反向子串兜底。
+
+### 回归
+
+| 场景 | 结果 |
+|---|---|
+| SauceDemo 登录+加购 | ✅ 6/6（探索 4/4 goal_complete，回到基线） |
+| AutomationExercise BFC | ✅ 8/8（探索 5/6 model_finish；7/8 偶发波动与本次无关） |
+| xywhaigc 登录 | ✅ 6/6（探索 3/3 goal_complete，回到基线） |
+| 单元测试 | ✅ 187/187 |
+
+### 已知限制（P2 处理）
+
+- ready 里程碑对"中文目标词 vs 英文页面元素"（"加入购物车" vs "Add to cart"）
+  判定不匹配 → 探索可能预算耗尽（产出仍可用）——ActionCandidate 语义接管。
+- 图片生成场景：m3 input=current 正确推进，但 contenteditable 不在观察层
+  （S2-P3 bridge 前无法真正填写）。
+
+---
+
 ## 2026-08-27 — 参考项目探索形态复核
 
 - `explore_page` 只返回指定 URL 当前状态的 A11y 快照，不代表整站未来状态。
