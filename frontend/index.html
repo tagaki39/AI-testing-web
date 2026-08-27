@@ -44,6 +44,8 @@
   }
   .badge.passed { background: #e6f7ed; color: #1a9c4f; }
   .badge.failed { background: #fdecec; color: #d43c3c; }
+  .badge.running { background: #e3f0fd; color: #1976d2; }
+  .badge.pending { background: #f0f2f5; color: #9aa3ad; }
   .step-detail { margin-top: 8px; font-size: 13px; color: #555; }
   .step-meta { margin-left: auto; font-size: 11px; color: #9aa3ad; font-family: "Cascadia Code", Consolas, monospace; white-space: nowrap; }
   .step-correction { margin-top: 8px; display: flex; gap: 8px; }
@@ -170,7 +172,7 @@ async function generate() {
   }
 }
 
-// ② 执行测试
+// ② 执行测试（异步启动 + SSE 实时进度）
 async function execute() {
   let caseObj;
   try {
@@ -197,7 +199,19 @@ async function execute() {
   }
   const btn = document.getElementById("btn-execute");
   btn.disabled = true;
-  setStatus("Playwright 正在执行…");
+  // 实时进度视图：先渲染步骤骨架（每步一个卡片），SSE 事件逐卡更新
+  document.getElementById("report-card").style.display = "block";
+  document.getElementById("steps").innerHTML = caseObj.steps.map((s, i) => `
+    <div class="step" id="live-${i + 1}">
+      <div class="step-header">
+        <span style="color:#999">${i + 1}.</span>
+        <strong>${escapeHtml(String(s.action || ""))}</strong>
+        <span class="badge pending">…</span>
+        <span class="step-meta"></span>
+      </div>
+    </div>
+  `).join("");
+  setStatus("Playwright 正在启动…");
   try {
     const resp = await fetch("/api/execute", {
       method: "POST",
@@ -206,13 +220,56 @@ async function execute() {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || "执行失败");
-    renderReport(data.report);
-    setStatus("✅ 执行完成");
+    openProgressStream(data.run_id, caseObj);
   } catch (e) {
     setStatus("❌ " + e.message, true);
-  } finally {
     btn.disabled = false;
   }
+}
+
+// SSE 实时进度：EventSource 订阅 /api/runs/{id}/events
+function openProgressStream(runId, caseObj) {
+  const es = new EventSource(`/api/runs/${runId}/events`);
+  const btn = document.getElementById("btn-execute");
+  const mark = (i, status, extra) => {
+    const el = document.getElementById(`live-${i}`);
+    if (!el) return;
+    const badge = el.querySelector(".badge");
+    if (badge) {
+      badge.className = `badge ${status}`;
+      badge.textContent = status === "running" ? "运行中…"
+        : status === "passed" ? "通过" : status === "failed" ? "失败" : "跳过";
+    }
+    const meta = el.querySelector(".step-meta");
+    if (meta && extra && extra.error) meta.textContent = extra.error;
+    el.style.borderLeftColor = status === "failed" ? "#d43c3c"
+      : status === "passed" ? "#2e7d32" : status === "running" ? "#1976d2" : "#bbb";
+  };
+  es.addEventListener("step_started", (ev) => {
+    const d = JSON.parse(ev.data);
+    mark(d.step_index, "running");
+    setStatus(`▶ 正在执行第 ${d.step_index} 步（${d.action}）`);
+  });
+  es.addEventListener("step_completed", (ev) => {
+    const d = JSON.parse(ev.data);
+    mark(d.step_index, d.status, d);
+  });
+  es.addEventListener("run_finished", (ev) => {
+    es.close();
+    renderReport(JSON.parse(ev.data).report);
+    setStatus("✅ 执行完成");
+    btn.disabled = false;
+  });
+  es.addEventListener("run_error", (ev) => {
+    es.close();
+    setStatus("❌ 执行失败: " + JSON.parse(ev.data).error, true);
+    btn.disabled = false;
+  });
+  es.onerror = () => {
+    es.close();
+    setStatus("❌ 执行进度连接中断", true);
+    btn.disabled = false;
+  };
 }
 
 // ③ 渲染报告：后端返回的 JSON → HTML 卡片

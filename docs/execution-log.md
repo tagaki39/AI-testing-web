@@ -1,5 +1,33 @@
 # Execution Log（执行日志）
 
+## 2026-08-27 — SSE 实时执行进度（功能文档 ⑥ + P5）
+
+### 实现（功能文档定稿方案）
+
+- **POST /api/execute → 异步化**：validate_case（第二道安全门）→ 创建 run
+  （内存状态 + 事件队列）→ 后台线程执行 → 立即返回 `{"run_id": "..."}`。
+- **GET /api/runs/{id}/events → SSE 事件流**（EventSource 只支持 GET）：
+  - 事件：`step_started` / `step_completed` / `run_finished`（带完整 report）/
+    `run_error`（带错误信息）
+  - 重连幂等：执行已终结（done/error）且队列耗尽 → 补发最终事件再关闭
+    （EventSource 自动重连不丢结果）；队列空闲发心跳注释帧保活
+- **runner.execute_case 加 `on_event` 回调**（可选，默认 None——同步调用
+  路径完全兼容）：核心循环逐步推送，回调异常吞掉（进度不影响执行主链路）
+- **前端 execute()**：POST → run_id → EventSource 订阅 → 步骤骨架实时更新
+  （运行中高亮/通过/失败/跳过徽章 + 边界色）→ run_finished 渲染完整报告
+- timings 记录移入 worker 完成分支（执行耗时数据不丢）
+
+### 回归（SSE 新链路全站验证）
+
+| 场景 | 结果 | 事件序列 |
+|---|---|---|
+| SauceDemo 登录+加购 | ✅ 6/6 | 13 事件（6 步 × start/complete + run_finished） |
+| AutomationExercise BFC | ✅ 8/8 | 17 事件（探索 5/3/done） |
+| xywhaigc 登录 | ✅ 6/6 | 13 事件（探索 3/3/done） |
+| 单元测试 | ✅ 173/173 | on_event=None 默认兼容 |
+
+---
+
 ## 2026-08-26 — P3 + 清理 + 最终回归（`6d51837` → 最终确认）
 
 ### P3：低价值动作拦截（`6d51837`）

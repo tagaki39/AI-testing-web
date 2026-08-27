@@ -491,6 +491,7 @@ def execute_case(
     case: DSLCase,
     variables: dict[str, str] | None = None,
     continue_on_failure: bool = False,
+    on_event: "callable | None" = None,
 ) -> dict:
     """执行整个用例，返回报告。
 
@@ -506,9 +507,21 @@ def execute_case(
       False → 某步失败后剩余步骤标记 skipped（级联失败不产生噪音报告）
       True  → 每步独立成败，继续执行（旧行为）
 
+    on_event（SSE 实时进度）：可选回调，逐步推送进度事件——
+      {"type": "step_started", "step_index", "action"}
+      {"type": "step_completed", "step_index", "action", "status", "error"}
+    回调异常必须吞掉（进度推送失败不影响执行主链路）。
+
     sync_playwright() 上下文管理器：自动管理浏览器生命周期。
     headless=True：无头模式（不弹窗口），服务器环境必须用这个。
     """
+    def _emit(ev: dict) -> None:
+        if on_event is None:
+            return
+        try:
+            on_event(ev)
+        except Exception:
+            pass
     ensure_executable_targets(case)   # ← 执行前防线（ref-only 步骤拒绝，浏览器启动前）
     variables = dict(variables or {})
     # 把 input_contract 里的默认值合并进来（DSL 声明的变量默认值）
@@ -540,6 +553,8 @@ def execute_case(
         # 核心循环：逐步骤执行（fail-fast 默认：失败后剩余步骤 skipped）
         for index, step in enumerate(case.steps, start=1):
             if failed and not continue_on_failure:
+                _emit({"type": "step_started", "step_index": index,
+                       "action": step.action})
                 results.append({
                     "step_index": index,
                     "action": step.action,
@@ -547,13 +562,22 @@ def execute_case(
                     "error": "前序步骤失败，已跳过（fail-fast）",
                     "duration_ms": 0,
                 })
+                _emit({"type": "step_completed", "step_index": index,
+                       "action": step.action, "status": "skipped",
+                       "error": None})
                 continue
+            _emit({"type": "step_started", "step_index": index,
+                   "action": step.action})
             evidence = _execute_step(page, step, variables, run_dir, index)
             results.append(evidence)
             if evidence["status"] == "failed" and not continue_on_failure:
                 failed = True
             if evidence["url"]:
                 latest_url = evidence["url"]
+            _emit({"type": "step_completed", "step_index": index,
+                   "action": step.action,
+                   "status": evidence["status"],
+                   "error": (evidence.get("error") or "")[:200]})
 
         browser.close()
 

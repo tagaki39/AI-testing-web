@@ -25,8 +25,11 @@ main.py — FastAPI 入口（HTTP 层：把前端请求接进来）
 
 import json
 import os
+import queue
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 # ⚠️ 必须在导入 ai_agent / runner 之前加载 .env！
 # 因为 ai_agent.py / runner.py 的模块顶层会读取环境变量（os.getenv）。
@@ -41,7 +44,7 @@ if ENV_FILE.exists():
 
 # 第三方库：FastAPI（Web 框架）、Pydantic（数据校验）、StaticFiles（托管静态文件）
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -56,6 +59,20 @@ from execution.runner import execute_case
 
 app = FastAPI(title="AI Web Testing", version="1.0.0")
 ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "artifacts"
+
+# ── SSE 执行 run 存储（内存级，单进程即可）─────────────────────────────
+# POST /api/execute → 创建 run（后台线程执行）→ 立即返回 run_id；
+# 前端 EventSource 订阅 GET /api/runs/{id}/events 实时进度。
+# 状态：running → done（带 report）/ error（带 error）。事件队列
+# 消费即弃（重连时由状态补发最终事件，幂等）。
+_RUNS: dict[str, dict] = {}
+_RUNS_LOCK = threading.Lock()
+
+
+def _json_sse(item: dict) -> str:
+    """事件 → SSE 帧（event: + data:，UTF-8 安全序列化）。"""
+    return f"event: {item['type']}\ndata: {json.dumps(item, ensure_ascii=False, default=str)}\n\n"
+
 
 # ── 耗时自动记录（每次生成/执行成功追加 JSONL，便于 jq 分析）──────────
 # 记录内容：生成各阶段计时（url/explore/planner/preflight）+
@@ -138,33 +155,98 @@ def api_generate(req: GenerateRequest):
 
 @app.post("/api/execute")
 def api_execute(req: ExecuteRequest):
-    """DSL → Playwright 执行 → 报告。
+    """DSL → Playwright 执行（异步：立即返回 run_id，SSE 订阅实时进度）。
 
-    注意：这里再次 validate_case（安全边界第二道门）——
-    前端传来的 DSL 是"用户可控"的，不能只信任 AI 生成那次校验。
-    任何入口都不能绕过 DSL 校验直接执行。
+    流程：
+      1. validate_case（安全边界第二道门——任何入口都不能绕过 DSL 校验）
+      2. 创建 run（内存状态 + 事件队列），后台线程执行
+      3. 立即返回 {"ok": true, "run_id": "..."}
+    前端随后 EventSource 订阅 GET /api/runs/{id}/events：
+      step_started / step_completed / run_finished（带完整 report）/
+      run_error（带错误信息）
     """
     try:
         case = validate_case(req.case)   # 再次校验（前后端都不能绕过）
-        report = execute_case(case, req.input_values)
-        _append_timing({
-            "type": "execute",
-            "case_name": report.get("case_name"),
-            "total_ms": report.get("total_duration_ms"),
-            "avg_step_ms": report.get("avg_step_ms"),
-            "passed": f"{report.get('passed_steps')}/{report.get('total_steps')}",
-            "steps": [
-                {"i": r["step_index"], "action": r["action"], "status": r["status"],
-                 "ms": r.get("duration_ms"), "resolve_ms": r.get("resolve_ms"),
-                 "resolved_by": r.get("resolved_by"),
-                 "target": r.get("target"), "scope": r.get("scope"),
-                 "error": (r.get("error") or "")[:200]}   # error 截断；不含 value 明文
-                for r in report.get("results", [])
-            ],
-        })
-        return _json_utf8({"ok": True, "report": report})
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"执行失败: {str(exc)[:300]}")
+    run_id = uuid4().hex[:12]
+    events: queue.Queue = queue.Queue()
+    state = {"status": "running", "events": events, "report": None, "error": None}
+    with _RUNS_LOCK:
+        _RUNS[run_id] = state
+
+    def _worker() -> None:
+        try:
+            report = execute_case(case, req.input_values, on_event=events.put)
+            state["report"] = report
+            state["status"] = "done"
+            events.put({"type": "run_finished", "report": report})
+            _append_timing({
+                "type": "execute",
+                "case_name": report.get("case_name"),
+                "total_ms": report.get("total_duration_ms"),
+                "avg_step_ms": report.get("avg_step_ms"),
+                "passed": f"{report.get('passed_steps')}/{report.get('total_steps')}",
+                "steps": [
+                    {"i": r["step_index"], "action": r["action"], "status": r["status"],
+                     "ms": r.get("duration_ms"), "resolve_ms": r.get("resolve_ms"),
+                     "resolved_by": r.get("resolved_by"),
+                     "target": r.get("target"), "scope": r.get("scope"),
+                     "error": (r.get("error") or "")[:200]}   # error 截断；不含 value 明文
+                    for r in report.get("results", [])
+                ],
+            })
+        except Exception as exc:
+            state["error"] = str(exc)[:300]
+            state["status"] = "error"
+            events.put({"type": "run_error", "error": state["error"]})
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return _json_utf8({"ok": True, "run_id": run_id})
+
+
+@app.get("/api/runs/{run_id}/events")
+def api_run_events(run_id: str):
+    """SSE 事件流：实时推送执行进度（EventSource 只支持 GET）。
+
+    重连幂等：执行已结束（done/error）且队列耗尽时，补发最终事件
+    再关闭（EventSource 自动重连不会丢最终结果）。队列空闲时发
+    心跳注释帧保活（不产生 data 事件）。
+    """
+    state = _RUNS.get(run_id)
+
+    def _stream():
+        if state is None:
+            yield _json_sse({"type": "run_error", "error": "run 不存在（可能已过期）"})
+            return
+        sent_final = False
+        while True:
+            item = None
+            try:
+                item = state["events"].get(timeout=5)
+            except queue.Empty:
+                pass
+            if item is not None:
+                if item["type"] in ("run_finished", "run_error"):
+                    sent_final = True
+                yield _json_sse(item)
+                if sent_final:
+                    break
+                continue
+            # 队列空：已终结 → 补发最终事件（重连幂等）→ 关闭；否则心跳
+            if state["status"] in ("done", "error") and not sent_final:
+                if state["status"] == "done":
+                    yield _json_sse({"type": "run_finished", "report": state["report"]})
+                else:
+                    yield _json_sse({"type": "run_error", "error": state["error"]})
+                break
+            yield ": ping\n\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 class CorrectionRequest(BaseModel):
