@@ -152,7 +152,7 @@ Locator resolution: "DOM 里谁对应它？" → semantic resolver
 | **R2** | scoring + confidence margin | 高分但 margin 低仍拒绝（✅ 已完成：`resolver.decide_resolution`——策略评分分层 + 放松组 + 置信度门槛；`LowConfidenceError` 继承 Ambiguous 保持兼容） |
 | **I1** | 实例身份恢复 | 编译后 locator 可区分 observation 内同名元素（容器内 scope 编译 + 身份证据前移；容器外留给 L1）（✅ 已完成：探索采集容器锚点 `scope_has_text` + verified 标记 → Compiler 同名重复附加 `Scope(has_text)`；E2E saucedemo 6/6、automationexercise 定位步骤全通——剩余失败为探索完整性/规划质量波动，属生成链路增强阶段） |
 | **L1** | corrections JSON loop | correction 是 candidate source，不绕过 Resolver；成功/失败统计 + 连续失败 disable（✅ 已完成：`backend/corrections.py`——URL 泛化 + 语义键匹配、upsert、连续失败 3 次熔断；correction 以 130 分最高候选进入统一裁决；前端失败步骤可提交修正；P4 E2E 验收：失败 → 提交 → 重跑命中 verified_count=1） |
-| **GQ** | 生成链路可靠性（质量门 + 探索完整性） | 见下方 GQ 决策记录（✅ 已完成：finish 完整性校验 + 缓存门槛放宽 done/steps≥2 + 目标覆盖警告 + GQ2 硬失败/自愈重生/反模式负例；E2E：saucedemo 无回归、automationexercise 不完整计划被明确拦截） |
+| **GQ** | 生成链路可靠性（质量门 + 探索完整性） | 见下方 GQ 决策记录（✅ 已完成：finish 完整性校验 + 目标覆盖警告 + GQ2 硬失败；缓存策略已由 S2-P0 收紧为 goal-scoped + `GOAL_COMPLETE` only） |
 
 **首个 milestone**：两个 regression 的执行前拒绝（不要求自动修复）：
 
@@ -210,10 +210,11 @@ exploration_complete 时做代码校验——已执行动作 < 2 的完成宣告
 把"探索不充分"作为 decision_rejected 反馈进历史，预算内继续
 （复用既有自纠机制，零新概念）。
 
-**决策 2 — 缓存门槛放宽（治重探索浪费）**：`done=True OR steps_used ≥ 2`
-才缓存。saucedemo done=False 但 steps=4 的探索产出了 7/7 计划——被拒
-缓存是浪费；而毒化历史的坏探索是 steps=1（同页状态堆叠）——阈值 2
-恰好放行前者、拒绝后者。
+**决策 2 — 缓存门槛（已被 S2-P0 取代）**：GQ 阶段曾采用
+`done=True OR steps_used ≥ 2` 复用有价值的部分探索；真实多阶段目标证明
+StateGraph/history 是目标相关轨迹，且 `done` 无法区分成功、错误页或认证失败。
+S2-P0 已改为 goal fingerprint 隔离，并且只缓存结构化终止原因
+`GOAL_COMPLETE` 的结果。详见 `docs/S2-plan.md`。
 
 **决策 3 — 生成期目标覆盖警告（治静默不完整，fail-open）**：
 - 探索 done=False → meta 标记 exploration_incomplete，前端醒目警告

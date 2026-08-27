@@ -1,5 +1,52 @@
 # Execution Log（执行日志）
 
+## 2026-08-27 — 参考项目探索形态复核
+
+- `explore_page` 只返回指定 URL 当前状态的 A11y 快照，不代表整站未来状态。
+- 交互流程由 `explore_flow` 执行预先给定的多步 actions，并在每个动作后重新
+  采集 A11y；它减少的是逐步 LLM 决策，不是浏览器交互或失败可能性。
+- 参考实现对定位失败采取 retry/fallback/skip，并由 ReAct safety cap 控制工具
+  轮次；当前项目则把失败前移为 verified transition。两者成本位置不同。
+- 后续 S2 采用混合路线：一次生成 Goal Contract，按 milestone 批量决定动作，
+  但继续逐动作验证真实迁移；不把完整当前页 AX Tree 误当作整站全局视野。
+
+---
+
+## 2026-08-27 — S2-P0：目标隔离、结构化终止与 singleton 安全
+
+### 实现
+
+- 新增 `TerminationReason` 与 `ExploreState.terminate(reason)`；探索结果明确区分
+  `goal_complete`、`model_finish`、认证拒绝、错误页、观察上限和预算耗尽。
+- 探索轨迹缓存 key 改为
+  `origin + auth_profile + redacted goal fingerprint + schema version`；仅
+  `goal_complete` 轨迹允许落盘，未完成或语义性 finish 不再跨目标复用。
+- singleton 快捷路径只对 capability 恰好为 `{click}` 的完整动作生效；唯一
+  textbox、button、link 等继续进入决策层，避免把“唯一元素”误当成“唯一动作”。
+- metrics 增加 termination reason 分布；README 与 ROADMAP 同步移除旧的
+  `done=False / steps>=2` 缓存口径。
+
+### 验证与规模
+
+| 项目 | 结果 |
+|---|---|
+| 目标测试 | 98/98 passed |
+| 全量测试 | 187/187 passed |
+| 后端生产代码 | 6,423 → 6,503 物理行（P0 净增 80） |
+| 前端代码 | 362 物理行（不变） |
+| 测试代码 | 3,745 → 3,881 物理行 |
+
+本阶段允许为契约与失败可观测性小幅增量；S2-P1～P6 按
+`docs/S2-plan.md` 的 replace-then-delete 原则接管旧路径，最终再做集中瘦身。
+
+### 规划材料口径
+
+`AI_Web_Testing_架构收敛与未来规划.docx` 可作为架构决策、回归矩阵和质量门禁
+参考，但其中 10,312 行是 `docs/source-code.txt` 的静态快照，不是本次 P0 后的
+工作树计数；执行阶段与当前状态以 `docs/S2-plan.md` 和本日志为准。
+
+---
+
 ## 2026-08-27 — SSE 实时执行进度（功能文档 ⑥ + P5）
 
 ### 实现（功能文档定稿方案）

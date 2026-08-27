@@ -4,24 +4,26 @@ AI 增强的 Web UI 自动化测试平台。
 
 - **AI 生成**：自然语言 → DeepSeek API → 结构化 DSL（Pydantic 强校验）
 - **Playwright 执行**：DSL → 真实浏览器 → 步骤级证据（截图）
+- **Grounded 探索**：结构化 A11y 观察 → 状态图 → state-scoped refs → 确定性定位编译
+- **实时反馈**：后台执行 + SSE 步骤进度与最终报告
 
-项目共 **8 个 Python 文件 + 1 个 HTML 文件**，无前端构建步骤。
+前端仍是单个 HTML 文件、无需构建；后端按探索、定位、编译、执行等职责拆分。
 
 ---
 
 ## 快速开始
 
 ```bash
-cd ai-testing-demo
+cd AI-testing-web
 
-# 1. 创建 .env（填你的 DeepSeek key）
-echo "AI_API_KEY=你的key" > .env
+# 1. 从示例创建 .env，并填写 DeepSeek key
+copy .env.example .env
 
-# 2. 安装依赖
-py -m pip install fastapi uvicorn playwright pydantic
+# 2. 安装依赖（Python 3.10+）
+python -m pip install -r requirements.txt
 
 # 3. 安装浏览器（如已安装过可跳过）
-py -m playwright install chromium
+python -m playwright install chromium
 
 # 4. 启动
 cd backend
@@ -45,7 +47,14 @@ python main.py
 定位策略分布 / resolve 延迟等）：
 
 ```bash
-py backend/metrics.py
+python backend/metrics.py
+```
+
+运行测试需要额外安装开发依赖：
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest backend/tests -q
 ```
 
 ---
@@ -56,28 +65,33 @@ py backend/metrics.py
 用户自然语言
     │
     ▼
-[ai_agent.py]  DeepSeek API 生成 DSL JSON
-    │                 │
-    │          [dsl.py] Pydantic 强校验 ← 安全边界
-    ▼                 │
-[runner.py]     Playwright 执行（for 循环逐步骤）
+[explore/]  页面观察 + bounded 探索 + State Graph
     │
     ▼
-步骤级证据（状态 + 截图 + URL）
+[ai_agent.py]  refs-only Planner（只选择已观察引用）
+    │
+    ▼
+[grounding.py] → [compiler.py] → [locator/resolver.py]
+    │            状态校验          确定性定位
+    ▼
+[execution/runner.py]  Playwright 执行
+    │
+    ▼
+SSE 步骤进度 + 证据（状态、截图、URL、定位策略）
 ```
 
-| 文件 | 行数 | 职责 |
-|------|------|------|
-| `backend/dsl.py` | ~150 | DSL 数据结构（含结构化 target/scope），Pydantic 强校验 |
-| `backend/explore_flow.py` | ~420 | bounded 探索：element ref 表 + Observation State Graph |
-| `backend/explore_cache.py` | ~70 | 探索结果缓存（脱敏落盘） |
-| `backend/ai_agent.py` | ~1430 | 双模式 Planner（refs-only / legacy）+ Preflight 修复链路 |
-| `backend/grounding.py` | ~175 | G3 State Grounding Validator（跨状态引用执行前拒绝） |
-| `backend/compiler.py` | ~80 | R1 LocatorSpec Compiler（target_ref → Locator 确定性编译） |
-| `backend/resolver.py` | ~220 | R1 Semantic Resolver：定位语义单一事实源（解析/候选顺序/导航限制/快照匹配） |
-| `backend/runner.py` | ~390 | Playwright 执行引擎：三分法编排 + 作用域消歧 + 时间预算 |
-| `backend/main.py` | ~150 | FastAPI 路由 + 静态托管 |
-| `frontend/index.html` | ~230 | 单页 UI（零构建） |
+| 路径 | 职责 |
+|------|------|
+| `backend/dsl.py` | DSL 数据结构与 Pydantic 安全边界 |
+| `backend/explore/` | 结构化观察、ActionSpace、bounded 探索与 State Graph |
+| `backend/explore_cache.py` | 脱敏探索缓存 |
+| `backend/ai_agent.py` | URL/数据处理、Planner 与生成质量门编排 |
+| `backend/grounding.py` | State Grounding Validator，拒绝跨状态引用 |
+| `backend/compiler.py` | `target_ref` / `transition_ref` 的确定性编译 |
+| `backend/locator/` | Semantic Resolver 与持久化定位覆盖规则 |
+| `backend/execution/` | 浏览器动作适配与 Playwright 执行引擎 |
+| `backend/main.py` | FastAPI、SSE、运行状态和静态托管 |
+| `frontend/index.html` | 零构建单页 UI |
 
 ---
 
@@ -212,8 +226,9 @@ button = container.get_by_role("button", name="Add to cart")
 
 - **探索完成性校验**：目标要求操作时，动作过少的"探索完成"宣告被拒绝并
   反馈继续探索（治"1 步后宣告完成"）
-- **缓存门槛**：`done=True 或已执行 ≥2 步` 才缓存——好探索不浪费
-  （实测二次生成 5.6s vs 冷启动 20-40s），浅探索仍拒缓存防毒化
+- **目标隔离缓存**：键包含 origin、登录态、脱敏目标指纹和 schema version；
+  只缓存 `termination_reason=goal_complete` 的确定性完成轨迹，模型 finish、
+  认证失败、错误页和预算耗尽均不缓存
 - **目标覆盖检查**（保守动作表）：goal 要求"加购/登录/结算"而计划中无
   对应 **click 动作** → 生成提示醒目警告（断言可见性不算覆盖——
   实测 9/10 类"看似完整实则漏动作"的计划被提前暴露）
@@ -228,17 +243,21 @@ button = container.get_by_role("button", name="Add to cart")
 ### 已实现
 
 - AI 生成 DSL + 人工编辑确认
-- Playwright 执行：goto / click / input / wait_for / assert_text
-- 三分法定位、作用域消歧、失败截图证据
-- 变量替换（`${var}`），缺失变量明确报错
+- 结构化 A11y 观察、ActionSpace 与 Observation State Graph
+- refs-only Planner、State Grounding 与确定性 Locator Compiler
+- Playwright 执行：goto / click / fill / select / check / wait_for / assertions
+- 三分法定位、评分与置信度门槛、实例身份与作用域消歧
+- 变量替换（`${var}`）、敏感值本地注入、缺失变量明确报错
+- 失败截图、定位策略与耗时证据；SSE 实时执行进度
+- 探索缓存、定位覆盖规则及连续失败熔断
 
 ### 后续规划
 
 | 方向 | 说明 |
 |------|------|
-| 页面结构感知 | 执行前抓取页面 ARIA snapshot 注入 Prompt，提升 AI 定位准确率 |
 | 运行时变量捕获 | `capture_text` / `capture_attribute`，支持"记录价格 → 断言一致"场景 |
-| 流式执行日志 | SSE 推送每步状态到前端（服务端单向推送场景，优于 WebSocket） |
 | Trace 证据 | Playwright Trace Viewer 记录完整操作轨迹，与步骤结果互补 |
 | 登录态复用 | `storage_state` 保存被测站点会话，避免重复登录 |
 | 持久化 | 用例与执行记录落库，支持多轮回归 |
+
+当前仍定位为本地单用户 demo：没有平台认证、数据库或分布式调度。
