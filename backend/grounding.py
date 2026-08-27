@@ -96,6 +96,9 @@ class GraphTransition(DSLModel):
     # S1：该转移前的成功非转移动作（fill/select/check/press）——
     # 探索期确定性恢复并绑定，Planner 不生成；value 为 ${var} 占位。
     pre_actions: list[dict] | None = None
+    # S2-P1：该转移为哪个里程碑执行（provenance——Progress 按 typed
+    # execution evidence 推导，不事后 NLP 重猜）
+    milestone_id: str | None = None
     to: str
 
 

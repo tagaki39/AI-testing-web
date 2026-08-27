@@ -205,7 +205,16 @@ def validate_goal_coverage(
     for milestone in milestones:
         if milestone.type not in {"auth", "action", "terminal_action"}:
             continue
-        labels = semantic_labels(milestone.target_terms[0])
+        # auth 类型自带语义 = login（intent 描述性句子如"提交登录表单"含
+        # "提交"动词，不做 NLP 判定避免误配 submit）
+        if milestone.type == "auth":
+            milestone_semantics[milestone.id] = ("login",)
+            continue
+        # 语义判定对象 = target_terms（业务对象）+ intent（完整句子含动作词）：
+        # LLM 常把 target_terms 填名词短语（"第一件商品"），动作词在 intent
+        #（"将第一件商品加入购物车"）——只查 target_terms 会漏配 add_to_cart
+        labels = semantic_labels(
+            f"{milestone.target_terms[0]} {milestone.intent}")
         if len(labels) > 1:
             raise GoalContractError(
                 f"milestone {milestone.id} 同时包含多个动作语义: {labels}")
@@ -218,6 +227,18 @@ def validate_goal_coverage(
             m for m in milestones
             if label in milestone_semantics.get(m.id, ())
         ]
+        if not matches:
+            raise GoalContractError(
+                f"目标要求 {label}，契约必须包含对应 milestone")
+        # 数量目标合法多 milestone（"前两个商品" = 2 个 add_to_cart action）；
+        # 其余语义（login/checkout/generate 等）仍要求唯一
+        if label == "add_to_cart":
+            if any(m.type != expected_type or m.execution != expected_execution
+                   for m in matches):
+                raise GoalContractError(
+                    f"目标 {label} 必须映射为 {expected_type}/"
+                    f"{expected_execution}")
+            continue
         if len(matches) != 1:
             raise GoalContractError(
                 f"目标要求 {label}，契约必须包含唯一对应 milestone")
@@ -280,6 +301,19 @@ def parse_goal_contract(
         raise GoalContractError("Goal Contract 响应不包含 JSON 对象")
     try:
         payload = json.loads(text[start:end + 1])
+        # 结构归一化（确定性，非猜测）：
+        #   - input 的语义由 field_terms/value_ref 决定，target_terms 无意义
+        #     ——LLM 常误填（超 max_length 或非空）→ 丢弃
+        #   - execution 由类型决定（terminal_action/verify=runner，其余
+        #     =explorer），LLM 输出直接覆盖（LLM 常误填 explorer/runner）
+        for milestone in payload.get("milestones", []):
+            mtype = milestone.get("type")
+            if mtype == "input":
+                milestone.pop("target_terms", None)
+            if mtype in {"terminal_action", "verify"}:
+                milestone["execution"] = "runner"
+            elif mtype in {"auth", "navigate", "input", "action"}:
+                milestone["execution"] = "explorer"
         contract = GoalContract.model_validate(payload)
     except Exception as exc:
         raise GoalContractError(f"Goal Contract schema 无效: {exc}") from exc
@@ -289,12 +323,26 @@ def parse_goal_contract(
 
 
 def canonicalize_goal_contract(contract: GoalContract, goal: str) -> GoalContract:
-    """只做无语义猜测的规范化；类型错误必须由语义校验拒绝。"""
+    """确定性结构归一化（无语义猜测）：
+
+    - 入口 navigate 删除：首个 navigate 且 target_terms 是入口 URL 描述
+      （LLM 常把完整 URL 复制为 target_terms）——入口打开由 goto 承担；
+      保留会让探索卡死在入口里程碑（explorer 要求 navigate 目标元素匹配
+      target_terms，URL 词匹配不到页面元素 → 全决策被拒，实测 budget 耗尽）。
+      站内导航（"工作台"/"图片生成"等页面名词）不是入口描述 → 保留。
+    - 重新编号 m1..mN。
+    """
     if goal is None:
         raise GoalContractError("canonicalize_goal_contract 必须显式传入 goal")
+    milestones = list(contract.milestones)
+    if milestones and milestones[0].type == "navigate" \
+            and re.search(r"https?://", milestones[0].target_terms[0] or ""):
+        milestones = milestones[1:]
+    if not milestones:
+        raise GoalContractError("Goal Contract 归一化后无里程碑")
     milestones = [
         m.model_copy(update={"id": f"m{i}"})
-        for i, m in enumerate(contract.milestones, start=1)
+        for i, m in enumerate(milestones, start=1)
     ]
     return GoalContract(milestones=milestones)
 

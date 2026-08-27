@@ -16,6 +16,7 @@ from goal_semantics import (
     FIELD_ALIASES_BY_KEY,
     GOAL_SEMANTIC_PATTERNS,
     normalize_semantic_text,
+    semantic_labels,
 )
 from .observation import (
     ExploreState, TerminationReason, _observe, _observe_after_action,
@@ -190,10 +191,18 @@ def _validate_milestone_decision(
         return None
 
     if milestone.type in {"navigate", "action"}:
+        # 匹配面 = target_terms（业务对象"第一件商品"）+ intent（动作句
+        # "将第一件商品加入购物车"——动作词在同义词组里才能匹配 Add to cart）
+        match_terms = tuple(milestone.target_terms) + (milestone.intent,)
         if action not in {"click", "press"} \
-                or not _matches_milestone_target(element_text, milestone.target_terms):
-            return (f"当前 {milestone.id} 是 {milestone.type}，目标元素必须匹配 "
-                    f"{milestone.target_terms[0]!r}")
+                or not _matches_milestone_target(element_text, match_terms):
+            # 已知语义（能匹配支持集）→ 必须点对应目标；未知语义（如"筛选"
+            # 不在支持集）→ 放行——程序无法验证的语义不猜，交给 LLM 语义决定
+            if semantic_labels(
+                    f"{milestone.target_terms[0]} {milestone.intent}"):
+                return (f"当前 {milestone.id} 是 {milestone.type}，目标元素必须匹配 "
+                        f"{milestone.target_terms[0]!r}")
+            return None
         return None
 
     return f"当前 {milestone.id} 必须由 Runner 接管，Explorer 禁止执行"
@@ -206,7 +215,7 @@ def _matches_milestone_target(value: object, terms: list[str]) -> bool:
     return any(
         any(normalize_semantic_text(term) in normalize_semantic_text(alias)
             or normalize_semantic_text(alias) in normalize_semantic_text(term)
-            for term in terms)
+            for term in terms for alias in aliases)
         and any(normalize_semantic_text(alias) in normalized for alias in aliases)
         for aliases in ACTION_ALIASES.values()
     )
