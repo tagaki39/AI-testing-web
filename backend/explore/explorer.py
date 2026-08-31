@@ -94,6 +94,7 @@ GOAL_ACTION_PATTERNS: dict[str, "re.Pattern"] = {
     "add_to_cart": re.compile(r"(加入购物车|加购|add\s+to\s+cart)", re.IGNORECASE),
     "login": re.compile(r"(登录|login|sign\s*in)", re.IGNORECASE),
     "checkout": re.compile(r"(结算|下单|checkout)", re.IGNORECASE),
+    "search": re.compile(r"(搜索|查询|search)", re.IGNORECASE),
 }
 
 # 动作 label → 探索 history 中必须出现的关键词（target name，casefold 匹配）
@@ -102,6 +103,7 @@ _ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
     "add_to_cart": ("add to cart", "加入购物车", "加入購物車"),
     "login": ("login", "sign in", "登录", "登陆", "登入"),
     "checkout": ("checkout", "结算", "结账", "去结算"),
+    "search": ("百度一下", "search", "搜索", "查询"),
 }
 
 
