@@ -569,7 +569,10 @@ def decide_resolution(rows: list) -> ResolutionResult:
             ))
     if blockers:
         best = max(blockers, key=lambda b: b[1])
-        if best[1] >= winner_score - CONFIDENCE_MARGIN:
+        # 边界语义修正：分差"恰好等于门槛"应放行（达标），拒绝只针对
+        # 分差 < 门槛（margin 不足）。此前用 >= 把 =门槛 的合法命中
+        # 一并拒绝（实测：role_decorated 80 vs text 60 差 20 被误拒）。
+        if best[1] > winner_score - CONFIDENCE_MARGIN:
             return ResolutionResult(
                 status="low_confidence",
                 detail=(

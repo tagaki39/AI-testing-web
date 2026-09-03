@@ -50,8 +50,9 @@ from locator.resolver import (
     business_identity, decide_resolution, parse_target, target_key,
 )
 
-# 执行截图保存目录（项目根/artifacts）
-ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "artifacts"
+# 执行截图保存目录（项目根/artifacts——注意：本文件在 backend/execution/ 下，
+# parents[2] 才是项目根；parents[1] 是 backend/，会把截图写错位导致 API 404）
+ARTIFACTS_DIR = Path(__file__).resolve().parents[2] / "artifacts"
 
 # 变量占位符的正则：匹配 "${email}" 这种写法
 # re.compile 预编译一次，后面反复用，比每次 re.search 快
