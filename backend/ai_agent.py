@@ -44,6 +44,7 @@ from explore import (
     GOAL_ACTION_PATTERNS, _ACTION_KEYWORDS, explore,
     missing_verified_goal_actions,
 )
+from explore.explorer import _goal_fully_covered_by_deterministic_model
 import anti_patterns
 from grounding import (
     StateGraph, StateGroundingMismatchError, UnknownTargetRefError,
@@ -1025,6 +1026,178 @@ def _sanitize_for_cache(explore_result: dict, runtime_inputs: dict) -> dict:
 _MAX_COMPACT_ACTIONS_PER_OBS = 20   # R5：compact ref 表每 obs 的 action 限量
 _MAX_COMPACT_EVIDENCE_PER_OBS = 3   # R5：compact ref 表每 obs 的 evidence 限量
 
+# ── D1：确定性路径规划（Restrict 边空间）─────────────────────────────────────
+# 根因（实测）：让 LLM 从"全量已验证转移表"选 transition_refs = 把路径规划
+#（图搜索，可确定性解决）交给 LLM——探索乱逛的成功边（Open Menu/详情往返/
+# 非目标商品）全暴露，LLM 多选（saucedemo 11-12 步、加错商品）。prompt 教学
+# 不收敛。解法：代码 BFS 最短路径成功后只把该路径的边暴露给 Planner。
+from collections import deque
+
+# D1 业务动作拒绝词（goal 剥掉登录/加购后仍含 → 多阶段目标 → LLM 兜底）。
+# 与 explorer 的 _FURTHER_ACTION_RE 不同：不含"进入/前往/跳转/返回"——
+# 对加购族那是"导航到验证页"（cart 终态启发已约束），不算多阶段。
+_D1_REJECT_RE = re.compile(
+    r"(筛选|上传|创建|发布|播放|下载|填写|生成|提交|选择|搜索|注册|支付|下单)")
+
+
+def _d1_supported_goal(goal: str) -> bool:
+    """D1 支持族：剥掉目标动作词后无业务动作动词。"""
+    rest = goal or ""
+    for pat in GOAL_ACTION_PATTERNS.values():
+        rest = pat.sub("", rest)
+    return not _D1_REJECT_RE.search(rest)
+
+
+def _norm_compact(s: str) -> str:
+    """去空白 + 小写（与完成校验同族归一化）。"""
+    return "".join((s or "").lower().split())
+
+
+def _edge_matches_action(edge: dict, keywords: tuple[str, ...]) -> bool:
+    """边的 target_name 是否命中动作关键词（去空白 casefold）。"""
+    name = _norm_compact(edge.get("target_name") or "")
+    return any(_norm_compact(k) in name for k in keywords)
+
+
+def _obs_evidence_text(obs: dict) -> str:
+    """obs 的证据文本（快照 + 元素名/归属），终态启发用。"""
+    parts = [obs.get("snapshot") or ""]
+    for e in obs.get("elements") or []:
+        parts.extend([e.get("name") or "", e.get("text") or "",
+                      e.get("scope_has_text") or ""])
+    return " ".join(parts)
+
+
+def _element_merch_text(observations: list[dict], ref: str) -> str:
+    """ref 元素的商品归属文本（scope_has_text / identity 值兜底）。"""
+    for o in observations:
+        for e in o.get("elements") or []:
+            if e.get("ref") == ref:
+                scope = (e.get("scope_has_text") or "").strip()
+                if scope:
+                    return scope
+                ident = (e.get("identity") or {}).get("value") or ""
+                return ident.replace("-", " ")
+    return ""
+
+
+def _has_cart_evidence(obs: dict, url: str | None) -> bool:
+    """obs 是否为购物车终态（URL 或证据文本含 cart 信号）。"""
+    text = _norm_compact(_obs_evidence_text(obs))
+    if url and "cart" in _norm_compact(url):
+        return True
+    return any(k in text for k in ("viewcart", "shoppingcart", "cart"))
+    # checkout/结算 不强制（结算页 ≠ 购物车验证页）
+
+
+def _bfs_edge_path(edges: list[dict], start: str, goal_obs: str) -> list[dict] | None:
+    """沿 verified edges BFS 从 start 到 goal_obs 的最短边序列。"""
+    adj: dict[str, list[dict]] = {}
+    for e in edges:
+        adj.setdefault(e.get("from"), []).append(e)
+    prev: dict[str, tuple[str, dict]] = {}
+    seen = {start}
+    queue = deque([start])
+    while queue:
+        cur = queue.popleft()
+        if cur == goal_obs:
+            path: list[dict] = []
+            node = cur
+            while node != start:
+                parent, edge = prev[node]
+                path.append(edge)
+                node = parent
+            path.reverse()
+            return path
+        for e in adj.get(cur, []):
+            nxt = e.get("to")
+            if nxt and nxt not in seen:
+                seen.add(nxt)
+                prev[nxt] = (cur, e)
+                queue.append(nxt)
+    return None
+
+
+def deterministic_path_edges(goal: str, verified_edges: list[dict],
+                             observations: list[dict]) -> list[dict] | None:
+    """D1：确定性最短路径（入口 → 目标动作边 → 验证终态）。
+
+    返回边序列（连续 from→to），失败返回 None → 调用方保留 LLM 兜底。
+    只在确定性模型支持的目标族内工作（复用 _goal_fully_covered_by_
+    deterministic_model：login-only / 加购族；含"筛选/上传"等多阶段动词
+    → None）。商品归属：goal 含明确商品名 → 只保留归属匹配的动作边；
+    goal 无商品名（"第一个商品"）→ 同动作多条边取探索顺序第一条。
+    """
+    if not verified_edges or not observations:
+        return None
+    # 1. 支持族判定（D1 收紧版——"进入购物车页面"是收尾导航非多阶段）
+    if not _d1_supported_goal(goal):
+        return None
+    # 2. 目标动作的候选边（goal 命中哪些 pattern 就要哪些动作）
+    entry_obs = observations[0]["id"]
+    goal_actions = [
+        label for label, pat in GOAL_ACTION_PATTERNS.items()
+        if pat.search(goal or "")
+    ]
+    if not goal_actions:
+        return None
+    action_edges: list[dict] = []
+    for label in goal_actions:
+        keywords = _ACTION_KEYWORDS[label]
+        action_edges.extend(
+            e for e in verified_edges if _edge_matches_action(e, keywords))
+    if not action_edges:
+        return None
+    # 3. 商品归属过滤（goal 与归属文本归一化互含；无命中则取首条）
+    scored: list[tuple[dict, str | None]] = []
+    goal_norm = _norm_compact(goal)
+    for e in action_edges:
+        merch = _norm_compact(
+            _element_merch_text(observations, e.get("target_ref") or ""))
+        hit = bool(merch) and (merch in goal_norm or goal_norm in merch)
+        scored.append((e, merch if hit else None))
+    picked: list[dict] = []
+    hit_edges = [e for e, m in scored if m]
+    if hit_edges:
+        picked = hit_edges[:1]   # 归属命中多条 → 取首条（探索顺序）
+    elif len(scored) == 1:
+        picked = [scored[0][0]]
+    elif goal_actions == ["login"]:
+        picked = [e for e, _ in scored][:1]
+    else:
+        picked = [scored[0][0]]   # "第一个商品"宽松：首遇动作边
+    # 4. 路径组装：入口 → 动作边(from) 前缀 + 动作边 + 终态后缀
+    results: list[list[dict]] = []
+    for e in picked:
+        prefix = _bfs_edge_path(verified_edges, entry_obs, e["from"])
+        if prefix is None:
+            continue
+        # 终态：含目标商品文本或 cart 证据、且 e.to 可达的最短 obs
+        targets: list[str] = []
+        for o in observations:
+            if o["id"] == e["from"]:
+                continue
+            text = _norm_compact(_obs_evidence_text(o))
+            merch = _norm_compact(
+                _element_merch_text(observations, e.get("target_ref") or ""))
+            has_merch = bool(merch) and merch in text
+            has_cart = _has_cart_evidence(o, o.get("url"))
+            if has_cart and (not merch or has_merch):
+                targets.append(o["id"])
+        # 无验证终态（cart 证据 + 商品文本）→ 该候选失败（宁可 None 走
+        # LLM 兜底，不产出"只加购无验证"的假装完整计划）
+        suffix: list[dict] = []
+        for tid in targets:
+            path = _bfs_edge_path(verified_edges, e["to"], tid)
+            if path is not None and (not suffix or len(path) < len(suffix)):
+                suffix = path
+        if not suffix:
+            continue
+        results.append(prefix + [e] + suffix)
+    if not results:
+        return None
+    return min(results, key=len)
+
 
 def _build_compact_refs(pages: list[dict],
                         transitions: list[dict] | None = None) -> str:
@@ -1198,6 +1371,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     tr = (explore_result or {}).get("transitions") or []
     compact_refs = (_build_compact_refs(pages, transitions=tr)
                     if pages else None)
+    restrict_edges: list[dict] | None = None   # D1（无探索时为 None）
     if compact_refs:
         # P0-3：canonical path 只来自成功转移边（State Graph transitions），
         # 失败动作单独标注为负例——Planner 不会学到"点击文本超时 →
@@ -1211,9 +1385,17 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             t for t in tr
             if t.get("from") and t.get("to") and t.get("from") != t.get("to")
         ]
+        # D1：确定性最短路径（Restrict 边空间）——代码搜索成功后只把
+        # 该路径的边暴露给 Planner（重编号 t1..tm），LLM 只能在正确的
+        # 边里选；失败（多阶段目标/不可达）→ 全量边 + LLM 语义兜底。
+        restrict_edges = deterministic_path_edges(
+            explore_goal, verified_edges, pages)
+        display_edges = restrict_edges if restrict_edges is not None \
+            else verified_edges
+        det_used = restrict_edges is not None
         path_lines = [
             f"t{i}: {t['from']} --{t['action']} {t['target_ref']}--> {t['to']}"
-            for i, t in enumerate(verified_edges, start=1)
+            for i, t in enumerate(display_edges, start=1)
         ]
         fail_lines = [
             f"- {h.get('action')} {h.get('target_ref')} 失败:"
@@ -1226,7 +1408,9 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         # 完整快照把 prompt 撑到几十 KB → LLM 回吐坏 JSON 的根因）。
         grounded_prompt = (
             f"目标页面入口: {entry_url}\n\n"
-            f"已验证状态转移（State Graph 成功边，规划路径只能沿这些边）:\n"
+            + (f"【代码已确定最短路径——按序选中以下全部转移即可，无需取舍】\n"
+               if det_used else
+               f"已验证状态转移（State Graph 成功边，规划路径只能沿这些边）:\n")
             + ("\n".join(path_lines) if path_lines else "- (无)")
             + ("\n\n失败动作（不要模仿，这些动作未产生有效状态变化）:\n"
                + "\n".join(fail_lines) if fail_lines else "")
@@ -1268,10 +1452,11 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         effective_tables = (
             tables if tables is not None else compact_refs
         )
-        # R7.1：verified_edges + observations（state cursor grounding 用）
+        # R7.1：display_edges（D1 Restrict 后 = 最短路径子集，编号与
+        # prompt 一致）+ observations（state cursor grounding 用）
         case, planner_meta = _generate_planner_case(
             prompt, mode=planner_mode, tables=effective_tables,
-            verified_edges=verified_edges, observations=pages,
+            verified_edges=display_edges, observations=pages,
             entry_url=entry_url,
         )   # ← Schema Recovery ×1（refs-only 模式含契约违规修复）
         case, removed = _normalize_steps(case)   # ← 计划归一化 + 记录删除
@@ -1393,6 +1578,12 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         "unverified_postconditions": detect_missing_postconditions(
             case, pages, (explore_result or {}).get("transitions", []),
         ) or None,
+        # D1：确定性路径规划是否接管（Restrict 边空间可观测）
+        "deterministic_path": (
+            {"used": True, "edges": len(restrict_edges)}
+            if restrict_edges is not None else
+            {"used": False, "reason": "unsupported_or_unreachable"}
+        ),
     }
 
     # Speed v1：生成链路计时（定位耗时构成，决定下一刀砍哪）

@@ -326,3 +326,25 @@ Correction reuse success rate        ← L1 后
 
 - 生成/执行耗时自动记录到 `timings.jsonl`（每轮完整数据）
 - 步骤级 `resolve_ms` / `resolved_by` 已进入证据
+
+---
+
+### D1 决策记录（确定性路径规划——Restrict 边空间，s2p0-fixes）
+
+**根因**（实测确认）：R7 让 LLM 从"全量已验证转移表"选 transition_refs——探索乱逛
+的成功边（Open Menu/详情往返/非目标商品）全暴露，LLM 多选（saucedemo 11-12 步、
+加 Bike Light）。prompt 教学不收敛（加约束反恶化 12 步）。路径规划是可确定性解决
+的图搜索，交给 LLM 违背"能在确定性程序内解决的，不交给 LLM"。
+
+**方案**：`deterministic_path_edges()`——代码 BFS 最短路径（入口 → 目标动作边 →
+cart 验证终态）成功后，只把该路径的边暴露给 Planner（Restrict 边空间，LLM 只能
+在正确的边里选）；失败（多阶段目标/探索无 cart 边）→ 全量边 + LLM 语义兜底
+（fail-open 保留）。断言仍由 LLM 生成（语义验证不可代码化）。
+
+**支持族判定**（D1 收紧版）：剥掉登录/加购/结算词后仍含业务动作动词
+（筛选/上传/生成/提交/支付等）→ 不接管；"进入/打开购物车页面"是收尾导航不算
+多阶段（与 explorer 的 _FURTHER_ACTION_RE 语义不同，独立维护）。
+
+**验证**：单测 6/6（合成图：返回 login+首遇加购+cart 最短路径，排除 Open Menu/
+第二商品；商品名归属过滤；多阶段→None；无 cart 终态→None 诚实）；真实 saucedemo
+探索无 cart 边时 det=None → LLM 兜底 7 步徽章断言（探索缺口诚实暴露）。
