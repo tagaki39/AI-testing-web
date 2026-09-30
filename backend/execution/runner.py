@@ -429,6 +429,11 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
             elif step.action == "assert_text":
                 text = _substitute(step.value, variables) or ""
                 expect(locator).to_contain_text(text, timeout=step.timeout_ms)
+            elif step.action == "capture_text":
+                # 运行时变量捕获：元素可见文本 → context_key（后续 ${key} 断言引用）
+                text = locator.inner_text().strip()
+                variables[step.context_key] = text
+                evidence["captured"] = f"{step.context_key}={text[:60]}"
 
         # 每步截图作为证据（full_page=True 截整页，不只是视口）
         shot = step_dir / f"step-{index:02d}.png"

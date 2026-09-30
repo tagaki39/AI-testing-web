@@ -1,23 +1,26 @@
 # AI Web Testing Demo
 
-AI 增强的 Web UI 自动化测试平台。
+**中文自然语言进 → 可执行测试用例 + 真浏览器执行报告出。**
 
-- **AI 生成**：自然语言 → DeepSeek API → 结构化 DSL（Pydantic 强校验）
-- **Playwright 执行**：DSL → 真实浏览器 → 步骤级证据（截图）
+核心设计原则一句话：**AI 只做选择题，事实与执行交给确定性代码**——
+LLM 负责语义理解与有限选择，定位、校验、执行、时间上界全部由代码保证。
 
-项目共 **8 个 Python 文件 + 1 个 HTML 文件**，无前端构建步骤。
+| 实测指标（可复现） | 数据 |
+|---|---|
+| BFC 场景（品牌筛选加购） | 生成 97.1s / 16 次 LLM 调用 → **28.8s / 7 次**；执行 **8/8 步全过（5.6s）** |
+| 单次定位耗时上界 | 全局预算 ≤5s（旧实现最坏叠加 60-110s；实测执行 280s → **17.7s**） |
+| 跨站点 E2E | SauceDemo / AutomationExercise / xywhaigc 登录+加购流程全通过 |
+| 测试 | **12 个测试文件、191 个测试函数全部通过**（含真实浏览器冒烟），零依赖 plain-assert |
 
 ---
 
 ## 快速开始
 
 ```bash
-cd ai-testing-demo
+# 1. 创建 .env（参考 .env.example，填你的 DeepSeek key）
+cp .env.example .env
 
-# 1. 创建 .env（填你的 DeepSeek key）
-echo "AI_API_KEY=你的key" > .env
-
-# 2. 安装依赖
+# 2. 安装依赖（无 requirements，四个包）
 py -m pip install fastapi uvicorn playwright pydantic
 
 # 3. 安装浏览器（如已安装过可跳过）
@@ -28,21 +31,21 @@ cd backend
 python main.py
 ```
 
-浏览器打开 **http://127.0.0.1:9000**。
+浏览器打开 **http://127.0.0.1:9000**（端口可由 `.env` 的 `APP_PORT` 覆盖）。
+
+`.env` 配置项：`AI_API_KEY`（必填）/ `AI_BASE_URL`（默认 DeepSeek）/ `AI_MODEL`（默认 `deepseek-chat`）/ `APP_PORT`。
 
 ---
 
 ## 使用流程
 
-1. 输入自然语言需求，如：`打开 https://example.com，验证页面包含文字 "Example Domain"`
-2. 点击「AI 生成 DSL」→ AI 返回结构化 DSL JSON，可在编辑框中人工调整
-3. 点击「执行测试」→ Playwright 执行全部步骤，逐步骤展示状态与截图
+1. 输入自然语言需求，如：
+   `打开 saucedemo.com，用 standard_user / secret_sauce 登录，把第一个商品加入购物车，进入购物车验证商品存在`
+2. 点击「AI 生成 DSL」→ 平台自动探索页面 → 生成结构化用例（可在编辑框中人工调整）
+3. 点击「执行测试」→ **SSE 实时进度**逐步展示每步状态、耗时、定位策略与截图
+4. 失败的步骤可在报告内**提交修正**（`css=xxx` / `test_id=xxx` / `text=xxx`），下次执行优先复用
 
-### 量化指标
-
-每次生成/执行自动追加耗时与定位策略记录（`timings.jsonl`，已脱敏）。
-聚合输出 ROADMAP §8 核心指标（Planner 成功率 / 各阶段 p50/p95 /
-定位策略分布 / resolve 延迟等）：
+命令行指标聚合（成功率 / p50·p95 / 定位策略分布 / 探索调用数）：
 
 ```bash
 py backend/metrics.py
@@ -50,68 +53,63 @@ py backend/metrics.py
 
 ---
 
-## 架构
+## 架构（v2）
 
 ```
-用户自然语言
+自然语言需求（凭据进系统即脱敏为 ${var}）
     │
     ▼
-[ai_agent.py]  DeepSeek API 生成 DSL JSON
-    │                 │
-    │          [dsl.py] Pydantic 强校验 ← 安全边界
-    ▼                 │
-[runner.py]     Playwright 执行（for 循环逐步骤）
+① 探索（explore/）        真实浏览器 + CDP 无障碍树观察
+    │                     LLM 每步只从"合法候选"里选动作（候选=代码过滤的产物）
+    │                     成功且状态变化 → 记一条已验证转移边
+    ▼
+   Observation State Graph（状态节点 + 转移边 + state-scoped 元素表 obs3:e17）
     │
     ▼
-步骤级证据（状态 + 截图 + URL）
+② 规划（ai_agent.py）     refs-only Planner：LLM 只选已验证转移 + 断言
+    │                     不写定位字段、不写步骤（违规进 Schema Recovery）
+    ▼
+③ 校验（grounding/compiler）  纯代码，全部发生在浏览器启动之前
+    │                     契约检查 → G3 状态推导 → 质量门 → 确定性编译 locator
+    ▼
+④ 执行（execution/）      三分法定位 + 评分置信度门槛 + 5s 全局预算
+    │                     "宁可明确失败，不允许低置信度点击"
+    ▼
+执行报告（每步截图 + 耗时 + 定位策略 + 异常详情）
 ```
-
-| 文件 | 行数 | 职责 |
-|------|------|------|
-| `backend/dsl.py` | ~150 | DSL 数据结构（含结构化 target/scope），Pydantic 强校验 |
-| `backend/explore_flow.py` | ~420 | bounded 探索：element ref 表 + Observation State Graph |
-| `backend/explore_cache.py` | ~70 | 探索结果缓存（脱敏落盘） |
-| `backend/ai_agent.py` | ~1430 | 双模式 Planner（refs-only / legacy）+ Preflight 修复链路 |
-| `backend/grounding.py` | ~175 | G3 State Grounding Validator（跨状态引用执行前拒绝） |
-| `backend/compiler.py` | ~80 | R1 LocatorSpec Compiler（target_ref → Locator 确定性编译） |
-| `backend/resolver.py` | ~220 | R1 Semantic Resolver：定位语义单一事实源（解析/候选顺序/导航限制/快照匹配） |
-| `backend/runner.py` | ~390 | Playwright 执行引擎：三分法编排 + 作用域消歧 + 时间预算 |
-| `backend/main.py` | ~150 | FastAPI 路由 + 静态托管 |
-| `frontend/index.html` | ~230 | 单页 UI（零构建） |
 
 ---
 
-## DSL 格式
+## 项目结构
 
-`target` 支持字符串与结构化两种写法，`scope` 用于同名元素消歧：
-
-```json
-{
-  "action": "click",
-  "target": "button=Add to cart",
-  "scope": "Blue Top"
-}
 ```
-
-```json
-{
-  "action": "click",
-  "scope": {"role": "listitem", "has_text": "Blue Top"},
-  "target": {"role": "button", "name": "Add to cart"}
-}
+backend/
+  dsl.py          ~160    DSL 数据结构 + Pydantic 强校验（extra=forbid + action 级校验）
+  ai_agent.py     ~1220   生成链路：入口 URL 解析 / refs-only Planner / Schema Recovery / 质量门
+  grounding.py    ~270    StateGraph + G3 State Grounding Validator（跨状态引用执行前拒绝）
+  compiler.py     ~115    LocatorSpec Compiler（target_ref → Locator 确定性编译 + I1 消歧）
+  goal_contract.py ~155   S2 目标契约（目标 → 里程碑，只描述意图不生成 DSL）
+  explore_cache.py ~105   探索结果缓存（脱敏落盘，冷 21s → 热 6s）
+  anti_patterns.py ~75    失败模式档案（按 reason_code 分类，重生时作负例注入）
+  metrics.py      ~195    timings.jsonl → 聚合指标
+  main.py         ~300    FastAPI：/api/generate /api/execute /api/runs/{id}/events(SSE)
+                          /api/corrections /api/artifacts + 静态托管
+  explore/
+    observation.py ~795   CDP AX 树归一化 / 元素表 / 语义 state_hash / 状态记录
+    action_space.py ~130  ActionSpace 结构过滤 + 动作能力矩阵 + 可操作性评估
+    explorer.py    ~940   bounded 探索循环 / 决策校验 / 目标约束 / 完成判定
+    progress.py    ~170   里程碑进度推导（只从 Observation/history/StateGraph 派生）
+  locator/
+    resolver.py    ~525   定位语义单一事实源（候选链 / 评分裁决 / 快照匹配）
+    corrections.py ~130   L1 持久化覆盖规则（统计 + 熔断）
+  execution/
+    runner.py      ~530   执行引擎：三分法编排 + 5s 预算 + 证据采集
+    action_executor.py ~100  动作执行器：ToolResult + 危险操作闸口
+  tests/           12 个测试文件，190+ 测试函数（零依赖 plain-assert）
+  regressions/     两个 grounding regression（SauceDemo / AutomationExercise）
+frontend/index.html ~350  单页 UI（零构建）
+docs/                     设计文档与执行日志（见文末索引）
 ```
-
-`target` 支持的定位方式：`{"role","name"}` 语义 / `{"text"}` 文本 / `{"test_id"}` / `{"css"}`。
-
-### 定位三分法
-
-遵循 Playwright 官方推荐的心智模型：
-
-- **0 个匹配** → 报"未找到"（`LocatorNotFoundError`）
-- **1 个匹配** → 使用
-- **2+ 个匹配** → 报"歧义"（`LocatorAmbiguousError`），**绝不自动选择第一个**，提示用 scope 消歧
-
-> 为什么不在匹配到多个时自动选第一个？页面改版后，被选中的可能不再是目标元素——宁可靠错误，不可点错元素。
 
 ---
 
@@ -119,107 +117,129 @@ py backend/metrics.py
 
 ### 1. DSL 作为安全边界
 
-AI 只负责生成结构化测试步骤，执行是确定性的 Playwright 代码。所有 DSL 经过 Pydantic 强校验，非法 action 在进入执行器之前被拦截——安全、可复现、可审计。前端传入的 DSL 同样经过校验，前后端都不能绕过。
+AI 生成、代码执行，中间隔着 Pydantic 强校验：`extra="forbid"`（未知字段直接报错，
+防"AI 以为生效、代码其实丢了"的虚假生效）+ action 白名单 + action 级业务校验
+（click 无 target、goto 无 value 都拒）。前端传入的 DSL 走同一条校验，前后端都不能绕过。
 
-### 2. 定位策略
+### 2. 探索：CDP 观察 + 受限选择
 
-写 DSL 时优先使用语义定位（`get_by_role("button", name="登录")`）——它基于浏览器的无障碍树（Accessibility Tree），不依赖 DOM 结构和 CSS 类名，前端改版后测试依然稳定，且不需要被测系统埋点。
+- **观察**：CDP `Accessibility.getFullAXTree` → 归一化 `AXNode`（role/name/disabled/层级）；
+  元素表带 **state-scoped ref**（`obs3:e17` = 第 3 个状态的第 17 个元素）；
+  `state_hash` 用语义签名——文本/输入变化不产生新状态，防状态膨胀
+- **受限选择**（Restrict, don't repair）：LLM 每步只从候选里选一个动作。
+  候选 = 代码四道过滤的产物：失败黑名单 → disabled/遮罩（dialog/overlay 外不暴露）
+  → 动作能力矩阵（textbox 只能 fill…）→ 目标 Policy（加满 2 件后终态动作不暴露）
+- **验证过的边**：动作真实执行成功且页面状态确实变化 → 记转移边
+  `obs2 --click obs2:e5--> obs3`；失败/无变化不记边（"边是走出来的，不是声明的"）
+- **完成判定**：LLM 提议 + 代码校验——执行 <2 步的完成宣告无效；
+  目标动作必须有 `from≠to` 的已验证转移（"点过失败 ≠ 完成"）
 
-执行器内部按稳定性降级：`data-testid`（页面有测试属性时最稳）→ 语义定位 → 文本 → CSS 兜底。
-
-使用模糊匹配（`exact=False`）：真实页面常见 icon 前缀空格、CSS text-transform 大小写等，accessible name 与可见文本常不一致；歧义仍由三分法拦截（2+ 匹配直接报错，绝不自动选第一个）。
-
-### 3. AI 生成质量保障
-
-- 低温度采样（`temperature: 0.2`），输出稳定
-- Prompt 严格约束 DSL 格式与 action 白名单
-- JSON 容错解析（兼容 ```json 代码块标记）
-- Pydantic 校验兜底，非法输出直接拒绝
-
-### 4. 作用域消歧
-
-页面存在多个同名元素（如 6 个 "Add to cart" 按钮）时，通过 `scope` 先锁定容器再在容器内查找：
-
-```python
-container = page.get_by_role("listitem").filter(has_text="Blue Top")
-button = container.get_by_role("button", name="Add to cart")
-```
-
-### 5. refs-only Planner 与确定性编译（Architecture v2）
+### 3. refs-only Planner 与确定性编译（架构 v2 核心）
 
 职责分离——**AI 负责"想操作谁"，代码负责"DOM 里谁对应它"**：
 
-- 生成时先探索页面，产出带编号的元素引用表（`obs3:e17`）与状态转移图
-- grounded 模式下 Planner **只从引用表选 `target_ref`**，禁止生成任何定位字段
-  （违反契约进入恢复修复，仍失败则明确拒绝）
-- `target_ref` 由 Compiler 从观察到的元素数据**确定性编译**成 target
-  （`obs3:e17` → `{"role": "button", "name": "Add to cart"}`），
-  用户可见的 DSL 格式不变，只是来源从 LLM 变为代码
-- State Grounding Validator 在执行前拒绝跨状态引用（页面已跳转却仍引用
-  上一页元素的步骤 → `STATE_GROUNDING_MISMATCH`）
-- 无探索的降级路径保留 legacy 生成能力（LLM 直接生成定位字段）
+- grounded 模式下 Planner **只从引用表选 `target_ref`**，禁止生成任何定位字段——连
+  `click` 都不写，状态变化由"已验证转移编号"表达；违规进 Schema Recovery（约束修复
+  ×1，带引用表上下文），恢复仍失败 → 明确拒绝
+- locator 由 Compiler 从观察到的元素数据**确定性编译**：
+  `obs3:e17` → `{"role": "button", "name": "Add to cart", "identity": {...}}`
+  （确定性 > Planner：编译产物覆盖 Planner 手写字段）
+- 执行前防线 `ensure_executable_targets`：拒绝未编译的 ref-only 步骤（防手改 DSL 绕过）
+- 无探索的降级路径保留 legacy 生成能力（LLM 直接生成定位字段），行为不变
 
-### 6. 评分与置信度门槛（R2）
+### 4. 状态接地校验（G3）
 
-定位解析不再"固定顺序第一个唯一命中胜出"，而是**收集全部策略证据后评分裁决**：
+纯静态推导，不跑浏览器：建 ref → 所属状态的权威映射 + 转移边索引，逐步推导
+每步的 expected state（goto 按 URL、click 沿唯一转移边推进、fill/断言不改状态）：
 
-| 策略 | 分数 | 语义 |
-|------|------|------|
-| test_id | 100 | 显式测试契约（最强身份） |
-| test_id_attr | 95 | data-test/data-qa 属性变体 |
-| role（exact） | 90 | 语义定位精确匹配 |
-| role_decorated | 80 | 容忍图标前缀 |
-| text | 60 | 文本定位 |
-| role_fuzzy | 50 | 语义模糊匹配 |
-| css | 30 | 兜底 |
+```
+被引用元素的所属状态 ≠ 推导出的当前状态 → STATE_GROUNDING_MISMATCH
+编造不存在的 ref                      → UnknownTargetRefError
+引用不可达的孤儿状态                  → UnreachableObservationError
+```
 
-- **放松组**：role/decorated/fuzzy 是同一身份的放松阶梯，组内不互相竞争
-- **置信度门槛**：winner 与最强竞争证据（不同身份来源的命中/多匹配）的分差
-  < 20 → `LowConfidenceError` 拒绝——**高分但 margin 低仍拒绝**，
-  宁可靠错误，不可低置信度点击
-- 拒绝原因完整可解释（winner/竞争证据/分差都在错误信息里）
+来源是两个独立站点复现的真实回归（`backend/regressions/`）：列表页点进详情页后，
+下一步却引用列表页元素。**fail-open**：推导断链处不猜不拒——只拒绝可证明的错位。
 
-### 7. 实例身份（I1）
+### 5. 三分法定位 + 评分门槛 + 时间预算
 
-同名元素（6 个 Add to cart）的"哪个"由探索期采集的证据确定，而不是执行时现猜：
+```
+1 个命中 → 评分裁决后操作
+N 个命中 → 可见性过滤 → 同一元素判定 → 业务实体聚类；仍不确定 → 明确拒绝（绝不 nth 猜测）
+0 个命中 → 5s 全局预算内轮询 → 超时明确失败
+```
 
-- **探索期**：`_resolve_locator` 命中即标 `verified`（身份证据前移）；
-  对 observation 内同名重复的元素，沿 DOM 祖先链（li/article/
-  data-testid/data-product-id/data-item-id）采集容器首行稳定文本
-  （跳过价格/短行/自身文本）作为 `scope_has_text` 锚点——
-  **只对重复元素采集，非重复零开销**
-- **编译期**：Compiler 发现 observation 内同名 >1 且有锚点 → 自动附加
-  `Scope(has_text=...)`；唯一元素不附加（scope 最小化）；
-  重复无锚点（容器外元素）→ 记录 `unscoped_duplicates`（L1 corrections 输入）
-- **执行期**：scope 是证据不是命令——仍过三分法 + R2 评分 + margin 门槛；
-  失败明确拒绝，绝不 nth 猜测
+- **评分裁决**（R2）：不再是"第一个唯一命中胜出"——correction(130) > identity_exact(120)
+  > test_id(100) > role exact(90) > decorated(80) > text(60) > fuzzy(50，**导航短名禁用**)
+  > css(30)；winner 与不同身份来源的竞争证据分差 < 20 → `LowConfidenceError` 拒绝
+- **两阶段 + 全局 deadline**：Phase A 立即全量 `count()` 扫描；全零才在 ≤5s 预算内轮询
+  （150ms/次）——整个定位过程时间上界与候选数量无关
+- `wait_for` / `assert_visible` 走 allow_lazy：定位唯一后再单独等可见（预算 ≠ 超时）
 
-### 8. 修正闭环（L1：持久化定位覆盖规则）
+> 为什么多个匹配不自动选第一个？点错元素可能"执行成功、测试变绿"——假成功
+> 比明确失败更危险。真实踩坑：`"Cart"` 模糊匹配命中 `"Add to cart"`。
 
-执行失败的步骤可在前端**提交修正**（`test_id=xxx` / `css=xxx` / `text=xxx`），
-保存为持久化覆盖规则（`corrections.json`，键 = URL 模式 + 语义键）：
+### 6. 实例身份（I1）
 
-- **不绕过 Resolver**：修正以最高分（130）候选进入统一裁决——
-  仍过唯一性 + 评分 + margin 门槛；过期（0 命中）自然落回标准候选，
-  歧义照常拒绝
-- **统计与熔断**：命中后执行成功 `verified_count+1`、失败计数清零；
-  连续失败 ≥3 自动禁用
+同名元素（12 个 Add to cart）的"哪一个"由探索期采集的证据确定：
+
+- **探索期**：对 observation 内同名重复元素采集容器锚点（`scope_has_text`，
+  跳过价格/短行）与稳定业务身份（`data-product-id` / `data-item-id`）；非重复零开销
+- **编译期**：同名 >1 且有锚点 → 自动附加 `Scope(has_text=...)`；有 identity →
+  编译为最高分自动策略 `identity_exact`；容器外无锚点 → 记录 `unscoped_duplicates`
+  （诚实拒绝，留给 corrections）
+- **执行期**：scope 是证据不是命令——仍过三分法 + 评分 + margin 门槛
+
+### 7. 生成质量门与自愈（GQ / GQ2）
+
+- **探索完成性校验**：动作过少的"探索完成"宣告被拒绝并反馈继续探索
+- **缓存门槛**：`done=True 或已执行 ≥2 步` 才缓存——好探索不浪费，浅探索不毒化
+- **目标覆盖检查**：goal 要求"加购/登录/结算"而计划无对应 click → 警告/硬失败
+  （断言可见性不算覆盖——实测 9/10 类"看似完整实则漏动作"被提前暴露）
+- **硬失败 + 自愈重生 ×1**：可证明不完整的计划不返回——记录反模式（脱敏摘要）→
+  带负例重新规划一次 → 仍失败 400 明确报错；**绝不静默返回不完整计划**
+
+### 8. 修正闭环（L1）
+
+执行失败步骤可提交持久化覆盖规则（`corrections.json`，键 = URL 模式 + 语义键）：
+
+- **不绕过 Resolver**：修正以 130 分最高候选进入统一裁决，仍过唯一性 + 评分 + margin
+- **统计与熔断**：成功 `verified_count+1`；连续失败 ≥3 自动禁用
 - 措辞红线：叫"持久化覆盖规则"，不叫"学习"
 
-### 9. 生成质量门（GQ）
+### 9. 安全与隐私
 
-生成链路的可靠性保障（fail-open，只警告不硬失败）：
+- **凭据提取即脱敏**：账号/密码在进入 LLM 之前替换为 `${var}`，真实值只存本地内存；
+  探索历史与页面快照落盘前二次脱敏（含登录后页面显示的用户名）
+- **goto SSRF 防护**：scheme 白名单 + 拒绝 localhost / 私网段（防内网探测）
+- **artifact 路径穿越防护**：resolve + 前缀校验
+- **XSS**：前端所有用户可控字段 `escapeHtml`
+- **危险操作闸口**：action_executor 对破坏性操作的控制
 
-- **探索完成性校验**：目标要求操作时，动作过少的"探索完成"宣告被拒绝并
-  反馈继续探索（治"1 步后宣告完成"）
-- **缓存门槛**：`done=True 或已执行 ≥2 步` 才缓存——好探索不浪费
-  （实测二次生成 5.6s vs 冷启动 20-40s），浅探索仍拒缓存防毒化
-- **目标覆盖检查**（保守动作表）：goal 要求"加购/登录/结算"而计划中无
-  对应 **click 动作** → 生成提示醒目警告（断言可见性不算覆盖——
-  实测 9/10 类"看似完整实则漏动作"的计划被提前暴露）
-- **硬失败 + 自愈重生**（GQ2）：可证明不完整的计划不返回——记录反模式
-  （脱敏行为摘要）→ 带负例 few-shot 重新规划一次 → 仍失败则 400 明确
-  报错；"宁可明确失败，不返回不完整计划"
+### 10. 指标与观测
+
+每次生成/执行自动落盘 `timings.jsonl`（脱敏）→ `metrics.py` 聚合：成功率 /
+p50·p95 / 定位策略分布 / 探索 LLM 调用数。步骤级 `resolve_ms` / `resolved_by`
+进入执行证据。
+
+---
+
+## 测试
+
+零依赖 plain-assert 脚本（项目无 pytest），直接运行：
+
+```bash
+py backend/tests/test_grounding.py     # G3 状态接地（15 项）
+py backend/tests/test_compiler.py      # 编译 + I1 消歧（36 项）
+py backend/tests/test_resolver.py      # 定位语义防漂移（31 项）
+py backend/tests/test_explore_state.py # 探索状态机（41 项）
+py backend/tests/test_ax_provider.py   # CDP AX provider（真实浏览器冒烟，无浏览器则 SKIP）
+py backend/tests/test_capture_text.py  # 运行时变量捕获（4 项）
+# …共 12 个测试文件、191 个测试函数
+```
+
+测试纪律：**复现即固化**——每个真实 E2E 缺陷先复现、再固化成回归断言；
+协议正确性用单测，集成正确性必须真实浏览器 E2E 背书。
 
 ---
 
@@ -227,18 +247,40 @@ button = container.get_by_role("button", name="Add to cart")
 
 ### 已实现
 
-- AI 生成 DSL + 人工编辑确认
-- Playwright 执行：goto / click / input / wait_for / assert_text
-- 三分法定位、作用域消歧、失败截图证据
-- 变量替换（`${var}`），缺失变量明确报错
+- 自然语言 → 探索 → refs-only 规划 → 确定性编译 → Playwright 执行全链路
+- 动作集：goto / click / fill / select / check / wait_for / assert_visible /
+  assert_text / assert_url / **capture_text**（运行时变量捕获，跨页断言 `${var}`）
+- 三分法定位 + 评分门槛 + 5s 全局预算；实例身份消歧（I1）
+- G3 状态接地校验 + 质量门 + 自愈重生；L1 修正闭环
+- SSE 实时进度；探索缓存；凭据脱敏；危险操作闸口
+- 12 个测试文件、191 个测试函数全部通过；两个跨状态回归固化
 
 ### 后续规划
 
 | 方向 | 说明 |
 |------|------|
-| 页面结构感知 | 执行前抓取页面 ARIA snapshot 注入 Prompt，提升 AI 定位准确率 |
-| 运行时变量捕获 | `capture_text` / `capture_attribute`，支持"记录价格 → 断言一致"场景 |
-| 流式执行日志 | SSE 推送每步状态到前端（服务端单向推送场景，优于 WebSocket） |
-| Trace 证据 | Playwright Trace Viewer 记录完整操作轨迹，与步骤结果互补 |
-| 登录态复用 | `storage_state` 保存被测站点会话，避免重复登录 |
-| 持久化 | 用例与执行记录落库，支持多轮回归 |
+| AI 生成用例套件 | 一次探索生成多条用例（候选路径枚举 + LLM 选择 + 覆盖报告） |
+| 登录态复用 | `storage_state` 保存被测站点会话，避免反复登录污染状态图 |
+| 运行时点击恢复 | 被遮挡时的"等待 → dismiss → retry"（参考项目有，当前明确失败） |
+| Playwright Trace | 完整操作轨迹证据，与步骤级截图互补 |
+| 用例持久化 | 当前 JSON/内存足够，生产版落库 |
+| 视觉定位兜底 | A11y 语义覆盖不到的 canvas/SVG 场景（VLM，deferred） |
+
+### 已知边界
+
+- 无 A11y 语义的页面（canvas 自绘控件、纯 SVG）无法定位
+- 探索有预算上界（超大站点探索不完 → 只警告不静默）
+- 仅 Chromium（CDP 依赖；aria_snapshot 仅降级 fallback）
+- 覆盖率无法形式化证明——用"可证明不完整就拒绝 + 可疑就警告"代替
+
+---
+
+## 文档索引
+
+| 文档 | 内容 |
+|------|------|
+| `docs/ROADMAP.md` | 架构演进路线与决策记录（G1-G3 / R1-R5 / I1 / L1 / GQ） |
+| `docs/architecture-comparison.md` | 与参考项目三方对比（BFC 场景实测数据） |
+| `docs/execution-log.md` | 执行日志与实测记录 |
+| `docs/bug修复.txt` | 编号问题档案（20 条评审修复） |
+| `backend/regressions/` | 两个跨状态回归用例（固化） |

@@ -103,10 +103,13 @@ class DSLStep(DSLModel):
     action: Literal[
         "goto", "click", "fill", "input", "select", "check",
         "wait_for", "assert_visible", "assert_text", "assert_url",
-    ]   # input 是 fill 的兼容别名（旧用例 / AI 偶尔输出）
+        "capture_text",
+    ]   # input 是 fill 的兼容别名（旧用例 / AI 偶尔输出）；
+        # capture_text 是运行时变量捕获（文本存入 context_key，供后续 ${key} 断言）
     target: str | Locator | None = None
     scope: str | Scope | None = None
     value: str | None = None       # 输入值 / 选项文本 / 断言文本 / URL 片段
+    context_key: str | None = None # capture_text 的变量名（执行时写入运行时变量）
     timeout_ms: int = Field(default=15000, ge=100, le=60000)   # 单步超时（毫秒）
     observation_ref: str | None = None   # 该步骤基于哪个观察到的页面状态生成
                                           # （grounding provenance + Preflight 验证上下文；
@@ -137,6 +140,10 @@ class DSLStep(DSLModel):
             raise ValueError(f"{self.action} 必须提供 target/target_ref 和 value")
         if self.action in {"assert_text", "assert_url"} and not self.value:
             raise ValueError(f"{self.action} 必须提供 value")
+        if self.action == "capture_text" \
+                and ((self.target is None and self.target_ref is None)
+                     or not self.context_key):
+            raise ValueError("capture_text 必须提供 target/target_ref 和 context_key")
         return self
 
 

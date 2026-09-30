@@ -118,6 +118,8 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
    - 所有可变测试输入必须使用 ${var}，每个变量必须声明在 input_contract
    - secret=true → default 必须为 null（执行时本地注入）
    - 非敏感变量只有上下文明确提供 default 时才能填写；不得猜测真实值
+   - capture_text: 捕获的元素文本存入 context_key（运行时变量，不需声明在
+     input_contract）；后续步骤用 ${context_key} 引用（如跨页价格一致断言）
 5. observation_ref（grounding 引用）：
    - 每个可定位步骤应引用产生该定位证据的 observation id（obs1/obs2/...）
    - observation_ref 必须来自系统提供的 observation 列表，禁止编造
@@ -127,6 +129,7 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
      禁止把待验证文本只放在 target.text 而省略 value
    - assert_visible: target 必填；如果只是"某段文字/元素出现"，使用 assert_visible，而不是无 value 的 assert_text
    - assert_url: value 必填（URL 片段）
+   - capture_text: target + context_key 必填（捕获文本到运行时变量），无 value
 7. 最小测试原则：
    - 仅生成完成用户需求所需的最少步骤
    - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
@@ -188,6 +191,9 @@ SYSTEM_PROMPT_REFS_ONLY = """你是 Web UI 自动化测试的 DSL 生成器（re
    - 所有可变测试输入必须使用 ${var}，每个变量必须声明在 input_contract
    - secret=true → default 必须为 null（执行时本地注入）
    - 非敏感变量只有上下文明确提供 default 时才能填写；不得猜测真实值
+   - capture_text: 用 target_ref 引用目标元素 + context_key 变量名捕获文本
+     （运行时变量，不需声明在 input_contract）；后续 assert_text 的 value 用
+     ${context_key} 引用（如价格跨页一致断言）
 4. 业务动作覆盖（最重要）：
    - 用户目标中要求的每个业务动作都必须对应 transition_refs 中的转移——
      目标说"加入购物车"就必须有加购元素的转移，"登录"就必须有登录转移
