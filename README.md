@@ -20,8 +20,8 @@ LLM 负责语义理解与有限选择，定位、校验、执行、时间上界�
 # 1. 创建 .env（参考 .env.example，填你的 DeepSeek key）
 cp .env.example .env
 
-# 2. 安装依赖（无 requirements，四个包）
-py -m pip install fastapi uvicorn playwright pydantic
+# 2. 安装依赖
+py -m pip install -r requirements.txt
 
 # 3. 安装浏览器（如已安装过可跳过）
 py -m playwright install chromium
@@ -226,7 +226,7 @@ p50·p95 / 定位策略分布 / 探索 LLM 调用数。步骤级 `resolve_ms` / 
 
 ## 测试
 
-零依赖 plain-assert 脚本（项目无 pytest），直接运行：
+零依赖 plain-assert 脚本（测试本身无需 pytest，直接运行）：
 
 ```bash
 py backend/tests/test_grounding.py     # G3 状态接地（15 项）
