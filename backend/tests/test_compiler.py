@@ -139,6 +139,44 @@ def test_compile_unknown_ref_rejected():
     raise AssertionError("未抛出 UnknownTargetRefError")
 
 
+def test_compile_ax_static_text_as_text_locator():
+    """AX StaticText 不是 ARIA role——编译成 text 定位（get_by_text），
+    不生成 Locator(role="StaticText")（BFC 购物车断言真实失败回归）。"""
+    graph = StateGraph(observations=[
+        {"id": "obs1", "url": "https://x.com/cart", "elements": [
+            {"ref": "obs1:e11",
+             "role": "StaticText", "name": "Shopping Cart"},
+        ]},
+    ], transitions=[])
+    case = _case([
+        {"action": "goto", "value": "https://x.com/cart"},
+        {"action": "assert_visible", "target_ref": "obs1:e11",
+         "observation_ref": "obs1"},
+    ])
+    compiled = compile_targets(case, graph)
+    assert compiled.steps[1].target == Locator(text="Shopping Cart")
+
+
+def test_compile_linebreak_not_as_empty_text():
+    """LineBreak 无有意义文本——拒绝，绝不生成 Locator(text="")。"""
+    graph = StateGraph(observations=[
+        {"id": "obs1", "url": "https://x.com/cart", "elements": [
+            {"ref": "obs1:e12", "role": "LineBreak"},
+        ]},
+    ], transitions=[])
+    case = _case([
+        {"action": "goto", "value": "https://x.com/cart"},
+        {"action": "assert_visible", "target_ref": "obs1:e12",
+         "observation_ref": "obs1"},
+    ])
+    try:
+        compile_targets(case, graph)
+    except ValueError as exc:
+        assert "LineBreak" in str(exc)
+        return
+    raise AssertionError("LineBreak 未被拒绝")
+
+
 def test_compile_empty_graph_noop():
     """空图 → 原样返回（legacy 降级路径不做编译）。"""
     case = _case([
@@ -431,7 +469,12 @@ def test_validate_completion_exemption_and_gate():
     assert _validate_completion(s) is not None      # ≥2 步但 Add to cart 未探索 → 拒绝
     s.history = [{"action": "click", "target_ref": "obs3:e22",
                   "target": {"role": "link", "name": "Add to cart"}}]
-    assert _validate_completion(s) is None          # 目标动作已探索 → 通过
+    # S1：目标性动作还须形成 verified transition（点过失败 ≠ 完成）
+    assert _validate_completion(s) is not None      # 无转移 → 拒绝
+    s.transitions = [{"from": "obs3", "action": "click",
+                      "target_ref": "obs3:e22", "target_name": "Add to cart",
+                      "to": "obs4"}]
+    assert _validate_completion(s) is None          # 已验证转移 → 通过
 
 
 def test_check_goal_coverage_detects_missing_click():
@@ -528,6 +571,105 @@ def test_plan_summary_sanitized():
 
 # ── 运行入口 ──────────────────────────────────────────────────────────────────
 
+# ── 4. R7.1：transition_ref 展开 + State Cursor Grounding ─────────────────────
+
+def test_expand_plan_schema_deterministic():
+    """S3：transition_refs 数组 → 确定性展开；goto 自动注入；
+    断言 observation_ref 由 cursor 自动赋值（LLM 无权写）。"""
+    from ai_agent import _expand_plan_schema
+    edges = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e44", "to": "obs3"},
+        {"from": "obs3", "action": "click", "target_ref": "obs3:e2", "to": "obs5"},
+    ]
+    obs = [
+        {"id": "obs1", "url": "https://x.com/", "elements": []},
+        {"id": "obs2", "url": "https://x.com/p", "elements": [
+            {"ref": "obs2:e44", "kind": "action", "name": "Add to cart"}]},
+        {"id": "obs3", "url": "https://x.com/p", "elements": [
+            {"ref": "obs3:e2", "kind": "action", "name": "View Cart"}]},
+        {"id": "obs5", "url": "https://x.com/cart", "elements": [
+            {"ref": "obs5:e1", "kind": "evidence", "text": "Blue Top"}]},
+    ]
+    out = _expand_plan_schema({
+        "name": "t", "transition_refs": ["t1", "t2"],
+        "assertions": [
+            {"action": "assert_visible", "target_ref": "obs5:e1"},
+            {"action": "assert_text", "value": "Blue Top"},
+        ],
+    }, edges, obs, entry_url="https://x.com/")
+    steps = out["steps"]
+    # goto 自动注入（入口，observation_ref 匹配入口 obs）
+    assert steps[0] == {"action": "goto", "value": "https://x.com/",
+                        "observation_ref": "obs1"}
+    assert steps[1] == {"action": "click", "target_ref": "obs2:e44",
+                        "observation_ref": "obs2"}
+    assert steps[2] == {"action": "click", "target_ref": "obs3:e2",
+                        "observation_ref": "obs3"}
+    # 断言 observation_ref 由 cursor 自动赋值（当前 obs5）
+    assert steps[3]["action"] == "assert_visible"
+    assert steps[3]["target_ref"] == "obs5:e1"
+    assert steps[3]["observation_ref"] == "obs5"
+    # 页面级断言无 target_ref → observation_ref 也自动赋值
+    assert steps[4]["action"] == "assert_text"
+    assert steps[4]["observation_ref"] == "obs5"
+
+
+def test_expand_transition_refs_unknown_rejected():
+    """未知 transition_ref → ValueError（schema recovery 重试，不静默）。"""
+    from ai_agent import _expand_plan_schema
+    try:
+        _expand_plan_schema({
+            "name": "t", "transition_refs": ["t9"], "assertions": [],
+        }, [{"from": "obs1", "action": "click",
+             "target_ref": "obs1:e1", "to": "obs2"}])
+    except ValueError as exc:
+        assert "t9" in str(exc)
+        return
+    raise AssertionError("未知 transition_ref 未拒绝")
+
+
+def test_expand_assertion_ref_out_of_current_state():
+    """断言引用非当前状态元素 → ASSERTION_REF_OUT_OF_CURRENT_STATE
+    （跨状态引用结构上不可能，不靠 prompt/G3 兜底）。"""
+    from ai_agent import _expand_plan_schema
+    edges = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e44", "to": "obs3"},
+    ]
+    obs = [
+        {"id": "obs2", "url": "https://x.com/p", "elements": [
+            {"ref": "obs2:e1", "kind": "action", "name": "Old"}]},
+        {"id": "obs3", "url": "https://x.com/cart", "elements": [
+            {"ref": "obs3:e1", "kind": "evidence", "text": "Cart"}]},
+    ]
+    try:
+        _expand_plan_schema({
+            "name": "t", "transition_refs": ["t1"],
+            "assertions": [{"action": "assert_visible", "target_ref": "obs2:e1"}],
+        }, edges, obs)
+    except ValueError as exc:
+        assert "ASSERTION_REF_OUT_OF_CURRENT_STATE" in str(exc)
+        assert "obs3" in str(exc)
+        return
+    raise AssertionError("断言跨状态未被拒绝")
+
+
+def test_expand_transition_out_of_order_rejected():
+    """transition 起点 ≠ cursor → TRANSITION_OUT_OF_ORDER（路径沿边推进）。"""
+    from ai_agent import _expand_plan_schema
+    edges = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e44", "to": "obs3"},
+    ]
+    try:
+        _expand_plan_schema({
+            "name": "t", "transition_refs": ["t1", "t1"],   # 第二次 cursor=obs3
+            "assertions": [],
+        }, edges)
+    except ValueError as exc:
+        assert "TRANSITION_OUT_OF_ORDER" in str(exc)
+        return
+    raise AssertionError("transition 乱序未被拒绝")
+
+
 def main() -> int:
     tests = [
         (name, fn) for name, fn in sorted(globals().items())
@@ -543,6 +685,44 @@ def main() -> int:
             print(f"FAIL  {name}: {type(exc).__name__}: {exc}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
+
+
+def test_expand_plan_schema_pre_actions():
+    """S1：edge.pre_actions（探索恢复的 fill）确定性插入转移前
+    （登录：fill 用户名/密码 → click Login；Planner 不生成 fill）。"""
+    from ai_agent import _expand_plan_schema
+    edges = [
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e5", "to": "obs2",
+         "pre_actions": [
+             {"action": "fill", "target_ref": "obs1:e3", "value": "${username}"},
+             {"action": "fill", "target_ref": "obs1:e4", "value": "${password}"},
+         ]},
+    ]
+    obs = [
+        {"id": "obs1", "url": "https://x.com/", "elements": [
+            {"ref": "obs1:e3", "kind": "action", "name": "Username"},
+            {"ref": "obs1:e4", "kind": "action", "name": "Password"},
+            {"ref": "obs1:e5", "kind": "action", "name": "Login"},
+        ]},
+        {"id": "obs2", "url": "https://x.com/home", "elements": [
+            {"ref": "obs2:e1", "kind": "action", "name": "Buy"},
+        ]},
+    ]
+    out = _expand_plan_schema({
+        "name": "t", "transition_refs": ["t1"], "assertions": [],
+    }, edges, obs, entry_url="https://x.com/")
+    acts = [(s["action"], s.get("value")) for s in out["steps"]]
+    assert [a for a, _ in acts] == ["goto", "fill", "fill", "click"]
+    assert acts[1] == ("fill", "${username}")
+    assert acts[2] == ("fill", "${password}")
+    assert out["steps"][1]["target_ref"] == "obs1:e3"
+    assert out["steps"][1]["observation_ref"] == "obs1"
+    # 无边 pre_actions → 只展开转移
+    edges2 = [{"from": "obs1", "action": "click", "target_ref": "obs1:e5", "to": "obs2"}]
+    out2 = _expand_plan_schema({
+        "name": "t", "transition_refs": ["t1"], "assertions": [],
+    }, edges2, obs, entry_url="https://x.com/")
+    assert [s["action"] for s in out2["steps"]] == ["goto", "click"]
 
 
 if __name__ == "__main__":

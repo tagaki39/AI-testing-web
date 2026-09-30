@@ -1,0 +1,29 @@
+架构参考——代码快照
+====================
+导出时间: 2026-08-18
+
+目录结构:
+  backend/          FastAPI 后端（app 下按模块组织，py → txt）
+    ai/              AI 能力（dsl_generator / page_explorer / planning_tools / test_planning_agent / locator_preflight）
+    api/             API 路由层（15 个路由模块）
+    core/            核心配置（config / settings）
+    db/              数据库（session / base / init）
+    locators/        5 层定位系统（semantic / corrections / ai_visual / fallback / url_pattern）
+    models/          SQLAlchemy ORM 模型（20 个）
+    reporters/       报告生成
+    runners/         Playwright 执行引擎（playwright_runner / click_preprocessor / postcondition_verifier / locator_confidence）
+    schemas/         Pydantic DSL / API schema（10 个）
+    services/        业务逻辑（ai_planning / ai_planning_streaming / auth / cases / executions / corrections / dsl / project_management / report_preferences / settings / sse_event_log）
+    main.txt         FastAPI 入口
+  frontend/         React + TS + Vite 前端（src 下 39 个文件）
+  docs/             设计文档
+  README.md / AGENTS.md / CLAUDE.md   项目文档
+
+阅读路径建议:
+  1. schemas/dsl.txt        ← DSL 结构化（target/scope 语义）
+  2. ai/dsl_generator.txt   ← NL→DSL 生成 + prompt 规则
+  3. locators/semantic.txt  ← 语义定位
+  4. runners/playwright_runner.txt  ← 执行引擎
+  5. ai/page_explorer.txt   ← 页面探索
+  6. runners/postcondition_verifier.txt  ← 动作后验证
+  7. services/ai_planning.txt ← 会话式 AI 规划

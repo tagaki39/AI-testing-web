@@ -50,8 +50,9 @@ from locator.resolver import (
     business_identity, decide_resolution, parse_target, target_key,
 )
 
-# 执行截图保存目录（项目根/artifacts）
-ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "artifacts"
+# 执行截图保存目录（项目根/artifacts——注意：本文件在 backend/execution/ 下，
+# parents[2] 才是项目根；parents[1] 是 backend/，会把截图写错位导致 API 404）
+ARTIFACTS_DIR = Path(__file__).resolve().parents[2] / "artifacts"
 
 # 变量占位符的正则：匹配 "${email}" 这种写法
 # re.compile 预编译一次，后面反复用，比每次 re.search 快
@@ -428,6 +429,11 @@ def _execute_step(page, step: DSLStep, variables: dict[str, str], step_dir: Path
             elif step.action == "assert_text":
                 text = _substitute(step.value, variables) or ""
                 expect(locator).to_contain_text(text, timeout=step.timeout_ms)
+            elif step.action == "capture_text":
+                # 运行时变量捕获：元素可见文本 → context_key（后续 ${key} 断言引用）
+                text = locator.inner_text().strip()
+                variables[step.context_key] = text
+                evidence["captured"] = f"{step.context_key}={text[:60]}"
 
         # 每步截图作为证据（full_page=True 截整页，不只是视口）
         shot = step_dir / f"step-{index:02d}.png"
@@ -491,6 +497,7 @@ def execute_case(
     case: DSLCase,
     variables: dict[str, str] | None = None,
     continue_on_failure: bool = False,
+    on_event: "callable | None" = None,
 ) -> dict:
     """执行整个用例，返回报告。
 
@@ -506,9 +513,21 @@ def execute_case(
       False → 某步失败后剩余步骤标记 skipped（级联失败不产生噪音报告）
       True  → 每步独立成败，继续执行（旧行为）
 
+    on_event（SSE 实时进度）：可选回调，逐步推送进度事件——
+      {"type": "step_started", "step_index", "action"}
+      {"type": "step_completed", "step_index", "action", "status", "error"}
+    回调异常必须吞掉（进度推送失败不影响执行主链路）。
+
     sync_playwright() 上下文管理器：自动管理浏览器生命周期。
     headless=True：无头模式（不弹窗口），服务器环境必须用这个。
     """
+    def _emit(ev: dict) -> None:
+        if on_event is None:
+            return
+        try:
+            on_event(ev)
+        except Exception:
+            pass
     ensure_executable_targets(case)   # ← 执行前防线（ref-only 步骤拒绝，浏览器启动前）
     variables = dict(variables or {})
     # 把 input_contract 里的默认值合并进来（DSL 声明的变量默认值）
@@ -540,6 +559,8 @@ def execute_case(
         # 核心循环：逐步骤执行（fail-fast 默认：失败后剩余步骤 skipped）
         for index, step in enumerate(case.steps, start=1):
             if failed and not continue_on_failure:
+                _emit({"type": "step_started", "step_index": index,
+                       "action": step.action})
                 results.append({
                     "step_index": index,
                     "action": step.action,
@@ -547,13 +568,22 @@ def execute_case(
                     "error": "前序步骤失败，已跳过（fail-fast）",
                     "duration_ms": 0,
                 })
+                _emit({"type": "step_completed", "step_index": index,
+                       "action": step.action, "status": "skipped",
+                       "error": None})
                 continue
+            _emit({"type": "step_started", "step_index": index,
+                   "action": step.action})
             evidence = _execute_step(page, step, variables, run_dir, index)
             results.append(evidence)
             if evidence["status"] == "failed" and not continue_on_failure:
                 failed = True
             if evidence["url"]:
                 latest_url = evidence["url"]
+            _emit({"type": "step_completed", "step_index": index,
+                   "action": step.action,
+                   "status": evidence["status"],
+                   "error": (evidence.get("error") or "")[:200]})
 
         browser.close()
 

@@ -157,6 +157,7 @@ class ParsedTarget:
     text: str | None = None
     test_id: str | None = None
     css: str | None = None
+    identity: dict | None = None   # A4.2：稳定业务 identity（{attr, value}）
 
 
 def parse_target(target: str | dict | None) -> ParsedTarget | None:
@@ -180,13 +181,14 @@ def parse_target(target: str | dict | None) -> ParsedTarget | None:
         target = target.model_dump() if hasattr(target, "model_dump") else dict(target)
 
     if isinstance(target, dict):
-        # 结构化格式：直接取出各字段
+        # 结构化格式：直接取出各字段（identity：A4.2 稳定业务 identity）
         return ParsedTarget(
             role=target.get("role"),
             name=target.get("name"),
             text=target.get("text"),
             test_id=target.get("test_id"),
             css=target.get("css"),
+            identity=target.get("identity") or None,
         )
 
     t = target.strip()
@@ -220,6 +222,24 @@ def build_locator_candidates(container, t: ParsedTarget) -> list[tuple[str, obje
       歧义仍然安全：模糊匹配到 2+ 个会被三分法拦截。
     """
     candidates: list[tuple[str, object]] = []
+    if t.identity and t.identity.get("attr") and t.identity.get("value"):
+        # A4.2 identity_exact：稳定业务 identity（data-product-id 等）——
+        # 确定性属性定位（非 CSS fallback：由 Compiler 从观察元素编译，
+        # LLM 不生成）。多个 DOM representation 时 count>1 由调用方
+        # 做可执行性裁决（visible 唯一）。
+        # S1：identity 是业务约束（filter）——目标指定了商品，role/text
+        # fallback 可能命中【别的商品】（BFC 实测：id=8 元素渲染竞态时
+        # role 命中了唯一可见的 Blue Top Add → 加错商品，购物车两件 500）。
+        # count=0 时由调用方轮询等待（allow_lazy）或诚实失败，绝不降级。
+        selector = f'[{t.identity["attr"]}="{t.identity["value"]}"]'
+        # S1：identity 是业务实体约束——【全局】建立候选集，scope 不参与。
+        # BFC 实测：scope 容器（I1 采集的 scope_has_text 可能因 DOM 结构
+        # 匹配到相邻卡片）会把正确 identity 过滤掉（global=2 scoped=0）。
+        # identity 唯一标识业务实体，跨容器；scope 只对无 identity 的
+        # role/text fallback 消歧。
+        _page = container.page if hasattr(container, "page") else container
+        candidates.append(("identity_exact", _page.locator(selector)))
+        return candidates
     if t.test_id:
         # get_by_test_id 默认只认 data-testid；真实站点常用 data-test/data-qa
         #（saucedemo 用 data-test）→ 附加属性变体
@@ -240,6 +260,11 @@ def build_locator_candidates(container, t: ParsedTarget) -> list[tuple[str, obje
         # "错误点击却看似成功"（比明确失败更危险）
         if not is_navigation_name(t.role, t.name):
             candidates.append(("role_fuzzy", container.get_by_role(t.role, name=t.name)))
+        # S1：text 兜底——CDP AX 观察（getFullAXTree）与 Playwright 执行
+        #（aria snapshot）对无 href 的 <a> role 判定不一致（CDP=link，
+        # Playwright=text）。低优先级（exact 文本），role 定位失败时
+        # 用 accessible name 文本兜底（count==1 才赢，不放大歧义）。
+        candidates.append(("text", container.get_by_text(t.name, exact=True)))
     if t.text:
         candidates.append(("text", container.get_by_text(t.text)))
         # 修复（真实 E2E）：图标前缀文本——PUA 字符来自 CSS 伪元素内容
@@ -358,6 +383,8 @@ def build_locator_for_count(page, target: dict):
 # 高于一切自动策略——但仍走统一裁决（唯一性 + margin 门槛），不绕过。
 STRATEGY_SCORES = {
     "correction": 130,
+    "identity_exact": 120,   # A4.2：确定性业务 identity（data-product-id）——
+                             # Compiler 编译，非 LLM 生成，最贴近业务语义
     "test_id": 100, "test_id_attr": 95, "role": 90,
     "role_decorated": 80, "text": 60, "text_clean": 55,
     "role_fuzzy": 50, "css": 30,
@@ -388,6 +415,8 @@ class ResolutionResult:
 # 竞争只发生在【不同身份来源】之间（test_id vs test_id_attr 各自成组，
 # 因为它们是不同属性契约，命中不同元素 = 真矛盾）。
 RELAXATION_GROUP_OF = {
+    "identity_exact": "identity",   # A4.2：独立身份来源——同一业务实体的
+                                    # 多个 DOM representation 不算真歧义
     "role": "role", "role_decorated": "role", "role_fuzzy": "role",
     "test_id": "test_id", "test_id_attr": "test_id_attr",
     "text": "text", "text_clean": "text",   # 同族：装饰清理是放松阶梯
@@ -431,13 +460,67 @@ def decide_resolution(rows: list) -> ResolutionResult:
     """
     hits_by_strategy: dict[str, list] = {}
     positive_by_strategy: dict[str, int] = {}   # 策略 → count>1 的行数
+    identity_locators: list = []   # A4.2：identity_exact 的 count>1 行保留 locator
     for strategy, locator, count in rows:
         if count == 1:
             hits_by_strategy.setdefault(strategy, []).append((strategy, locator))
         elif count > 1:
             positive_by_strategy[strategy] = positive_by_strategy.get(strategy, 0) + 1
+            if strategy == "identity_exact":
+                identity_locators.append((strategy, locator))
 
     if not hits_by_strategy:
+        # A4.2：identity_exact 是唯一候选（count>1，无任何唯一命中）——
+        # 同一业务实体的多个 DOM representation（normal+overlay）不是真歧义，
+        # 用可执行性裁决：恰好 1 个可见 → 解决；多可见 → ambiguous；
+        # 0 可见 → 落入下方既有拒绝路径（不改变拒绝语义）。
+        if identity_locators:
+            # 注意：locator.is_visible() 对多匹配 locator 抛 strict mode
+            # violation → 必须逐元素检查（locator.all() 拿 ElementHandle）
+            visible_indices: list[tuple[str, int]] = []
+            for strategy, locator in identity_locators:
+                try:
+                    handles = locator.all()
+                    visible_indices.extend(
+                        (strategy, i) for i, h in enumerate(handles)
+                        if h.is_visible()
+                    )
+                except Exception:
+                    continue
+            if len(visible_indices) == 1:
+                strategy, i = visible_indices[0]
+                return ResolutionResult(
+                    status="resolved", strategy="identity_exact",
+                    hits=[(strategy, locator.nth(i))],
+                )
+            if len(visible_indices) > 1:
+                # S1：多 visible 必须【证明动作语义等价】才视为同一动作的
+                # 多个 representation（Identity 约束"是谁"，role/name 约束
+                # "做什么"——只有 (tag, 文本) 一致的节点才等价）。
+                # BFC 实测：全局 [data-product-id="1"] 16 个都是 Blue Top
+                # 的 Add to cart（Polo 卡片 + 推荐区）→ 等价 → 选第一个；
+                # 若混入不同语义（Remove/View Product）→ AMBIGUOUS。
+                try:
+                    handles = locator.all()
+                    sigs = {
+                        handles[i].evaluate(
+                            "el => el.tagName + '|' + (el.innerText || '').trim()")
+                        for _, i in visible_indices
+                    }
+                except Exception:
+                    sigs = {"?"}
+                if len(sigs) == 1:
+                    strategy, i = visible_indices[0]
+                    return ResolutionResult(
+                        status="resolved", strategy="identity_exact",
+                        hits=[(strategy, locator.nth(i))],
+                    )
+                return ResolutionResult(
+                    status="ambiguous",
+                    detail=(f"identity_exact 命中 {len(visible_indices)} 处可见"
+                            "但动作语义不一致的节点（同业务实体不同动作）"
+                            "——无法视为同一动作的 representation"),
+                )
         if positive_by_strategy:
             return ResolutionResult(
                 status="ambiguous",
@@ -474,13 +557,22 @@ def decide_resolution(rows: list) -> ResolutionResult:
             ))
     for group, (strategy, score, n) in group_positives.items():
         if group != winner_group:
+            # A4.2：identity 组的 count>1 是同一业务实体的重复 DOM 表示
+            #（normal+overlay），不是竞争身份来源——不参与 margin 拒绝。
+            # role 已唯一命中可见表示时，不得被隐藏的 overlay 重复否决；
+            # identity 组自身的 count>1 由可见性裁决处理（见上）。
+            if group == "identity":
+                continue
             blockers.append((
                 strategy, score,
                 f"{n} 行多匹配（{group} 组，count>1）",
             ))
     if blockers:
         best = max(blockers, key=lambda b: b[1])
-        if best[1] >= winner_score - CONFIDENCE_MARGIN:
+        # 边界语义修正：分差"恰好等于门槛"应放行（达标），拒绝只针对
+        # 分差 < 门槛（margin 不足）。此前用 >= 把 =门槛 的合法命中
+        # 一并拒绝（实测：role_decorated 80 vs text 60 差 20 被误拒）。
+        if best[1] > winner_score - CONFIDENCE_MARGIN:
             return ResolutionResult(
                 status="low_confidence",
                 detail=(

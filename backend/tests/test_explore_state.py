@@ -36,10 +36,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from explore import (   # noqa: E402
-    ExploreState, _decide, _detect_auth_failure, _detect_error_page,
+    ExploreState, TerminationReason, _decide, _detect_auth_failure, _detect_error_page,
     _is_repeated_no_progress, _record_page, _validate_action_target,
     _validate_completion, validate_actionability,
 )
+from explore.action_space import _build_action_space   # noqa: E402
 
 
 # ── page mock（_record_page 只依赖 url / title / locator("body").aria_snapshot）──
@@ -109,7 +110,8 @@ def _decide_state() -> ExploreState:
         goal="login", entry_url="https://x.com",
         input_keys={"email", "password"},
     )
-    state.elements = [{"ref": "obs2:e10", "role": "textbox", "name": "Email"}]
+    state.elements = [{"ref": "obs2:e10", "kind": "action",
+            "role": "textbox", "name": "Email"}]
     state.observations = [{
         "id": "obs2", "url": "https://x.com/login",
         "state_hash": "h", "elements": state.elements,
@@ -119,7 +121,7 @@ def _decide_state() -> ExploreState:
 
 def test_c_unknown_runtime_key_rejected() -> None:
     """${username} 不在白名单（{email, password}）→ 决策拒绝。"""
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "fill", "target_ref": "obs2:e10", "value": "${username}"}'
     decision, err = _decide(_decide_state(), llm)
     assert decision is None, "未知 key 必须被拒"
@@ -128,7 +130,7 @@ def test_c_unknown_runtime_key_rejected() -> None:
 
 def test_d_literal_value_rejected() -> None:
     """真实值（test123@example.com）→ 决策拒绝（模型不得输出真实值）。"""
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return ('{"action": "fill", "target_ref": "obs2:e10", '
                 '"value": "test123@example.com"}')
     decision, err = _decide(_decide_state(), llm)
@@ -138,7 +140,7 @@ def test_d_literal_value_rejected() -> None:
 
 def test_c2_known_key_passes() -> None:
     """${email} 在白名单 → 决策通过（对照：校验不放跑真占位符）。"""
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "fill", "target_ref": "obs2:e10", "value": "${email}"}'
     decision, err = _decide(_decide_state(), llm)
     assert decision is not None, f"合法占位符被误拒: {err}"
@@ -158,7 +160,8 @@ def test_h2_role_action_matrix() -> None:
     assert _validate_action_target("click", {"role": "button", "name": "Login"}) == (True, None)
     assert _validate_action_target("fill", {"role": "button", "name": "Login"})[0] is False
     assert _validate_action_target("fill", {"role": "textbox", "name": "Email"}) == (True, None)
-    assert _validate_action_target("click", {"role": "textbox", "name": "Email"}) == (True, None)
+    # P3：textbox 不支持 click（fill() 完成 focus——低价值动作移除）
+    assert _validate_action_target("click", {"role": "textbox", "name": "Email"})[0] is False
     assert _validate_action_target("press", {"role": "link", "name": "Cart"}) == (True, None)
 
 
@@ -167,28 +170,31 @@ def test_h3_text_click_rejected_in_decide() -> None:
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
         {"ref": "obs1:e1", "type": "text", "text": "Blue Top"},
-        {"ref": "obs1:e2", "role": "button", "name": "Add to cart"},
+        {"ref": "obs1:e2", "kind": "action",
+            "role": "button", "name": "Add to cart"},
     ]
     state.observations = [{
         "id": "obs1", "url": "https://x.com", "state_hash": "h",
         "elements": state.elements,
     }]
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs1:e1"}'
     decision, err = _decide(state, llm)
     assert decision is None, "click text 必须被拒"
-    assert "NON_ACTIONABLE_REF" in (err or "")
+    # R7.3：决策层白名单提前拒绝（text 无 kind=action，不进入 Selectable）
+    assert "不是可操作元素" in (err or "")
 
 
 def test_h4_button_click_passes() -> None:
     """点击真按钮 → 通过（对照）。"""
     state = ExploreState(goal="buy", entry_url="https://x.com")
-    state.elements = [{"ref": "obs1:e2", "role": "button", "name": "Add to cart"}]
+    state.elements = [{"ref": "obs1:e2", "kind": "action",
+            "role": "button", "name": "Add to cart"}]
     state.observations = [{
         "id": "obs1", "url": "https://x.com", "state_hash": "h",
         "elements": state.elements,
     }]
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs1:e2"}'
     decision, err = _decide(state, llm)
     assert decision is not None, f"合法点击被误拒: {err}"
@@ -253,8 +259,10 @@ def test_i4_blacklist_removed_from_action_space() -> None:
     from explore import _build_action_space
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
-        {"ref": "obs4:e25", "role": "link", "name": "Add to cart", "actionable": True},
-        {"ref": "obs4:e24", "role": "button", "name": "Continue Shopping", "actionable": True},
+        {"ref": "obs4:e25", "kind": "action",
+            "role": "link", "name": "Add to cart", "actionable": True},
+        {"ref": "obs4:e24", "kind": "action",
+            "role": "button", "name": "Continue Shopping", "actionable": True},
     ]
     state.observations = [{
         "id": "obs4", "url": "https://x.com", "state_hash": "h",
@@ -272,8 +280,10 @@ def test_i5_blacklisted_ref_rejected_by_validator() -> None:
     """防御兜底：模型仍输出黑名单 ref → ref 校验拒绝（不在候选表内）。"""
     state = ExploreState(goal="buy", entry_url="https://x.com")
     state.elements = [
-        {"ref": "obs4:e25", "role": "link", "name": "Add to cart", "actionable": True},
-        {"ref": "obs4:e24", "role": "button", "name": "Continue Shopping", "actionable": True},
+        {"ref": "obs4:e25", "kind": "action",
+            "role": "link", "name": "Add to cart", "actionable": True},
+        {"ref": "obs4:e24", "kind": "action",
+            "role": "button", "name": "Continue Shopping", "actionable": True},
     ]
     state.observations = [{
         "id": "obs4", "url": "https://x.com", "state_hash": "h",
@@ -281,13 +291,13 @@ def test_i5_blacklisted_ref_rejected_by_validator() -> None:
     }]
     state.failed_actions.add(("obs4", "click", "obs4:e25"))
     state.current_obs = "obs4"
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs4:e25"}'
     decision, err = _decide(state, llm, elements=[
         e for e in state.elements if (state.current_obs, "click", e["ref"])
         not in state.failed_actions])
     assert decision is None, "黑名单 ref 必须被拒"
-    assert "不在当前元素表" in (err or "")
+    assert "不是可操作元素" in (err or "")
 
 
 # ── J：完成宣告的完整性校验（BFC 实测：3 步宣告完成，目标动作未探索）─────────
@@ -326,6 +336,261 @@ def test_j3_no_action_goal_exempt() -> None:
     assert _validate_completion(state) is None
 
 
+def _completed_login_state(goal: str) -> ExploreState:
+    """构造已有 verified login transition 的最小完成状态。"""
+    state = ExploreState(goal=goal, entry_url="https://x.com")
+    state.step_count = 2
+    state.history = [
+        {"action": "fill", "target_ref": "obs1:e1", "value": "${username}"},
+        {"action": "click", "target_ref": "obs1:e2",
+         "target": {"role": "button", "name": "登录"}},
+    ]
+    state.transitions = [
+        {"from": "obs1", "action": "click", "target_ref": "obs1:e2",
+         "target_name": "登录", "to": "obs2"},
+    ]
+    state.current_obs = "obs2"
+    return state
+
+
+def test_j3a_login_only_is_deterministically_ready() -> None:
+    """纯登录目标证据齐备后可以由程序自动完成。"""
+    from explore.explorer import _completion_status
+    status = _completion_status(_completed_login_state("登录系统"))
+    assert status.ready
+    assert not status.unknown
+
+
+def test_j3b_login_with_further_action_is_unknown_not_ready() -> None:
+    """登录成功不代表后续生成任务完成；应交还 LLM 继续语义探索。"""
+    from explore.explorer import _completion_status
+    state = _completed_login_state("登录后进入图片生成页面，填写提示词并生成图片")
+    status = _completion_status(state)
+    assert not status.ready
+    assert status.unknown
+    assert _validate_completion(state) is None  # UNKNOWN 时允许模型选择 finish
+
+
+def test_j3c_missing_login_evidence_remains_incomplete() -> None:
+    """三态不能放松硬门：未验证登录时仍必须禁止 finish。"""
+    from explore.explorer import _completion_status
+    state = ExploreState(
+        goal="登录后进入图片生成页面，生成图片", entry_url="https://x.com")
+    state.step_count = 3
+    status = _completion_status(state)
+    assert not status.ready
+    assert not status.unknown
+    assert _validate_completion(state) is not None
+
+
+def test_j3d_termination_reason_is_separate_from_done() -> None:
+    """done 只表示停止；结构化 reason 才表达停止语义。"""
+    state = ExploreState(goal="login", entry_url="https://x.com")
+    assert not state.done and state.termination_reason is None
+    state.terminate(TerminationReason.AUTH_REJECTED)
+    assert state.done
+    assert state.termination_reason == TerminationReason.AUTH_REJECTED
+
+
+def test_singleton_click_only_role_is_deterministic() -> None:
+    """唯一 checkbox 只有 click 能力，可安全跳过 LLM。"""
+    from explore.explorer import _deterministic_singleton_decision
+    decision = _deterministic_singleton_decision([
+        {"ref": "obs1:e1", "kind": "action", "role": "checkbox", "name": "Remember"},
+    ])
+    assert decision == {"action": "click", "target_ref": "obs1:e1"}
+
+
+def test_singleton_textbox_or_button_does_not_assume_click() -> None:
+    """textbox/button 有多个动作语义，必须交给决策层。"""
+    from explore.explorer import _deterministic_singleton_decision
+    textbox = [
+        {"ref": "obs1:e1", "kind": "action", "role": "textbox", "name": "Prompt"},
+    ]
+    button = [
+        {"ref": "obs1:e2", "kind": "action", "role": "button", "name": "Generate"},
+    ]
+    assert _deterministic_singleton_decision(textbox) is None
+    assert _deterministic_singleton_decision(button) is None
+
+
+def test_classify_fill_selfloop_no_transition() -> None:
+    """S1-1：fill obs1→obs1 不产生 transition（只进 pending）。"""
+    from explore.explorer import _classify_action_outcome
+    pending, edge = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e3", "${username}", None, [])
+    assert edge is None
+    assert pending == [{"action": "fill", "target_ref": "obs1:e3",
+                        "value": "${username}", "observation_ref": "obs1"}]
+
+
+def test_classify_consecutive_fills_bound_to_next_transition() -> None:
+    """S1-2：两个连续 fill 按原顺序绑定到下一条 obs1→obs2 迁移。"""
+    from explore.explorer import _classify_action_outcome
+    pending, _ = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e3", "${username}", None, [])
+    pending, _ = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e4", "${password}", None, pending)
+    pending, edge = _classify_action_outcome(
+        "click", "obs1", "obs2", "obs1:e5", None, "Login", pending)
+    assert edge is not None
+    assert [p["target_ref"] for p in edge["pre_actions"]] == ["obs1:e3", "obs1:e4"]
+    assert [p["value"] for p in edge["pre_actions"]] == ["${username}", "${password}"]
+    assert pending == []   # 真实迁移落图后消费
+
+
+def test_classify_select_real_transition_not_in_own_pre_actions() -> None:
+    """S1-3：select 造成 obs1→obs2 → 成为 transition；自身不进 pre_actions。"""
+    from explore.explorer import _classify_action_outcome
+    pending, _ = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e3", "${u}", None, [])
+    pending, edge = _classify_action_outcome(
+        "select", "obs1", "obs2", "obs1:e7", "B", None, pending)
+    assert edge is not None and edge["action"] == "select"
+    assert [p["action"] for p in edge["pre_actions"]] == ["fill"]
+    assert pending == []
+
+
+def test_classify_selfloop_click_not_in_pending() -> None:
+    """S1-4：self-loop click（无进展）不进 StateGraph、不进 pending
+    （保留 history 供 no-progress 诊断）。"""
+    from explore.explorer import _classify_action_outcome
+    pending, edge = _classify_action_outcome(
+        "click", "obs1", "obs1", "obs1:e9", None, "Retry", [])
+    assert edge is None
+    assert pending == []
+
+
+def test_classify_fill_then_select_migration() -> None:
+    """S1-5：fill（状态内）+ select（真迁移 obs1→obs2）→
+    select 的 edge.pre_actions=[fill]。"""
+    from explore.explorer import _classify_action_outcome
+    pending, _ = _classify_action_outcome(
+        "fill", "obs1", "obs1", "obs1:e3", "${u}", None, [])
+    pending, edge = _classify_action_outcome(
+        "select", "obs1", "obs2", "obs1:e7", "B", None, pending)
+    assert edge is not None
+    assert [p["target_ref"] for p in edge["pre_actions"]] == ["obs1:e3"]
+    assert edge["pre_actions"][0]["observation_ref"] == "obs1"
+
+
+def test_cart_entry_name_semantic_classifier() -> None:
+    """购物车入口语义分类：PUA 图标前缀可匹配（BFC：导航 " Cart"），
+    但 "Add to cart" 绝不误判（正则保持语义精确）。"""
+    from explore.explorer import _is_cart_entry_name
+    assert _is_cart_entry_name("Cart")
+    assert _is_cart_entry_name(" Cart")
+    assert _is_cart_entry_name("View Cart")
+    assert _is_cart_entry_name(" View Cart")
+    # 反例：加购动作不是进入购物车
+    assert not _is_cart_entry_name("Add to cart")
+    assert not _is_cart_entry_name("Continue Shopping")
+
+
+def test_finish_disabled_until_completion() -> None:
+    """S1：完成校验不通过时 finish 在决策层禁用（prompt 白名单不含
+    finish + 代码校验拒绝）——不消耗预算让 LLM 反复尝试同一结论。"""
+    state = ExploreState(
+        goal="将前两个商品加入购物车，并在购物车中验证商品信息",
+        entry_url="https://x.com",
+    )
+    state.step_count = 5
+    state.history = [
+        {"action": "click", "target_ref": "obs1:e3", "target": {"role": "link", "name": "Add to cart"}},
+    ]
+    def llm(prompt, system_prompt=None, timeout=None):
+        # LLM 仍输出 finish（不遵守白名单）→ 代码校验拒绝
+        return '{"action": "finish", "exploration_complete": true}'
+    decision, err = _decide(state, llm, elements=[
+        {"ref": "obs2:e1", "kind": "action", "role": "button", "name": "Continue Shopping"},
+    ])
+    assert decision is None, "未完成时 finish 必须被拒"
+    assert "finish 当前禁用" in (err or "")
+    # 完成（数量齐 + 正停留在购物车终态）→ finish 允许
+    state.observations = [
+        {"id": "obs2", "url": "https://x.com", "elements": [
+            {"ref": "obs2:e1", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "1"}},
+            {"ref": "obs2:e2", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "8"}},
+        ]},
+        {"id": "obs6", "url": "https://x.com/view_cart", "elements": [
+            {"ref": "obs6:e1", "kind": "evidence", "text": "Shopping Cart"},
+        ]},
+    ]
+    state.transitions = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e1",
+         "target_name": "Add to cart", "to": "obs3"},
+        {"from": "obs4", "action": "click", "target_ref": "obs2:e2",
+         "target_name": "Add to cart", "to": "obs5"},
+        {"from": "obs5", "action": "click", "target_ref": "obs5:e2",
+         "target_name": "View Cart", "to": "obs6"},
+    ]
+    state.current_obs = "obs6"
+    state.history.append(
+        {"action": "click", "target_ref": "obs1:e3", "target": {"role": "link", "name": "Add to cart"}})
+    decision2, err2 = _decide(state, llm, elements=[
+        {"ref": "obs2:e1", "kind": "action", "role": "button", "name": "Continue Shopping"},
+    ])
+    assert decision2 is not None and decision2.get("action") == "finish", f"完成时应允许 finish: {err2}"
+
+
+def test_j4_cart_verify_requires_cart_entry_transition() -> None:
+    """R7.2：目标要求"验证购物车"但 StateGraph 无成功购物车入口
+    transition（View Cart）→ 完成宣告被拒；有则通过（不靠 URL）。"""
+    state = ExploreState(
+        goal="将前两个商品加入购物车，并在购物车中验证商品信息",
+        entry_url="https://x.com",
+    )
+    state.step_count = 5
+    state.history = [
+        {"action": "click", "target_ref": "obs1:e3", "target": {"role": "link", "name": "Add to cart"}},
+    ]
+    # 数量检查先于 cart：completed=0 < required=2 → 数量拒绝
+    state.transitions = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e1",
+         "target_name": "Add to cart", "to": "obs3"},
+    ]
+    err = _validate_completion(state)
+    assert err is not None and "数量目标未完成" in err
+    # 数量完成（2 个不同实体）+ 成功 View Cart transition → 通过
+    state.observations = [
+        {"id": "obs2", "url": "https://x.com", "elements": [
+            {"ref": "obs2:e1", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "1"}},
+            {"ref": "obs2:e2", "kind": "action", "name": "Add to cart",
+             "identity": {"attr": "data-product-id", "value": "8"}},
+        ]},
+        {"id": "obs6", "url": "https://x.com/view_cart", "elements": [
+            {"ref": "obs6:e1", "kind": "evidence", "text": "Shopping Cart"},
+        ]},
+    ]
+    state.transitions = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e1",
+         "target_name": "Add to cart", "to": "obs3"},
+        {"from": "obs4", "action": "click", "target_ref": "obs2:e2",
+         "target_name": "Add to cart", "to": "obs5"},
+        {"from": "obs5", "action": "click", "target_ref": "obs5:e2",
+         "target_name": "View Cart", "to": "obs6"},
+    ]
+    state.current_obs = "obs6"   # current-state anchored：正停留在购物车终态
+    assert _validate_completion(state) is None
+    # 进过购物车但已离开（current_obs ≠ cart to）→ 拒绝
+    state.current_obs = "obs3"
+    assert _validate_completion(state) is not None
+    # self-loop 的 View Cart（无状态变化）不算成功入口
+    state.transitions = [
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e1",
+         "target_name": "Add to cart", "to": "obs3"},
+        {"from": "obs2", "action": "click", "target_ref": "obs2:e2",
+         "target_name": "Add to cart", "to": "obs5"},
+        {"from": "obs5", "action": "click", "target_ref": "obs5:e2",
+         "target_name": "View Cart", "to": "obs5"},
+    ]
+    state.current_obs = "obs5"
+    assert _validate_completion(state) is not None
+
+
 # ── K：错误页 honest stop（R5：404/500 → 目标无法继续 → 诚实停止）─────────────
 
 def test_k_detects_404_page() -> None:
@@ -344,12 +609,61 @@ def test_k2_no_false_positive() -> None:
     assert not _detect_error_page("价格 500 元，库存充足")
 
 
+# ── L：A3 ActionSpace dialog restriction（模态框场景验收核心）─────────────────
+
+def test_a3_dialog_limits_action_space() -> None:
+    """dialog 打开时，ActionSpace 只含 dialog 内 action（View Cart /
+    Continue Shopping），dialog 外 Add to cart 不暴露。"""
+    state = ExploreState(goal="buy", entry_url="https://x.com")
+    state.elements = [
+        {"ref": "obs4:e35", "kind": "action",
+            "role": "link", "name": "View Cart",
+         "actionable": True, "context_role": "dialog", "context_name": "Added!"},
+        {"ref": "obs4:e36", "kind": "action",
+            "role": "button", "name": "Continue Shopping",
+         "actionable": True, "context_role": "dialog", "context_name": "Added!"},
+        {"ref": "obs4:e25", "kind": "action",
+            "role": "link", "name": "Add to cart",
+         "actionable": True, "kind": "action"},   # dialog 外 action（无 context）
+        {"ref": "obs4:e30", "type": "text", "text": "Blue Top"},
+    ]
+    state.observations = [{
+        "id": "obs4", "url": "https://x.com", "state_hash": "h",
+        "elements": state.elements,
+    }]
+    state.current_obs = "obs4"
+    space = _build_action_space(state)
+    refs = [e["ref"] for e in space]
+    assert "obs4:e35" in refs and "obs4:e36" in refs   # dialog 内 action
+    assert "obs4:e25" not in refs                       # dialog 外被排除
+    assert "obs4:e30" in refs                           # 文本 evidence 保留
+
+
+def test_a3_no_dialog_no_restriction() -> None:
+    """无 dialog 上下文 → 全部 actionable 元素正常暴露。"""
+    state = ExploreState(goal="buy", entry_url="https://x.com")
+    state.elements = [
+        {"ref": "obs2:e10", "kind": "action",
+            "role": "link", "name": "Add to cart", "actionable": True},
+        {"ref": "obs2:e4", "kind": "action",
+            "role": "link", "name": "Cart", "actionable": True},
+    ]
+    state.observations = [{
+        "id": "obs2", "url": "https://x.com", "state_hash": "h",
+        "elements": state.elements,
+    }]
+    state.current_obs = "obs2"
+    space = _build_action_space(state)
+    assert len(space) == 2
+
+
 # ── F/G：no-progress guard + auth failure（Transition/Progress Validation）────
 
 def _progress_state() -> ExploreState:
     state = ExploreState(goal="login", entry_url="https://x.com",
                          input_keys={"email", "password"})
-    state.elements = [{"ref": "obs2:e12", "role": "button", "name": "Login"}]
+    state.elements = [{"ref": "obs2:e12", "kind": "action",
+            "role": "button", "name": "Login"}]
     state.observations = [{
         "id": "obs2", "url": "https://x.com/login",
         "state_hash": "h", "elements": state.elements,
@@ -365,7 +679,7 @@ def test_f_self_loop_same_action_rejected() -> None:
     state.transitions.append({
         "from": "obs2", "action": "click", "target_ref": "obs2:e12", "to": "obs2",
     })
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs2:e12"}'
     decision, err = _decide(state, llm)
     assert decision is None, "self-loop 重复必须被拒"
@@ -378,8 +692,9 @@ def test_f2_self_loop_different_action_passes() -> None:
     state.transitions.append({
         "from": "obs2", "action": "click", "target_ref": "obs2:e12", "to": "obs2",
     })
-    state.elements.append({"ref": "obs2:e10", "role": "textbox", "name": "Email"})
-    def llm(prompt, system_prompt=None):
+    state.elements.append({"ref": "obs2:e10", "kind": "action",
+            "role": "textbox", "name": "Email"})
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "fill", "target_ref": "obs2:e10", "value": "${email}"}'
     decision, err = _decide(state, llm)
     assert decision is not None, f"换动作被误拒: {err}"
@@ -391,7 +706,7 @@ def test_f3_progress_transition_not_rejected() -> None:
     state.transitions.append({
         "from": "obs2", "action": "click", "target_ref": "obs2:e12", "to": "obs3",
     })
-    def llm(prompt, system_prompt=None):
+    def llm(prompt, system_prompt=None, timeout=None):
         return '{"action": "click", "target_ref": "obs2:e12"}'
     decision, err = _decide(state, llm)
     assert decision is not None, f"有进展的重复被误拒: {err}"
@@ -411,12 +726,13 @@ def test_g2_auth_failure_false_positive_avoided() -> None:
     assert not _detect_auth_failure("")
 
 def test_e_observation_cap_stops_exploration() -> None:
-    """per-url cap=5：第 6 个不同状态 → done=True + 记录原因，
-    不再继续带无主元素决策。"""
+    """R6：只保留 total cap（12）——同 URL 多状态是合法业务（列表↔modal
+    循环），per-URL cap 已删。第 13 个状态 → done=True + 记录原因。"""
     state = ExploreState(goal="login", entry_url="https://x.com")
-    for i in range(6):
+    for i in range(13):
         _record_page(state, _MockPage("https://x.com", f'- button "B{i}"\n'))
     assert state.done, "观察预算满必须停止探索"
+    assert state.termination_reason == TerminationReason.OBSERVATION_LIMIT
     assert any(h.get("action") == "observation_cap" for h in state.history)
 
 

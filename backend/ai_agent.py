@@ -38,10 +38,11 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, ValidationError
 
 from compiler import compile_targets
-from dsl import DSLCase, Locator, Scope, validate_case
-from explore_cache import invalidate as cache_invalidate, load as cache_load, save as cache_save
+from dsl import DSLCase, validate_case
+from explore_cache import is_cacheable_trace, load as cache_load, save as cache_save
 from explore import (
     GOAL_ACTION_PATTERNS, _ACTION_KEYWORDS, explore,
+    missing_verified_goal_actions,
 )
 import anti_patterns
 from grounding import (
@@ -49,22 +50,25 @@ from grounding import (
     UnreachableObservationError, _reachable_observations,
     validate_state_grounding,
 )
-from locator.resolver import (
-    PRICE_RE, build_locator_exact_first, build_locator_for_count,
-    choose_scope_text, is_navigation_target, parse_target, snapshot_match,
-)
+from locator.resolver import is_navigation_target, parse_target
 
 # ── 配置（环境变量）───────────────────────────────────────────────────────────
 # os.getenv("名字", 默认值)：读环境变量，没设置就用默认值。
 # .env 文件的值由 main.py 在启动时灌入 os.environ（见 main.py 顶部）。
 
+class ExplorationIncompleteError(Exception):
+    """探索未验证目标动作（history 点过 ≠ 成功状态迁移）——不进入 Planner。
+    S1 第二防线：目标要求 verified outcome 但探索未形成对应转移。"""
+
+
+class OutputBudgetExceededError(Exception):
+    """LLM 输出超过 max_tokens 预算（finish_reason=length）——输出失控。
+    S4：safety cap，不做 schema recovery（截断 JSON 修复无意义）。"""
+
+
 API_KEY = os.getenv("AI_API_KEY", "")
 BASE_URL = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1")
 MODEL = os.getenv("AI_MODEL", "deepseek-chat")
-
-# R4（评审）：Preflight 从 hard gate 降级为 optional diagnostics——
-# 运行时 Resolver 才是定位权威；默认关闭，调试时临时开启。
-GENERATE_PREFLIGHT = False
 
 # ── Prompt（约束 LLM 输出符合格式的 JSON）──────────────────────────────────────
 # 这段提示词是"AI 生成质量的第一个保障"：
@@ -114,6 +118,8 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
    - 所有可变测试输入必须使用 ${var}，每个变量必须声明在 input_contract
    - secret=true → default 必须为 null（执行时本地注入）
    - 非敏感变量只有上下文明确提供 default 时才能填写；不得猜测真实值
+   - capture_text: 捕获的元素文本存入 context_key（运行时变量，不需声明在
+     input_contract）；后续步骤用 ${context_key} 引用（如跨页价格一致断言）
 5. observation_ref（grounding 引用）：
    - 每个可定位步骤应引用产生该定位证据的 observation id（obs1/obs2/...）
    - observation_ref 必须来自系统提供的 observation 列表，禁止编造
@@ -123,6 +129,7 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
      禁止把待验证文本只放在 target.text 而省略 value
    - assert_visible: target 必填；如果只是"某段文字/元素出现"，使用 assert_visible，而不是无 value 的 assert_text
    - assert_url: value 必填（URL 片段）
+   - capture_text: target + context_key 必填（捕获文本到运行时变量），无 value
 7. 最小测试原则：
    - 仅生成完成用户需求所需的最少步骤
    - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
@@ -153,97 +160,69 @@ SYSTEM_PROMPT = """你是一个 Web UI 自动化测试的 DSL 生成器。
 #   Planner 只从元素引用表选 target_ref，禁止生成任何定位字段——
 #   locator 由系统确定性编译（R1 Compiler），不再信任 LLM 的 role/name/scope。
 SYSTEM_PROMPT_REFS_ONLY = """你是 Web UI 自动化测试的 DSL 生成器（refs-only 模式）。
-根据用户描述的自然语言测试需求，从系统提供的元素引用表中选择元素，输出一个 JSON 对象。示例（与最小步骤规则完全一致）：
+根据用户描述的自然语言测试需求，从系统提供的【已验证状态转移】和【元素引用表】中选择，输出一个 JSON 对象。示例：
 
 {
-  "name": "登录并进入商品页",
-  "description": "登录后验证进入商品页",
+  "name": "前两个商品加入购物车并验证",
+  "description": "筛选品牌后加购两个商品，进入购物车验证",
   "base_url": "https://xxx.com",
   "input_contract": [
-    {"key": "username", "type": "string", "required": true, "secret": false, "default": "standard_user"},
-    {"key": "password", "type": "secret", "required": true, "secret": true, "default": null}
+    {"key": "username", "type": "string", "required": true, "secret": false, "default": "standard_user"}
   ],
-  "steps": [
-    {"action": "goto", "value": "https://xxx.com", "observation_ref": "obs1"},
-    {"action": "fill", "target_ref": "obs1:e3", "value": "${username}", "observation_ref": "obs1"},
-    {"action": "fill", "target_ref": "obs1:e4", "value": "${password}", "observation_ref": "obs1"},
-    {"action": "click", "target_ref": "obs1:e5", "observation_ref": "obs1"},
-    {"action": "assert_url", "value": "/inventory.html", "observation_ref": "obs2"}
+  "transition_refs": ["t1", "t2", "t3", "t4"],
+  "assertions": [
+    {"action": "assert_visible", "target_ref": "obs3:e11"},
+    {"action": "assert_text", "value": "Blue Top"}
   ]
 }
 
 规则：
-1. action 只能是: goto, click, fill, select, check, wait_for, assert_visible, assert_text, assert_url
-2. 定位元素只能通过 target_ref 引用元素引用表中的 ref（格式 obsN:eM）：
-   - 每个需要定位元素的步骤（click/fill/select/check/wait_for/assert_visible）
-     必须提供 target_ref，且只能从系统提供的元素引用表中选择
-   - 禁止生成 target、scope、role、name、text、css、test_id 等任何定位字段
-     （locator 由系统根据 ref 确定性编译）
-   - 引用表中没有合适元素时，调整步骤设计（如改用 assert_text 验证页面文本），
-     禁止编造 ref
+1. transition_refs（状态变化步骤，最重要）：
+   - 从系统提供的"已验证状态转移"表中选择（t1/t2/...，格式 t1: obs1 --click obs1:e29--> obs2）
+   - 按执行顺序排列；系统沿已验证边确定性展开为 action/target_ref/observation_ref
+   - 你不需要（也无权）推导状态机——只做语义选择：哪些已验证转移属于用户目标
+   - 数量要求（"前两个商品"）：选择不同业务实体的转移（不同 t 对应不同目标）
+2. assertions（验证步骤）：
+   - 追加在 transition_refs 之后执行（observation_ref 由系统自动设置为当前状态）
+   - 元素级断言（assert_visible/assert_text 带 target_ref）：只能引用【当前执行位置】状态的元素
+   - 页面级断言（assert_text 整页 / assert_url）：不需要 target_ref
+   - 验证策略：登录/跳转 → assert_url 或目标页关键元素；文本/价格 → assert_text；元素出现 → assert_visible
 3. 变量：
    - 所有可变测试输入必须使用 ${var}，每个变量必须声明在 input_contract
    - secret=true → default 必须为 null（执行时本地注入）
    - 非敏感变量只有上下文明确提供 default 时才能填写；不得猜测真实值
+   - capture_text: 用 target_ref 引用目标元素 + context_key 变量名捕获文本
+     （运行时变量，不需声明在 input_contract）；后续 assert_text 的 value 用
+     ${context_key} 引用（如价格跨页一致断言）
 4. 业务动作覆盖（最重要）：
-   - 用户目标中要求的每个业务动作都必须生成对应的执行步骤——
-     目标说"加入购物车"就必须有 click 加购元素的步骤，说"登录"就必须
-     有完整的登录步骤（fill + click）
-   - 禁止只生成导航（goto）和断言而跳过目标要求的业务动作
-5. observation_ref（grounding 引用）：
-   - 每个可定位步骤应引用产生该定位证据的 observation id（obs1/obs2/...）
-   - observation_ref 必须来自系统提供的 observation 列表，禁止编造
-   - target_ref 的 obs 前缀必须与 observation_ref 一致（都是 obsN）
-6. 断言动作字段约束（机械规则）：
-   - assert_text: value 必填（要验证的文本）；验证某个元素内文本时用 target_ref
-     引用该元素，验证整页文本时不提供 target_ref；
-     禁止把待验证文本只放在 target 里而省略 value（target 字段本来就被禁止）
-   - assert_visible: target_ref 必填（验证元素出现）
-   - assert_url: value 必填（URL 片段），不需要 target_ref
-7. 最小测试原则：
-   - 仅生成完成用户需求所需的最少步骤
-   - 不生成重复 wait、辅助 assertion 或用户未要求的业务检查
-   - 单一最终目标默认生成恰好 1 个最终验证
-   - 如果用户明确要求多个独立验证结果，则保留这些明确要求的验证
-8. Wait after state-changing actions（等待修改动作的 postcondition）：
-   - 当 click / submit / select 会触发异步页面状态变化、且后续步骤依赖
-     该变化时，必须等待一个能证明变化已经完成的新状态元素（postcondition），
-     再继续下一步
-   - 正确：click "Add to cart" → wait_for 加购后的 "Added!" 弹窗 或
-     按钮变 "Remove" → 再 click "Cart"
-   - 错误：click "Add to cart" → wait_for "Cart"——Cart 链接在动作前就
-     一直存在，它不能证明加购完成
-   - 禁止机械地在每个 click 前生成 wait_for——Playwright 已自动等待目标
-     可操作；wait_for 只用于等待业务状态变化（postcondition）
-   - postcondition 元素必须来自元素表（target_ref 引用新状态中的元素，
-     如 obs6 的 "Remove"；引用表中没有可靠 postcondition 时，宁可不加
-     wait_for 也不编造 ref）
-9. Modify-then-assert（修改后先等再断言）：
-   - 修改值（fill/select/check）后，先 wait_for 更新生效，再断言新值
-   - 不得在修改生效前断言新值（竞态：断言可能读到旧状态）
-10. 验证策略：
-   - 登录/页面跳转 → 优先 assert_url 或目标页面关键元素 assert_visible
-   - 元素出现、按钮状态变化 → assert_visible
-   - 文本、价格、数量变化 → assert_text
-   - 用户未明确验证方式时，选择与最终动作因果关系最直接的可观察结果
-11. 只输出 JSON，不要输出任何解释或代码块标记"""
+   - 用户目标中要求的每个业务动作都必须对应 transition_refs 中的转移——
+     目标说"加入购物车"就必须有加购元素的转移，"登录"就必须有登录转移
+   - 禁止只选导航转移而跳过目标要求的业务动作
+5. 输出紧凑性（硬约束）：
+   - 输出必须是【单个 JSON 对象】本身，禁止任何前置/后置文本、代码块标记
+   - 禁止复制、引用或重述页面结构、元素引用表、状态转移表、ARIA snapshot 内容
+   - 输出通常 <60 行；禁止输出任何 action 为 click/fill/goto 的步骤对象
+     （状态变化由 transition_refs 表达，你只输出转移编号和断言）"""
 
 
 # ── LLM 调用（标准库实现，无外部依赖）──────────────────────────────────────────
 
-def _call_llm(user_prompt: str, system_prompt: str | None = None) -> str:
+def _call_llm(user_prompt: str, system_prompt: str | None = None,
+              timeout: float = 60, max_tokens: int = 1500) -> str:
     """调用 DeepSeek chat completions API，返回文本内容。
 
     这是最原始的 HTTP POST 请求，拆解每一步：
       1. 构造 payload（JSON 请求体）：model + messages + temperature
       2. urllib.request.Request：封装 URL、请求体、请求头
-      3. urlopen()：真正发出网络请求（timeout=60 秒上限）
+      3. urlopen()：真正发出网络请求（默认 timeout=60 秒上限；
+         Explorer 单次决策传 20s——决策不是长文生成）
       4. 解析响应 JSON，取 choices[0].message.content（LLM 的回答文本）
 
     请求体格式是 OpenAI 兼容规范（DeepSeek 兼容它）：
       messages = [system（角色设定）] + [user（用户输入）]
 
     参数 system_prompt：可覆盖默认 SYSTEM_PROMPT（阶段 1 提取 URL 时用专用 prompt）
+    timeout：网络超时秒数（P0：探索决策 20s / Planner 60s）
     """
     if not API_KEY:
         raise RuntimeError("未配置 AI_API_KEY（环境变量或 .env 文件）")
@@ -255,6 +234,7 @@ def _call_llm(user_prompt: str, system_prompt: str | None = None) -> str:
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0,   # 确定性输出（结构化生成；≠ 完全 deterministic，但显著降低波动）
+        "max_tokens": max_tokens,   # S4：safety cap（正常输出 <1KB；防 output runaway）
     }
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",            # DeepSeek 的 OpenAI 兼容端点
@@ -264,9 +244,17 @@ def _call_llm(user_prompt: str, system_prompt: str | None = None) -> str:
             "Authorization": f"Bearer {API_KEY}",  # 认证：Bearer token 标准格式
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return data["choices"][0]["message"]["content"]
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+    data = json.loads(body.decode("utf-8"))
+    choice = data["choices"][0]
+    # S4：输出超预算（finish_reason=length）→ 明确失败（output runaway
+    # 不做 schema recovery——截断 JSON 的修复没有意义）
+    if choice.get("finish_reason") == "length":
+        raise OutputBudgetExceededError(
+            f"LLM 输出超过预算 {max_tokens} tokens（finish_reason=length）"
+            "——输出失控，不做修复，请重试")
+    return choice["message"]["content"]
 
 
 # ── 阶段 1：从用户需求中解析入口 URL（代码优先 + LLM fallback）────────────────
@@ -300,6 +288,13 @@ _EMAIL_IN_GOAL_RE = re.compile(r'[\w.+-]+@[\w.-]+\.[\w.]+')
 # ⚠️ "xxx / yyy" 模式必须要求 / 两边有空格 + 前置标识词——
 # 否则 "https://example.com" 的 // 会被误认为用户名/密码分隔（修复）
 _PASSWORD_PATTERNS = [
+    # "账号 test1 密码 147258"（无斜杠格式）——用户名 + 密码一起提取，
+    # 否则 username 残留进 LLM 上下文（LLM 输出真实值 → Data Grounding 拒）
+    re.compile(
+        r'(?:账号|用户名|login\s+with|using|用|使用)\s*[:：]?\s*'
+        r'([^\s，,。;；]+)\s+(?:密码|口令)[：:\s]+([^\s，,。;；]+)',
+        re.IGNORECASE,
+    ),
     re.compile(r'(?:密码|口令)[：:\s]+([^\s，,。;；]+)'),
     re.compile(r'password[：:\s]+([^\s，,。;；]+)', re.IGNORECASE),
     re.compile(
@@ -327,24 +322,38 @@ def _extract_and_redact_goal(goal: str) -> tuple[str, dict]:
         redacted = redacted.replace(m.group(0), "${email}")
 
     # ② 密码（多种写法，命中一个即可）
-    # 注意："用户名 / 密码" 格式：group(1)=用户名，group(2)=密码，
-    # 两者都提取注入（探索时 fill 都用 ${var} 占位，Executor 本地填值）；
-    # 其余写法（密码:/password:/口令）只有密码，取 group(1)。
-    m = _PASSWORD_PATTERNS[0].search(redacted) or _PASSWORD_PATTERNS[1].search(redacted)
+    # 注意：
+    #   pattern[0] = "账号 X 密码 Y"（无斜杠）：group(1)=用户名, group(2)=密码
+    #   pattern[3] = "用户名 / 密码"（斜杠）：group(1)=用户名, group(2)=密码
+    #   其余写法（密码:/password:/口令）只有密码，取 group(1)
+    m = _PASSWORD_PATTERNS[0].search(redacted)
     if m:
-        secret = m.group(1)
+        # 账号 X 密码 Y：group(1)=用户名（提取），group(2)=密码
+        username = m.group(1)
+        if not username.startswith("${"):
+            runtime["username"] = username
+            redacted = redacted.replace(username, "${username}")
+        secret = m.group(2)
     else:
-        m = _PASSWORD_PATTERNS[2].search(redacted)
+        m = _PASSWORD_PATTERNS[1].search(redacted)
         if m:
-            username = m.group(1)
-            if not username.startswith("${"):
-                # 用户名位置可能是已脱敏的 ${email} 占位符（修复：
-                # "login with ${email} / test123" 不再把占位符当真实用户名）
-                runtime["username"] = username
-                redacted = redacted.replace(username, "${username}")
-            secret = m.group(2)
+            secret = m.group(1)
         else:
-            secret = None
+            m = _PASSWORD_PATTERNS[2].search(redacted)
+            if m:
+                secret = m.group(1)
+            else:
+                m = _PASSWORD_PATTERNS[3].search(redacted)
+                if m:
+                    username = m.group(1)
+                    if not username.startswith("${"):
+                        # 用户名位置可能是已脱敏的 ${email} 占位符（修复：
+                        # "login with ${email} / test123" 不再把占位符当真实用户名）
+                        runtime["username"] = username
+                        redacted = redacted.replace(username, "${username}")
+                    secret = m.group(2)
+                else:
+                    secret = None
     if secret:
         runtime["password"] = secret
         redacted = redacted.replace(secret, "${password}")
@@ -473,6 +482,21 @@ def _extract_json(text: str) -> dict:
 # 修复：Planner 输出不符合 DSL schema 时（如 assert_text 缺 value），
 # 整体 400 终止——应把"原输出 + 精简错误"反馈给专用 recovery LLM，
 # 只修 schema，不重新规划（不增删重排步骤）。
+
+PLANNER_RECOVERY_SYSTEM_PROMPT = """你是 Web 测试 DSL 的 schema 修复器。
+
+你会收到：
+1. 上一次 Planner 生成的 JSON
+2. Pydantic 校验错误
+
+只修复这些 schema 错误。
+
+规则：
+- 不新增无关步骤
+- 不改变已有步骤顺序
+- 不改变 locator、scope、业务对象，除非校验错误直接要求
+- 不重新规划测试流程
+- 只输出修复后的完整 JSON"""
 
 PLANNER_RECOVERY_SYSTEM_PROMPT = """你是 Web 测试 DSL 的 schema 修复器。
 
@@ -696,23 +720,115 @@ def _build_retry_hint(error_info: str) -> str:
     )
 
 
+def _expand_plan_schema(case_dict: dict,
+                        verified_edges: list[dict],
+                        observations: list[dict] | None = None,
+                        entry_url: str | None = None) -> dict:
+    """S3：Planner 输出 transition_refs + assertions → DSL steps 确定性展开。
+
+    Planner 不再输出状态变化步骤的详细结构（LLM 无空间生成 28KB 回吐）：
+      - transition_refs：沿 verified edges 顺序展开（action/target_ref/
+        observation_ref 由边决定，State Cursor 推进）
+      - assertions：追加到末尾，observation_ref 由当前 cursor 自动赋值，
+        target_ref 必须属于当前状态（跨状态引用结构上不可能）
+      - goto 步骤自动注入（entry_url，observation_ref 匹配入口 obs）
+
+    未知 transition_ref / cursor 错位 / 断言跨状态 → ValueError
+    （schema recovery 干净重生，不靠 prompt 提醒）。
+    """
+    if not verified_edges:
+        return case_dict
+    refs_by_obs: dict[str, set[str]] = {}
+    if observations:
+        for o in observations:
+            refs_by_obs[o["id"]] = {e["ref"] for e in o.get("elements", [])}
+    index = {f"t{i + 1}": t for i, t in enumerate(verified_edges)}
+
+    def match_url(value) -> str | None:
+        if not value:
+            return None
+        url = str(value).strip().rstrip("/")
+        for o in observations or []:
+            if o.get("url") == url or (o.get("url") or "").rstrip("/") == url:
+                return o["id"]
+        return None
+
+    steps: list[dict] = []
+    cursor: str | None = None
+    for tref in case_dict.pop("transition_refs", []):
+        edge = index.get(tref)
+        if edge is None:
+            raise ValueError(f"未知 transition_ref {tref}（verified 边外）")
+        if cursor is not None and edge["from"] != cursor:
+            raise ValueError(
+                f"TRANSITION_OUT_OF_ORDER: {tref} 起点 {edge['from']} "
+                f"≠ 当前状态 {cursor}（路径沿已验证转移边推进）")
+        # S1：pre_actions（该转移前的成功非转移动作，如登录 fill）——
+        # 探索期确定性恢复并绑定到边，Planner 不生成
+        for pa in edge.get("pre_actions") or []:
+            steps.append({
+                "action": pa["action"],
+                "target_ref": pa["target_ref"],
+                "value": pa.get("value"),
+                "observation_ref": edge["from"],
+            })
+        steps.append({
+            "action": edge["action"],
+            "target_ref": edge["target_ref"],
+            "observation_ref": edge["from"],
+        })
+        cursor = edge["to"]
+
+    # goto 注入（入口，observation_ref 匹配入口 obs）
+    if steps and entry_url:
+        steps.insert(0, {
+            "action": "goto",
+            "value": entry_url,
+            "observation_ref": match_url(entry_url),
+        })
+
+    # assertions：observation_ref 由 cursor 自动赋值；元素级引用必须
+    # 属于当前状态（跨状态引用在结构上不可能）
+    for a in case_dict.pop("assertions", []):
+        if cursor is not None:
+            a["observation_ref"] = cursor
+            tref2 = a.get("target_ref")
+            if tref2:
+                allowed = refs_by_obs.get(cursor, set())
+                if allowed and tref2 not in allowed:
+                    raise ValueError(
+                        f"ASSERTION_REF_OUT_OF_CURRENT_STATE: 断言引用 "
+                        f"{tref2} 不属于当前状态 {cursor}（断言只能引用"
+                        "当前状态元素；页面级断言可不提供 target_ref）")
+        steps.append(a)
+    case_dict["steps"] = steps
+    return case_dict
+
+
 def _generate_planner_case(
     grounded_prompt: str,
     mode: str = "legacy",
     tables: str | None = None,
+    verified_edges: list[dict] | None = None,
+    observations: list[dict] | None = None,
+    entry_url: str | None = None,
 ) -> tuple[DSLCase, dict]:
     """Planner 生成 + 校验；schema 失败 constrained recovery ×1。
 
-    mode: "refs_only"（grounded，有元素表——只允许 target_ref 定位）
+    mode: "refs_only"（grounded，有元素表——状态变化型步骤用
+          transition_ref，由 verified_edges 确定性展开）
           "legacy"（无探索降级——保留 role/name/scope 生成能力）
+
+    verified_edges: R7——探索的成功转移边（带顺序，t1..tN）；
+          Planner 的 click 步骤从这里选 transition_ref。
 
     返回 (case, planner_meta)，meta 记录：
       planner_attempts / schema_recovery_used / schema_recovery_success
       initial_validation_errors / planner_recovery_ms / mode
 
     只对"生成结果不合法"（JSON 解析 / Pydantic ValidationError /
-    refs-only 契约违规）做 recovery；LLM API 异常（超时/网络）不在此
-    吞掉，让上层 fail safely。
+    refs-only 契约违规 / 未知 transition_ref）做 recovery；LLM API
+    异常（超时/网络）不在此吞掉，让上层 fail safely。
     """
     from pydantic import ValidationError
 
@@ -724,812 +840,67 @@ def _generate_planner_case(
         "initial_validation_errors": None,
         "planner_recovery_ms": 0,
         "mode": mode,
+        "transitions_expanded": 0,
     }
 
     def parse_and_validate(text: str) -> DSLCase:
-        case = validate_case(_extract_json(text))
+        case_dict = _extract_json(text)
+        # S3：transition_refs + assertions 确定性展开（在 DSL 校验前——
+        # 展开后才合法；LLM 不输出步骤结构，无 28KB 回吐空间）
+        if refs_only and verified_edges:
+            n_before = len(case_dict.get("transition_refs") or [])
+            case_dict = _expand_plan_schema(
+                case_dict, verified_edges,
+                observations=observations, entry_url=entry_url)
+            meta["transitions_expanded"] = n_before
+        case = validate_case(case_dict)
         if refs_only:
             check_refs_only(case)
         return case
 
+    # R5：输入/输出尺寸指标（验证 compact 化是否生效——正常应几 KB）
+    meta["prompt_chars"] = len(grounded_prompt)
     raw_text = _call_llm(
         grounded_prompt,
         system_prompt=SYSTEM_PROMPT_REFS_ONLY if refs_only else SYSTEM_PROMPT,
     )
+    meta["output_chars"] = len(raw_text)
     try:
         return parse_and_validate(raw_text), meta
     except (ValueError, ValidationError) as exc:
         meta["schema_recovery_used"] = True
         meta["planner_attempts"] = 2
         meta["initial_validation_errors"] = _summarize_validation_error(exc)
+        # R5：坏输出只留诊断日志（前 300 字符），绝不重新喂模型
+        print(f"[PLANNER] bad_output chars={len(raw_text)} "
+              f"preview={raw_text[:300]!r}", flush=True)
 
+        # R5：recovery 不嵌入上次坏输出——32KB 坏 JSON 全文回灌 =
+        # 雪崩放大器（大 prompt → 更坏输出 → 更大 prompt）。只给错误
+        # 摘要 + 原始任务，干净重生；坏输出不再进入任何后续 LLM 上下文。
         recovery_prompt = (
-            "上一次 Planner 输出：\n"
-            f"{raw_text}\n\n"
-            "Schema 校验错误：\n"
-            f"{meta['initial_validation_errors']}"
+            "上一次 Planner 输出未通过 DSL Schema 校验，错误：\n"
+            f"{meta['initial_validation_errors']}\n\n"
+            "请根据下面的原始任务重新生成完整的 DSL JSON。"
+            "不要解释、不要复述输入、不要输出 Markdown、不要复制任何页面结构。\n\n"
+            f"原始任务：\n{grounded_prompt}"
         )
         if refs_only and tables:
             # refs-only 修复需要引用表上下文（补 ref / 改 ref 都只能在表内选）
             recovery_prompt += f"\n\n元素引用表（target_ref 只能从这里选择）：\n{tables}"
+        meta["recovery_prompt_chars"] = len(recovery_prompt)
         t = perf_counter()
         repaired_text = _call_llm(
             recovery_prompt,
-            system_prompt=PLANNER_RECOVERY_SYSTEM_PROMPT_REFS_ONLY
-            if refs_only else PLANNER_RECOVERY_SYSTEM_PROMPT,
+            system_prompt=(SYSTEM_PROMPT_REFS_ONLY
+                            if refs_only else PLANNER_RECOVERY_SYSTEM_PROMPT),
         )
         meta["planner_recovery_ms"] = int((perf_counter() - t) * 1000)
+        meta["recovery_output_chars"] = len(repaired_text)
 
         case = parse_and_validate(repaired_text)   # 仍失败 → 抛异常（fail safely）
         meta["schema_recovery_success"] = True
-        return case, meta
-
-
-# ── Preflight v2：候选提取 + 确定性消歧 + LLM 受限选择 ────────────────────────
-# 核心原则（设计评审）：
-#   "LLM 最适合做语义判断，不应该承担能够由确定性程序完成的结构修复；
-#    模型输出空间越小，Agent 越稳定。"
-#
-# 分层修复（不再是 LLM 自由生成 patch）：
-#   Round 1  确定性代码修复：歧义 → 提取候选 → 需求匹配/首个候选；不存在 → 文本替代
-#   Round 2  LLM 受限选择：只从候选里选 candidate_id，patch 由代码生成
-#   Round 3  fail-safe：剩余问题标记 unresolved，不无限重试
-
-@dataclass
-class PreflightIssue:
-    """结构化定位问题（机器可理解，供修复精确定位）。
-
-    类型区分（修复：把"scope 坏了"和"target 歧义"分开）：
-      LOCATOR_NOT_FOUND    target 不存在
-      AMBIGUOUS_LOCATOR    target 多匹配且无有效 scope
-      AMBIGUOUS_SCOPE      scope 锚点选择错误（文本多次/低频实体）
-      SCOPE_CARDINALITY_UNKNOWN  弱验证下 scope 计数不确定（warning）
-    """
-    step_index: int        # 出问题的步骤（1-based，与执行报告一致）
-    issue_id: str          # 唯一标识（"step6"）
-    type: str
-    target: dict           # 原始 target（结构化）
-    detail: str            # 人类可读说明
-    scope: dict | None = None          # 出问题的 scope（一等公民）
-    candidates: list[dict] | None = None   # 歧义候选 [{"candidate_id", "scope_candidates"}]
-
-
-class RepairItem(BaseModel):
-    """单步修复补丁。
-
-    clear_scope 显式清除 scope（修复：scope=None 的"不修改 vs 清空"歧义——
-    Step 9 导航级元素 scope 多余时应 clear_scope，而不是替换）。
-    """
-    step_index: int = Field(ge=1)
-    target: Locator | None = None
-    scope: Scope | None = None
-    clear_scope: bool = False
-
-
-class RepairPatch(BaseModel):
-    """修复补丁集：只修出问题的步骤，其余步骤不动。"""
-    repairs: list[RepairItem] = Field(default_factory=list)
-
-
-class RepairChoice(BaseModel):
-    """LLM 的选择题答案：只选 candidate_id，不生成任何 locator。"""
-    issue_id: str
-    candidate_id: str
-
-
-class RepairResponse(BaseModel):
-    """LLM 选择题响应（必须覆盖全部 issue，否则判为无效响应）。"""
-    choices: list[RepairChoice] = Field(default_factory=list)
-
-
-def _scopesnapshot_match(snapshot: str, scope_text: str | None) -> tuple[bool, int]:
-    """scope 的三分验证：has_text 文本在快照中出现 0 / 1 / N 次。
-
-    修复：有 scope ≠ 已消歧——scope 值可能是"不存在的商品"（0 次）
-    或匹配多个容器（N 次），Preflight 必须和 Runner 的三分法一致。
-    匹配语义来自 resolver.snapshot_match（单一事实源，R1）。
-    """
-    if not scope_text:
-        return True, 1   # 无 scope → 视为消歧通过（交由 target 检查）
-    return snapshot_match(snapshot, None, scope_text)
-
-
-def _target_to_dict(t) -> dict:
-    """把 target（str / Locator 模型 / dict）统一转成 dict。"""
-    if hasattr(t, "model_dump"):
-        return t.model_dump()
-    if isinstance(t, dict):
-        return t
-    return {"text": str(t)}
-
-
-def _preflight_targets(
-    case: DSLCase, observations: list[dict], first_pass: bool = True,
-) -> list[PreflightIssue]:
-    """Page-aware Preflight：按 step.observation_ref 在对应页面状态内做 0/1/N 验证。
-
-    验证上下文选择（修复跨页面误判）：
-      有合法 observation_ref → 强验证：在该 observation 的 snapshot 内做
-                               存在性 + 次数（0/1/N 真实有效）
-      无 observation_ref    → 弱验证：跨 observation presence-only
-                               （存在即可，不做全局 count blocking——
-                               避免把跨页面重复误判为同页歧义）
-
-    css=/test_id= 无法用快照文本验证（DOM 属性不是语义）→ 跳过。
-    """
-    obs_map = {o["id"]: o for o in observations}
-    fallback_snapshot = _pages_to_text(observations)   # 弱验证用
-
-    issues: list[PreflightIssue] = []
-    for index, step in enumerate(case.steps, start=1):
-        t = step.target
-        if not t:
-            continue   # goto / 无 target 断言，无需验证
-
-        parsed = parse_target(t)   # 复用执行器的解析（单一实现）
-        if parsed is None:
-            continue
-        role, name = parsed.role, parsed.name
-        if not name:
-            name = parsed.text
-        if not name:
-            continue   # 纯 css/test_id，无法验证
-
-        # 验证上下文：有 ref → 对应 observation（强）；无 → 合并快照（弱）
-        ref = step.observation_ref
-        if ref and ref in obs_map:
-            snapshot = obs_map[ref]["snapshot"]
-            strong = True
-        else:
-            snapshot = fallback_snapshot
-            strong = False
-
-        found, count = snapshot_match(snapshot, role, name)
-        if not found:
-            issues.append(PreflightIssue(
-                step_index=index,
-                issue_id=f"step{index}",
-                type="LOCATOR_NOT_FOUND",
-                target=_target_to_dict(t),
-                detail=f"步骤 {index}: target 在页面快照中不存在",
-            ))
-        elif count > 1 and role and strong:
-            # 强验证（有 observation_ref）：该页面状态内真歧义 → scope 检查
-            # 弱验证（无 ref）：target 存在即通过（presence-only，
-            #   不做全局 count blocking——避免跨页面重复误判为歧义）
-            scope_text = None
-            if step.scope is not None:
-                scope_text = step.scope.model_dump().get("has_text") \
-                    if hasattr(step.scope, "model_dump") \
-                    else (step.scope.get("has_text") if isinstance(step.scope, dict) else str(step.scope))
-            if not scope_text:
-                issues.append(PreflightIssue(
-                    step_index=index,
-                    issue_id=f"step{index}",
-                    type="AMBIGUOUS_LOCATOR",
-                    target=_target_to_dict(t),
-                    detail=f"步骤 {index}: 页面存在 {count} 个同名 {role}，需 scope 消歧",
-                ))
-            else:
-                scope_found, scope_count = _scopesnapshot_match(snapshot, scope_text)
-                scope_dict = None
-                if step.scope is not None:
-                    scope_dict = step.scope.model_dump() if hasattr(step.scope, "model_dump") \
-                        else (step.scope if isinstance(step.scope, dict) else {"has_text": str(step.scope)})
-                if not scope_found and first_pass:
-                    # 首次检测：scope 文本不存在 → 真问题（blocking，Repair 处理）
-                    issues.append(PreflightIssue(
-                        step_index=index,
-                        issue_id=f"step{index}",
-                        type="AMBIGUOUS_SCOPE",
-                        target=_target_to_dict(t),
-                        scope=scope_dict,
-                        detail=(
-                            f"步骤 {index}: scope 文本不存在（{scope_text!r}）"
-                            "——Repair 判断：target 唯一则清空 scope，否则换业务实体锚点"
-                        ),
-                    ))
-                elif not scope_found:
-                    # 修复后 recheck：文本不存在可能是智能裁剪/页面状态差异
-                    # （如商品名 text 行被限量裁剪）→ warning，运行时兜底
-                    issues.append(PreflightIssue(
-                        step_index=index,
-                        issue_id=f"step{index}",
-                        type="SCOPE_CARDINALITY_UNKNOWN",
-                        target=_target_to_dict(t),
-                        detail=(
-                            f"步骤 {index}: scope 文本在快照中不存在（{scope_text!r}）"
-                            "——可能是裁剪/状态差异，由运行时定位兜底"
-                        ),
-                    ))
-                elif scope_count > 1:
-                    if strong and first_pass:
-                        # 第一次检测：文本多次 + target 多匹配 = 锚点可能选错
-                        # （如 Rs. 500 多商品同价）→ blocking，触发 Repair
-                        # 判断"target 唯一则清空 / 否则换 goal 业务实体"
-                        issues.append(PreflightIssue(
-                            step_index=index,
-                            issue_id=f"step{index}",
-                            type="AMBIGUOUS_SCOPE",
-                            target=_target_to_dict(t),
-                            scope=scope_dict,
-                            detail=(
-                                f"步骤 {index}: scope 锚点（{scope_text!r}）在对应页面状态出现 "
-                                f"{scope_count} 次——Repair 判断：target 唯一则清空，否则换业务实体"
-                            ),
-                        ))
-                    else:
-                        # 修复后 recheck / 弱验证：文本 count>1 不直接判真歧义
-                        # （同一商品 normal+overlay 双 render 会重复）——
-                        # 容器唯一性由运行时联合三分法（含可见性过滤）判定
-                        issues.append(PreflightIssue(
-                            step_index=index,
-                            issue_id=f"step{index}",
-                            type="SCOPE_CARDINALITY_UNKNOWN",
-                            target=_target_to_dict(t),
-                            detail=(
-                                f"步骤 {index}: scope 文本在快照中出现 {scope_count} 次"
-                                "（可能是同商品双 render），由运行时可见性+联合三分法判定"
-                            ),
-                        ))
-                # scope 唯一 → 消歧通过
-
-    return issues
-
-
-# ── 候选提取（歧义 → 真实页面上下文）──────────────────────────────────────────
-
-def _extract_candidate_contexts(
-    urls: list[str], target: dict, login_inputs: dict | None = None,
-    observations: list[dict] | None = None,
-) -> list[dict] | None:
-    """打开页面，提取 target 所有匹配元素的上下文文本（消歧候选）。
-
-    核心：候选是【系统观察到的真实实体】——LLM 只能从中选择，
-    没有权限创造 scope 文本。
-
-    ⚠️ 注意：这里直接构建 locator 数 count，不能用 _resolve_locator——
-    它是三分法，count>1 会抛 AmbiguousError（歧义正是我们要提取的）。
-
-    login_inputs：登录后的页面（如商品页）在新会话会被重定向回登录页，
-    用探索时提取的账号密码自动登录后重试。
-
-    observations：性能优化（Speed B2）——先用已探索的页面快照文本筛选
-    "哪些页面可能包含 target"，只访问这些 URL（从 4 个 → 1 个），
-    避免遍历所有页面 + 反复登录。
-    """
-    from playwright.sync_api import sync_playwright
-
-    # 快照筛选：只访问可能包含 target 的 observation
-    if observations:
-        parsed = parse_target(target)
-        role, name = (parsed.role, parsed.name or parsed.text) if parsed else (None, None)
-        if role and name:
-            hits = [o["url"] for o in observations
-                    if snapshot_match(o["snapshot"], role, name)[0]]
-            if hits:
-                urls = hits
-
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.set_default_timeout(10000)
-            try:
-                for url in urls:
-                    try:
-                        page.goto(url, wait_until="domcontentloaded")
-                        page.wait_for_timeout(500)   # 渲染底线（之前 1000ms）
-                    except Exception:
-                        continue
-                    # 被重定向到登录页（需要登录态）→ 自动登录后重试
-                    if login_inputs and _try_login(page, login_inputs):
-                        try:
-                            page.goto(url, wait_until="domcontentloaded")
-                            page.wait_for_timeout(500)
-                        except Exception:
-                            pass
-                    locator = build_locator_for_count(page, target)
-                    if locator is None:
-                        continue
-                    count = locator.count()
-                    if count <= 1:
-                        continue
-                    candidates = []
-                    for i in range(count):
-                        try:
-                            node = locator.nth(i)
-                            # 向上找稳定业务容器（li/article/data-testid），否则向上 2 层
-                            container = node.locator(
-                                "xpath=ancestor::*[self::li or self::article or @data-testid][1]"
-                            )
-                            container_count = container.count()   # count 缓存，避免重复查询
-                            if container_count == 0:
-                                container = node.locator("xpath=../..")
-                                container_count = container.count()
-                            raw = container.inner_text().strip() if container_count > 0 else ""
-                            node_text = node.inner_text().strip()
-                            # 候选上下文：容器文本 + 候选 scope 行（排除按钮自身文本）
-                            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-                            scope_candidates = [
-                                ln for ln in lines if ln != node_text
-                            ][:5]
-                        except Exception:
-                            raw, node_text, scope_candidates = "", "", []
-                        candidates.append({
-                            "candidate_id": f"c{i + 1}",
-                            "context_text": raw[:200],
-                            "scope_candidates": scope_candidates,
-                        })
-                    if candidates:
-                        return candidates
-            finally:
-                browser.close()
-    except Exception:
-        return None
-    return None
-
-
-def _try_login(page, login_inputs: dict) -> bool:
-    """当前页面有登录表单时自动登录（候选提取用）。
-
-    返回是否尝试了登录。表单定位用通用语义（Username/Password/Login），
-    失败静默（不中断候选提取）。登录后用 wait_for_load_state 精确等待
-    导航完成（修复：固定 1200ms sleep 浪费）。
-    """
-    try:
-        username = page.get_by_role("textbox", name="Username")
-        if username.count() == 0:
-            return False
-        username.fill(login_inputs.get("username") or "")
-        page.get_by_role("textbox", name="Password").fill(login_inputs.get("password") or "")
-        page.get_by_role("button", name="Login").click()
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=8000)
-        except Exception:
-            pass
-        page.wait_for_timeout(400)   # SPA 内容渲染底线
-        return True
-    except Exception:
-        return False
-
-
-def _text_alternative(snapshot: str, name: str) -> Locator | None:
-    """NOT_FOUND 的确定性修复：目标名在快照中存在文本 → 换成文本定位。"""
-    found, _ = snapshot_match(snapshot, None, name)
-    return Locator(text=name) if found else None
-
-
-def _resolve_ambiguity(goal: str, issue: PreflightIssue) -> tuple[str, dict | None, str | None]:
-    """需求明确性判断（区分 Locator / Requirement ambiguity）：
-      - goal 命中某候选的业务实体行 → ("auto", 候选, scope)  需求明确，代码直接修
-      - 无命中但有可用 scope 行    → ("first", 候选, scope)   需求歧义，确定性选第一个
-      - 其他                      → ("llm", None, None)      多个候选匹配需求，LLM 选
-
-    ⚠️ 业务实体优先：goal 匹配前先跳过价格/短行等噪音——
-    否则用户需求同时提到商品名和价格（"Blue Top ... Rs. 500"）时，
-    候选行顺序靠前的价格会被误选为 scope 锚点（修复实测 bug）。
-    """
-    # 确定性：goal 子串命中某个候选的【业务实体】行（跳过价格等噪音）
-    for cand in (issue.candidates or []):
-        for scope in cand.get("scope_candidates", []):
-            scope = scope.strip()
-            if not scope or len(scope) < 2 or PRICE_RE.fullmatch(scope):
-                continue   # 跳过价格/短行（Rs. 500 等易重复文本）
-            if scope.lower() in goal.lower():
-                return "auto", cand, scope
-
-    # 需求歧义：取第一个候选的第一个"好" scope 行（同样跳过价格）
-    for cand in (issue.candidates or []):
-        scope = choose_scope_text(cand.get("scope_candidates", []))
-        if scope:
-            return "first", cand, scope
-
-    return "llm", None, None
-
-
-def _scope_patch(issue: PreflightIssue, scope_text: str) -> RepairItem:
-    """由最终 scope 文本生成 patch（代码构造，LLM 不参与）。
-
-    Invariant：导航 target 禁止商品/业务 scope——即使修复流程想加，
-    也改为 clear_scope（导航 locator 的消歧走导航语义，不是商品 scope）。
-    """
-    if is_navigation_target(issue.target):
-        return RepairItem(step_index=issue.step_index, clear_scope=True)
-    return RepairItem(
-        step_index=issue.step_index,
-        target=Locator(**issue.target),
-        scope=Scope(has_text=scope_text),
-    )
-
-
-def _normalize_invalid_scopes(case: DSLCase) -> DSLCase:
-    """导航 target 的 scope 一律清空（invariant，不依赖 Repair round）。
-
-    无论 Planner 生成还是 Repair 产生——导航元素（Cart/Products/Home）
-    与商品/价格 scope 语义不兼容，是系统级 locator invariant。
-    """
-    changed = False
-    for step in case.steps:
-        if (step.scope is not None and step.target is not None
-                and is_navigation_target(_target_to_dict(step.target))):
-            step.scope = None
-            changed = True
-    if changed:
-        return validate_case(case.model_dump())
-    return case
-
-
-def _dedupe_preserve_order(values: list[str]) -> list[str]:
-    """保序去重（scope 候选：同一商品 normal+overlay 双 render 会重复）。"""
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        normalized = " ".join(value.split()).strip()
-        key = normalized.casefold()
-        if not normalized or key in seen:
-            continue
-        seen.add(key)
-        result.append(normalized)
-    return result
-
-
-def _goal_match_anchor(goal: str, anchors: list[str]) -> str | None:
-    """从锚点中选"用户明确指定的业务实体"（跳过价格/短行/动作文本）。
-
-    修复：goal 同时含商品名和价格时（"Blue Top ... Rs. 500"），
-    价格行不能因顺序靠前被误选——业务实体优先。
-    """
-    for anchor in anchors:
-        if not anchor or len(anchor) < 2 or PRICE_RE.fullmatch(anchor):
-            continue
-        if anchor.lower() in goal.lower():
-            return anchor
-    return None
-
-
-def _inspect_scoped_steps(
-    scoped_items: list[tuple[int, dict]],
-    urls: list[str], login_inputs: dict | None,
-    observations: list[dict] | None,
-) -> dict[int, dict]:
-    """一次浏览器会话验证所有 scoped 步骤（性能：不 per-step launch）。
-
-    判断语义与 Runner 联合三分法一致（不是文本 count）：
-      - target 不带 scope 精确 count == 1 → scope 多余 → {"action": "remove_scope"}
-      - 否则提取去重锚点 → {"action": "replace_scope", "anchors": [...]}
-      （goal 业务实体匹配在调用方做）
-
-    返回 {step_index: {"action": ..., "anchors": [...]}}。
-    """
-    from playwright.sync_api import sync_playwright
-
-    pending = dict(scoped_items)
-    result: dict[int, dict] = {}
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.set_default_timeout(10000)
-            try:
-                # 快照筛选：所有待检查 target 的 URL 并集
-                target_urls: list[str] = []
-                for _, target in scoped_items:
-                    parsed = parse_target(target)
-                    role, name = (parsed.role, parsed.name or parsed.text) if parsed else (None, None)
-                    if observations and role and name:
-                        hits = [o["url"] for o in observations
-                                if snapshot_match(o["snapshot"], role, name)[0]]
-                        target_urls.extend(hits)
-                if not target_urls:
-                    target_urls = urls
-                seen_urls: set[str] = set()
-
-                for url in target_urls:
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    try:
-                        page.goto(url, wait_until="domcontentloaded")
-                        page.wait_for_timeout(500)
-                    except Exception:
-                        continue
-                    if login_inputs and _try_login(page, login_inputs):
-                        try:
-                            page.goto(url, wait_until="domcontentloaded")
-                            page.wait_for_timeout(500)
-                        except Exception:
-                            pass
-
-                    for idx, target in list(pending.items()):
-                        if idx in result:
-                            continue
-                        # 导航级 target：商品/价格 scope 一律禁止 → remove_scope
-                        # （deterministic 规则，修复 Step 9 Cart→Blue Top 误修）
-                        if is_navigation_target(target):
-                            result[idx] = {
-                                "action": "remove_scope",
-                                "anchors": [],
-                                "reason": "navigation_target_cannot_use_product_scope",
-                            }
-                            continue
-                        locator = build_locator_exact_first(page, target)
-                        if locator is None:
-                            continue
-                        count = locator.count()
-                        if count == 0:
-                            continue   # 该页面无此 target，留给其他页面
-                        if count == 1:
-                            result[idx] = {"action": "remove_scope", "anchors": []}
-                            continue
-                        # target 多匹配：提取去重锚点（replace_scope 候选）
-                        anchors: list[str] = []
-                        for i in range(min(count, 6)):
-                            try:
-                                node = locator.nth(i)
-                                container = node.locator(
-                                    "xpath=ancestor::*[self::li or self::article or @data-testid][1]"
-                                )
-                                cc = container.count()
-                                if cc == 0:
-                                    container = node.locator("xpath=../..")
-                                    cc = container.count()
-                                raw = container.inner_text().strip() if cc > 0 else ""
-                                node_text = node.inner_text().strip()
-                                for line in raw.splitlines():
-                                    line = line.strip()
-                                    if line and line != node_text:
-                                        anchors.append(line)
-                            except Exception:
-                                pass
-                        result[idx] = {
-                            "action": "replace_scope",
-                            "anchors": _dedupe_preserve_order(anchors),
-                        }
-            finally:
-                browser.close()
-    except Exception:
-        pass
-    return result
-
-
-# 修复专用 system prompt（角色独立——修复是"选择题"，不是 DSL 生成）
-REPAIR_SYSTEM_PROMPT = """你是测试定位歧义选择器。
-只负责从系统提供的候选（candidate_id）中选择最符合用户目标的选项。
-禁止创建、修改或推断任何 target、scope、文本、CSS 或 locator。
-必须为每个 issue_id 返回且仅返回一个选择。"""
-
-
-def _llm_choose_candidates(goal: str, issues: list[PreflightIssue]) -> list[RepairChoice]:
-    """LLM 只做选择题：从系统观察到的候选中选 candidate_id。
-
-    响应必须覆盖全部 issue（expected == received），否则判为无效响应。
-    """
-    issue_lines = "\n".join(
-        f"- issue_id={i.issue_id} 步骤 {i.step_index}: {i.detail}\n"
-        f"  候选: " + " | ".join(
-            f"{c['candidate_id']}={'/'.join(c.get('scope_candidates', [])[:2]) or c.get('context_text', '')[:30]}"
-            for c in (i.candidates or [])
-        )
-        for i in issues
-    )
-    prompt = (
-        f"用户测试目标（已脱敏）: {goal}\n\n"
-        f"以下每个问题都提供了系统实际观察到的候选。你只能从 candidates 中选择 candidate_id。\n"
-        f"禁止创建新的 target、scope、文本或 locator。\n"
-        f"必须为每个 issue_id 返回且仅返回一个选择。\n\n"
-        f"{issue_lines}\n\n"
-        '只输出 JSON: {"choices": [{"issue_id": "step6", "candidate_id": "c1"}]}'
-    )
-    raw_text = _call_llm(prompt, system_prompt=REPAIR_SYSTEM_PROMPT)
-    resp = RepairResponse.model_validate(_extract_json(raw_text))
-    expected = {i.issue_id for i in issues}
-    received = {c.issue_id for c in resp.choices}
-    if expected != received:
-        raise ValueError(f"修复响应不完整: 期望覆盖 {expected}，实际收到 {received}")
-    return resp.choices
-
-
-def _apply_patch(case: DSLCase, patch: RepairPatch) -> int:
-    """程序本地应用 patch：只替换 patch 中指定的步骤，其余分毫不动。
-
-    clear_scope=True → 显式清除 scope（Step 9 类：导航级元素 scope 多余）。
-    """
-    applied = 0
-    for rep in patch.repairs:
-        idx = rep.step_index - 1
-        if not (0 <= idx < len(case.steps)):
-            continue
-        step = case.steps[idx]
-        if rep.target is not None:
-            step.target = rep.target
-        if rep.clear_scope:
-            step.scope = None
-        elif rep.scope is not None:
-            step.scope = rep.scope
-        applied += 1
-    return applied
-
-
-def _preflight_and_repair(
-    case: DSLCase, observations: list[dict], urls: list[str], goal: str,
-    login_inputs: dict | None = None,
-) -> dict:
-    """分层修复主流程（Round1 确定性 → Round2 LLM 受限选择 → Round3 fail-safe）。
-
-    返回统计：repairs_applied / implicit_resolutions / blocking_issues / warnings
-    """
-    multi_snapshot = _pages_to_text(observations)   # 修复 prompt / 弱验证用
-
-    stats = {
-        "repairs_applied": 0,
-        "implicit_resolutions": [],
-        "blocking_issues": None,
-        "warnings": None,
-        # 诊断指标：有 observation_ref 的步骤占比（强验证覆盖度）+
-        # 降级为弱验证的步骤（无 ref / 非法 ref）
-        "observation_coverage": f"{sum(1 for s in case.steps if s.observation_ref)}/{len(case.steps)}",
-        "fallback_steps": [
-            i for i, s in enumerate(case.steps, start=1) if not s.observation_ref
-        ],
-        # Speed B1：Preflight 细分计时（定位 13.8s 花在哪）
-        "timings": {
-            "initial_check_ms": 0,
-            "candidate_extract_ms": 0,
-            "round2_llm_ms": 0,
-            "recheck_ms": 0,
-        },
-        # 修复有效性统计（修复 repairs_applied=6 无效果的误导）：
-        # effective = blocking 数量变化，而不是"写了多少 patch"
-        "issues_before": 0,
-        "issues_after": 0,
-        "effective_repairs": 0,
-    }
-
-    # Round1 提取过的 candidates 按 issue_id 保留——
-    # run_preflight() 会重建 issue 对象（candidates=None），
-    # 不回填会导致 Round2 过滤条件 i.candidates 为空而进不去（修复）
-    known_candidates: dict[str, list[dict]] = {}
-
-    first_pass = True
-
-    def run_preflight() -> list[PreflightIssue]:
-        nonlocal first_pass
-        t = perf_counter()
-        result = _preflight_targets(case, observations, first_pass=first_pass)
-        first_pass = False   # 首次之后的 recheck 不再触发"锚点选错" blocking
-        for iss in result:
-            if iss.issue_id in known_candidates:
-                iss.candidates = known_candidates[iss.issue_id]
-        return result
-
-    t0 = perf_counter()
-    issues = run_preflight()
-    stats["timings"]["initial_check_ms"] = int((perf_counter() - t0) * 1000)
-    stats["issues_before"] = len(issues)
-    if not issues:
-        return stats
-
-    # ── Round 1：确定性代码修复（零 LLM 调用）────────────────────
-    round1_patches: list[RepairItem] = []
-    for issue in issues:
-        if issue.type == "AMBIGUOUS_LOCATOR":
-            # 候选提取：真实页面上下文（系统观察到的实体）
-            t = perf_counter()
-            issue.candidates = _extract_candidate_contexts(
-                urls, issue.target, login_inputs, observations,
-            )
-            stats["timings"]["candidate_extract_ms"] += int((perf_counter() - t) * 1000)
-            if issue.candidates:
-                known_candidates[issue.issue_id] = issue.candidates
-            else:
-                continue   # 提取失败 → 留给 Round 2
-            mode, chosen, scope_text = _resolve_ambiguity(goal, issue)
-            if mode in ("auto", "first") and chosen and scope_text:
-                round1_patches.append(_scope_patch(issue, scope_text))
-                if mode == "first":
-                    stats["implicit_resolutions"].append({
-                        "step_index": issue.step_index,
-                        "reason": "用户未指定具体对象，按确定性规则选择第一个候选",
-                        "selected": scope_text,
-                        "policy": "first_candidate",
-                    })
-            # mode == "llm" → 留给 Round 2
-        # AMBIGUOUS_SCOPE 统一由 Round 1.5（Browser-backed）处理——
-        # 浏览器判定 target 唯一性 + goal 业务实体锚点
-        elif issue.type == "LOCATOR_NOT_FOUND":
-            parsed = parse_target(issue.target)
-            name = (parsed.name or parsed.text) if parsed else None
-            if name:
-                alt = _text_alternative(multi_snapshot, name)
-                if alt:
-                    round1_patches.append(RepairItem(step_index=issue.step_index, target=alt))
-
-    # ── Round 1.5：Browser-backed scope 确认（静态快照可能漏）────────
-    # 快照验证通过 ≠ 真实 DOM 唯一（如 Rs. 500 在快照出现 1 次、
-    # 执行时 3 个商品同价）——一次浏览器会话核实所有 scoped 步骤：
-    #   target 不带 scope 唯一 → remove_scope（Step 9 Cart）
-    #   target 多匹配 → 提取锚点，goal 业务实体匹配替换（Step 8 Add to cart）
-    # 修复 handled_steps 粒度：target 修复 ≠ scope 已处理——
-    # 只有"已做过 scope 操作"（replace/clear）的步骤才跳过 Round 1.5
-    scope_handled_steps = {
-        p.step_index for p in round1_patches
-        if p.scope is not None or p.clear_scope
-    }
-    scoped_items = [
-        (index, _target_to_dict(step.target))
-        for index, step in enumerate(case.steps, start=1)
-        if step.scope is not None and index not in scope_handled_steps
-        and step.target is not None
-    ]
-    if scoped_items:
-        inspection = _inspect_scoped_steps(
-            scoped_items, urls, login_inputs, observations,
-        )
-        for index, info in inspection.items():
-            if info["action"] == "remove_scope":
-                round1_patches.append(RepairItem(step_index=index, clear_scope=True))
-            else:
-                scope_text = _goal_match_anchor(goal, info.get("anchors", []))
-                if scope_text:
-                    step = case.steps[index - 1]
-                    current_scope = step.scope.model_dump().get("has_text") \
-                        if hasattr(step.scope, "model_dump") else str(step.scope)
-                    if scope_text != current_scope:
-                        round1_patches.append(RepairItem(
-                            step_index=index, scope=Scope(has_text=scope_text),
-                        ))
-
-    if round1_patches:
-        stats["repairs_applied"] += _apply_patch(case, RepairPatch(repairs=round1_patches))
-        t = perf_counter()
-        issues = run_preflight()
-        stats["timings"]["recheck_ms"] += int((perf_counter() - t) * 1000)
-
-    # ── Round 2：LLM 受限选择（只选 candidate_id，patch 代码生成）─
-    if issues:
-        llm_issues = [i for i in issues if i.type == "AMBIGUOUS_LOCATOR" and i.candidates]
-        if llm_issues:
-            try:
-                t = perf_counter()
-                choices = _llm_choose_candidates(goal, llm_issues)
-                stats["timings"]["round2_llm_ms"] += int((perf_counter() - t) * 1000)
-                patches: list[RepairItem] = []
-                for ch in choices:
-                    issue = next((i for i in llm_issues if i.issue_id == ch.issue_id), None)
-                    candidate = next(
-                        (c for c in (issue.candidates or []) if c["candidate_id"] == ch.candidate_id),
-                        None,
-                    ) if issue else None
-                    # LLM 只选 candidate_id，最终 scope 文本由代码从候选行中确定
-                    if issue and candidate:
-                        scope_text = choose_scope_text(candidate.get("scope_candidates", []))
-                        if scope_text:
-                            patches.append(_scope_patch(issue, scope_text))
-                if patches:
-                    stats["repairs_applied"] += _apply_patch(case, RepairPatch(repairs=patches))
-                    t = perf_counter()
-                    issues = run_preflight()
-                    stats["timings"]["recheck_ms"] += int((perf_counter() - t) * 1000)
-            except Exception:
-                pass   # LLM 选择失败 → Round 3 fail-safe
-
-    # ── Round 3：fail-safe（剩余问题分类记录，不无限重试）───────────
-    # 语义拆分（避免"还有问题却 6/6 通过"的误导）：
-    #   blocking_issues = 歧义/scope 问题未消（执行必然失败）
-    #   warnings        = 非阻塞：快照未验证到（可能是操作后状态变化）、
-    #                      scope 跨页面计数不确定（cardinality unknown）
-    stats["issues_after"] = len(issues)
-    stats["effective_repairs"] = stats["issues_before"] - stats["issues_after"]
-    stats["blocking_issues"] = [
-        asdict(i) for i in issues
-        if i.type in {"AMBIGUOUS_LOCATOR", "AMBIGUOUS_SCOPE"}
-    ]
-    stats["warnings"] = [
-        asdict(i) for i in issues
-        if i.type in {"LOCATOR_NOT_FOUND", "SCOPE_CARDINALITY_UNKNOWN"}
-    ]
-    return stats
+    return case, meta
 
 
 # ── Plan Normalization（生成后归一化：LLM 输出可以波动，最终 DSL 稳定）─────────
@@ -1556,6 +927,32 @@ def _target_key(step) -> str:
     if isinstance(t, dict):
         return f"{t.get('role') or ''}:{t.get('name') or ''}:{t.get('text') or ''}"
     return str(t)
+
+
+def _target_to_dict(t) -> dict:
+    """把 target（str / Locator 模型 / dict）统一转成 dict。"""
+    if hasattr(t, "model_dump"):
+        return t.model_dump()
+    if isinstance(t, dict):
+        return t
+    return {"text": str(t)}
+
+
+def _normalize_invalid_scopes(case: DSLCase) -> DSLCase:
+    """导航 target 的 scope 一律清空（invariant，不依赖 Repair round）。
+
+    无论 Planner 生成还是 Repair 产生——导航元素（Cart/Products/Home）
+    与商品/价格 scope 语义不兼容，是系统级 locator invariant。
+    """
+    changed = False
+    for step in case.steps:
+        if (step.scope is not None and step.target is not None
+                and is_navigation_target(_target_to_dict(step.target))):
+            step.scope = None
+            changed = True
+    if changed:
+        return validate_case(case.model_dump())
+    return case
 
 
 def _normalize_steps(case: DSLCase) -> tuple[DSLCase, list[int]]:
@@ -1631,6 +1028,63 @@ def _sanitize_for_cache(explore_result: dict, runtime_inputs: dict) -> dict:
     return result
 
 
+_MAX_COMPACT_ACTIONS_PER_OBS = 20   # R5：compact ref 表每 obs 的 action 限量
+_MAX_COMPACT_EVIDENCE_PER_OBS = 3   # R5：compact ref 表每 obs 的 evidence 限量
+
+
+def _build_compact_refs(pages: list[dict],
+                        transitions: list[dict] | None = None) -> str:
+    """R5：compact ref 表——canonical path 优先，只给 ref + role/name。
+
+    与 _pages_to_text 的区别：refs-only Planner 只需要从 ref 表选
+    target_ref——ARIA snapshot 全文是噪音（8 obs × 全文曾把 prompt
+    撑到几十 KB，LLM 开始回吐坏 JSON）。
+
+    优先级（防"巨大 snapshot → 巨大 ref table"）：
+      1. 成功 transition 涉及的 ref（被验证可操作，规划必需）排最前
+      2. 各 obs 其余 action 限量（Add/View Cart 等业务关键元素在 AX
+         树前部，前 20 足够；过量 refs 同样撑爆 prompt）
+      3. evidence 限量（断言用文本锚点）
+
+    observation_ref 校验（valid_refs）不受影响——只是给 LLM 的视角缩小。
+    """
+    path_refs: set[str] = {
+        t.get("target_ref") for t in (transitions or []) if t.get("target_ref")
+    }
+    sections = []
+    for page in pages:
+        obs_id = page.get("id", "?")
+        url = page.get("url", "")
+        elements = page.get("elements") or []
+        path_lines = []
+        rest_action = 0
+        ev_count = 0
+        for e in elements:
+            if e["ref"] in path_refs:
+                name = (e.get("name") or "").strip()
+                path_lines.append(f"      {e['ref']}: {e.get('role', '')} \"{name}\"")
+        lines = list(path_lines)
+        for e in elements:
+            if e["ref"] in path_refs:
+                continue
+            if e.get("kind") == "action" or "role" in e:
+                if rest_action >= _MAX_COMPACT_ACTIONS_PER_OBS:
+                    continue
+                rest_action += 1
+                name = (e.get("name") or "").strip()
+                lines.append(f"      {e['ref']}: {e.get('role', '')} \"{name}\"")
+            else:
+                if ev_count >= _MAX_COMPACT_EVIDENCE_PER_OBS:
+                    continue
+                ev_count += 1
+                text = (e.get("text") or e.get("name") or "").strip()[:60]
+                lines.append(f"      {e['ref']}: text \"{text}\"")
+        if not lines:
+            continue
+        sections.append(f"[{obs_id}] {url}\n" + "\n".join(lines))
+    return "\n\n".join(sections)
+
+
 def _pages_to_text(pages: list[dict]) -> str:
     """把探索到的 observation 快照合并成 Planner 可读文本（每页分段标记）。
 
@@ -1639,6 +1093,9 @@ def _pages_to_text(pages: list[dict]) -> str:
 
     G1：每页附 state-scoped 元素表（refs）——Planner 可输出 target_ref
     引用系统观察到的真实元素（obs3:e17），而非自由构造 role/name/scope。
+
+    注意：refs-only 主路径已改用 _build_compact_refs（R5，不含 snapshot
+    全文）；本函数保留给 Preflight 弱验证等需要 snapshot 的调用方。
     """
     sections = []
     for page in pages:
@@ -1681,6 +1138,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     第 4 步是"最后一道防线"：AI 就算输出了合法 JSON，
     只要 action 不在白名单、缺字段、类型不对，照样拒绝。
     校验失败会抛异常，由 main.py 捕获后返回 400 给前端。
+
     """
     # ── 阶段 1：解析入口 URL（正则优先，描述性输入 LLM fallback）───
     t_url = perf_counter()
@@ -1697,7 +1155,7 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     cache_hit = False
     auth_profile = "authenticated" if runtime_inputs else "anonymous"
     if entry_url:
-        cached = cache_load(entry_url, auth_profile)
+        cached = cache_load(entry_url, auth_profile, explore_goal)
         if cached:
             explore_result = cached
             pages = cached.get("observations", [])
@@ -1707,11 +1165,14 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
                 explore_result = explore(explore_goal, entry_url, _call_llm, runtime_inputs)
                 pages = explore_result.get("observations", [])   # ← observations 模型
                 # 保存前脱敏：history 的 value 还原为 ${var}（缓存不落盘真实凭据）
-                # 缓存门槛（GQ 决策 2）：done=True，或已执行 ≥2 步——
-                # saucedemo 的 done=False/steps=4 探索产出了 7/7 计划（好探索
-                # 被拒缓存是浪费）；steps=1 的浅探索仍拒缓存（历史毒化案例）。
-                if explore_result.get("done") or explore_result.get("steps_used", 0) >= 2:
-                    cache_save(entry_url, auth_profile, _sanitize_for_cache(explore_result, runtime_inputs))
+                # S2-P0：StateGraph/history 是目标相关轨迹。只有代码可证明
+                # GOAL_COMPLETE 的结果可按目标指纹缓存；MODEL_FINISH、错误页、
+                # 认证失败和预算耗尽均不可复用。
+                if is_cacheable_trace(explore_result):
+                    cache_save(
+                        entry_url, auth_profile, explore_goal,
+                        _sanitize_for_cache(explore_result, runtime_inputs),
+                    )
             except Exception:
                 # R4（评审）：探索失败不再静默降级 legacy——Grounded mode
                 # 下 Explore fail → generate fail（fail honestly）。
@@ -1739,16 +1200,26 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         if reach:
             pages = [p for p in pages if p["id"] in reach]
     multi_snapshot = _pages_to_text(pages) if pages else None
-    if multi_snapshot:
+    # R5：canonical path（成功转移边）先行——compact ref 表按 path 优先
+    tr = (explore_result or {}).get("transitions") or []
+    compact_refs = (_build_compact_refs(pages, transitions=tr)
+                    if pages else None)
+    if compact_refs:
         # P0-3：canonical path 只来自成功转移边（State Graph transitions），
         # 失败动作单独标注为负例——Planner 不会学到"点击文本超时 →
         # 进入 obs4"的错误因果（temporal attribution bug：失败动作的
         # 15s 超时窗口恰好吞掉了前一个动作的延迟状态）。
-        tr = (explore_result or {}).get("transitions") or []
-        path_lines = [
-            f"- {t['from']} --{t['action']} {t['target_ref']}--> {t['to']}"
-            for t in tr
+        # R7：verified transitions 带 ID（t1..tN）——Planner 的状态变化型
+        # 步骤（click）从这里选 transition_ref，由代码确定性展开成
+        # action/target_ref/observation_ref——结构上不可能生成跨状态引用，
+        # G3 从"经常拦截"降级为"safety invariant"。
+        verified_edges = [
+            t for t in tr
             if t.get("from") and t.get("to") and t.get("from") != t.get("to")
+        ]
+        path_lines = [
+            f"t{i}: {t['from']} --{t['action']} {t['target_ref']}--> {t['to']}"
+            for i, t in enumerate(verified_edges, start=1)
         ]
         fail_lines = [
             f"- {h.get('action')} {h.get('target_ref')} 失败:"
@@ -1756,23 +1227,28 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             for h in (explore_result or {}).get("history", [])
             if h.get("error") and h.get("action") != "decision_rejected"
         ]
+        # R5：refs-only Planner 只吃 canonical path + compact ref 表——
+        # 不注入 ARIA snapshot 全文（Planner 只选 ref，snapshot 是噪音；
+        # 完整快照把 prompt 撑到几十 KB → LLM 回吐坏 JSON 的根因）。
         grounded_prompt = (
             f"目标页面入口: {entry_url}\n\n"
             f"已验证状态转移（State Graph 成功边，规划路径只能沿这些边）:\n"
             + ("\n".join(path_lines) if path_lines else "- (无)")
             + ("\n\n失败动作（不要模仿，这些动作未产生有效状态变化）:\n"
                + "\n".join(fail_lines) if fail_lines else "")
-            + "\n\n各页面真实结构（ARIA snapshot）：\n\n"
-            + multi_snapshot
+            + "\n\n元素引用表（target_ref 只能从这些 ref 中选择，禁止编造）:\n\n"
+            + compact_refs
             + "\n\n用户测试需求（已脱敏，密码等敏感信息已替换为 ${var} 占位符）: "
             + explore_goal
             + "\n\n规则："
             "1. 用户提供的测试数据用 ${var} 占位并声明在 input_contract："
             "需求中给出的值填 default；密码等敏感信息 secret=true 且 default=null；"
-            "2. （G3 refs-only）定位元素一律通过 target_ref 引用元素引用表中的"
-            "系统观察元素（如 obs3:e17）——target_ref 只能从元素引用表选择，"
-            "禁止编造；禁止生成 target/scope 等定位字段（locator 由系统"
-            "根据 ref 确定性编译，不要输出 role/name/text/css/test_id）；"
+            "2. （R7）状态变化型步骤（click/导航）用 transition_ref 引用"
+            "『已验证状态转移』表中的边（t1/t2/...）——系统确定性展开为"
+            "action/target_ref/observation_ref，你无需推导状态机；"
+            "fill/select/check/wait_for/assert_visible/assert_text 用 target_ref"
+            "引用元素引用表中的系统观察元素（如 obs3:e17），禁止编造；"
+            "禁止生成 target/scope 等定位字段（locator 由系统根据 ref 编译）；"
             "3. 每个步骤必须设置 observation_ref，且只能从页面分段标记"
             "（[obs1] [obs2] ...）中选择——禁止创造不存在的 observation_ref；"
             "target_ref 的 obs 前缀必须与 observation_ref 一致；"
@@ -1793,8 +1269,16 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     # 确定性编译，跨状态/编造 ref 执行前拒绝（放在 Preflight 之前：
     # grounding 错位的计划不值得花浏览器轮次修复）。
     def attempt(prompt: str, tables: str | None = None):
+        # R5：显式空字符串也算"已传"（不用 `or`——语义严格，不会把
+        # 显式传的空表误当"没传"回退到完整 snapshot）
+        effective_tables = (
+            tables if tables is not None else compact_refs
+        )
+        # R7.1：verified_edges + observations（state cursor grounding 用）
         case, planner_meta = _generate_planner_case(
-            prompt, mode=planner_mode, tables=tables or multi_snapshot,
+            prompt, mode=planner_mode, tables=effective_tables,
+            verified_edges=verified_edges, observations=pages,
+            entry_url=entry_url,
         )   # ← Schema Recovery ×1（refs-only 模式含契约违规修复）
         case, removed = _normalize_steps(case)   # ← 计划归一化 + 记录删除
         case = _normalize_invalid_scopes(case)   # ← 导航 scope invariant
@@ -1817,6 +1301,15 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
     # （复用探索结果，不重新探索）→ 二次失败 → 异常冒出 → api 400。
     # 不做负例 few-shot 注入——格式错 retry、grounding 错 replan、
     # 仍错 fail honestly，三层结果就够（反模式库保留作 diagnostics）。
+    # S1 第二防线：目标要求的 verified action 缺失 → 明确失败（不进入
+    # Planner——空图/缺目标边生成 = 让 LLM 编测试）。与 Explorer
+    # completion 共用 missing_verified_goal_actions（同一判断，不写两套）。
+    missing_verified = missing_verified_goal_actions(explore_goal, verified_edges)
+    if missing_verified:
+        raise ExplorationIncompleteError(
+            "探索未验证目标动作: " + ", ".join(missing_verified)
+            + "（history 点过 ≠ 成功状态迁移）")
+
     generation_retries = 0
     anti_pattern_used = 0
     try:
@@ -1842,11 +1335,15 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             # 关键：重生时只提供可达 observation 的快照——Planner 看不到
             # 不可达状态（如孤儿 obs5），物理上无法引用它（BFC 实测：
             # 只靠 prompt 提示不够，Planner 会因目标完整性压力继续引用）。
+            # R5：compact 化 + 转移边过滤到 reach 内（不回到 full snapshot）
             if explore_result is not None:
                 sg = StateGraph.from_explore_result(explore_result)
                 reach = _reachable_observations(sg)
                 retry_pages = [p for p in pages if p["id"] in reach]
-                retry_tables = _pages_to_text(retry_pages) if retry_pages else None
+                retry_tr = [t for t in tr
+                            if t.get("from") in reach and t.get("to") in reach]
+                retry_tables = (_build_compact_refs(retry_pages, transitions=retry_tr)
+                                if retry_pages else None)
         case, planner_meta, removed_assertions, compile_stats = attempt(
             grounded_prompt + _build_retry_hint(str(exc)) + extra,
             tables=retry_tables,
@@ -1869,6 +1366,9 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
             "steps_used": (explore_result or {}).get("steps_used", 0),
             "llm_calls": (explore_result or {}).get("llm_calls", 0),
             "done": (explore_result or {}).get("done", False),
+            "termination_reason": (
+                (explore_result or {}).get("termination_reason")
+            ),
             "transitions": (explore_result or {}).get("transitions", []),   # G2：状态转移边
         } if explore_result else None,
         "preflight": None,           # Preflight 校验结果（有多页面快照时才执行）
@@ -1885,20 +1385,9 @@ def generate_dsl(user_prompt: str) -> tuple[DSLCase, dict]:
         },
     }
 
-    # ── 阶段 4：Page-aware Preflight（按 observation_ref 验证 + 分层修复）─
-    # R4（评审）：Preflight 从 hard gate 降级为 optional diagnostics——
-    # 运行时 Resolver 才是定位权威（0/1/N + confidence）；探索快照模拟
-    # runtime locator 曾多次制造假阳性 bug。正式主链：G3 → Compiler →
-    # Runner/Resolver。调试时可临时开 GENERATE_PREFLIGHT。
-    t_preflight = perf_counter()
-    if pages and GENERATE_PREFLIGHT:
-        urls = [p["url"] for p in pages]
-        # 只要跑了 Preflight 就始终返回 stats（修复：不再按条件访问
-        # 可能不存在的 key——避免 repairs=0 时 KeyError）
-        meta["preflight"] = _preflight_and_repair(
-            case, pages, urls, explore_goal, runtime_inputs,
-        )
-    preflight_ms = int((perf_counter() - t_preflight) * 1000)
+    # S1：Preflight 已删除（R4 降级后恒不执行——运行时 Resolver 是定位
+    # 权威，探索快照模拟曾制造假阳性；主链 G3 → Compiler → Runner）
+    preflight_ms = 0
 
     # ── GQ：生成期目标覆盖警告（fail-open，只提示不硬失败）───────────
     # 探索不完整 / 目标动作缺失 / 断言前缺等待 → 前端醒目提示，

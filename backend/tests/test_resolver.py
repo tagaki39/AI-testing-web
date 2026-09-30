@@ -26,9 +26,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # backend/
 
 from locator.resolver import (   # noqa: E402
-    LowConfidenceError, ParsedTarget, build_locator_candidates,
-    build_locator_exact_first, build_locator_for_count,
-    decorated_name_pattern, is_navigation_name, parse_target, snapshot_match,
+    LocatorAmbiguousError, LowConfidenceError, ParsedTarget,
+    build_locator_candidates, build_locator_exact_first,
+    build_locator_for_count, decorated_name_pattern, is_navigation_name,
+    parse_target, snapshot_match,
 )
 
 # FontAwesome 购物车图标（U+F07A，PUA 区）：用 chr() 构造，避免源码含字面 PUA
@@ -173,15 +174,15 @@ def test_candidates_order_and_nav_guard():
             page, ParsedTarget(test_id="add-1"))]
         assert strategies[0] == "test_id"
 
-        # 非导航 button：exact → decorated → fuzzy 全都有，且 exact 在前
+        # 非导航 button：exact → decorated → fuzzy → text 兜底（S1），exact 在前
         strategies = [s for s, _ in build_locator_candidates(
             page, ParsedTarget(role="button", name="Add to cart"))]
-        assert strategies == ["role", "role_decorated", "role_fuzzy"]
+        assert strategies == ["role", "role_decorated", "role_fuzzy", "text"]
 
         # 导航 link（Cart）：禁止 fuzzy 候选（否则会命中 Add to cart / View Cart）
         strategies = [s for s, _ in build_locator_candidates(
             page, ParsedTarget(role="link", name="Cart"))]
-        assert strategies == ["role", "role_decorated"]
+        assert strategies == ["role", "role_decorated", "text"]
 
         # exact 候选只命中 "Cart" 本身（1 个）；fuzzy 本会命中 2 个
         exact_loc = build_locator_candidates(
@@ -370,8 +371,9 @@ def test_snapshot_match_decorated_leading_icon():
 
 
 def test_attach_scope_context_duplicates_only():
-    """I1 采集：同名重复按钮获容器锚点（跳过价格行）；唯一元素零采集。"""
-    from explore import ExploreState, _attach_scope_context, _observe, _parse_elements
+    """Legacy DOM scope（A4.1）：重复 action 获容器锚点（跳过价格行）；
+    唯一元素零采集；只接收 kind=action 候选。"""
+    from explore import ExploreState, _attach_legacy_dom_scope, _observe, _parse_elements
     pw, browser, page = _launch()
     try:
         page.set_content(
@@ -383,7 +385,7 @@ def test_attach_scope_context_duplicates_only():
         state = ExploreState(goal="t", entry_url="https://x.com")
         state.snapshot = _observe(page)
         state.elements = _parse_elements(state.snapshot)
-        _attach_scope_context(state, page)
+        _attach_legacy_dom_scope(page, state.elements)   # 候选 = 全量（函数内过滤 action）
 
         buys = [e for e in state.elements if e.get("name") == "Buy"]
         assert len(buys) == 2
@@ -418,6 +420,126 @@ def test_text_candidates_strip_icon_prefix():
         pw.stop()
 
 
+# ── A4.2：identity_exact 可执行性裁决（normal+overlay 双渲染）─────────────────
+
+def test_a42_identity_2_candidates_1_visible_resolved():
+    """identity_exact 命中 2 个 DOM representation（normal+overlay），
+    恰好 1 个可见 → resolved identity_exact（同一业务实体的重复表示
+    不是真歧义；role 全站多命中不唯一）。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button data-product-id="1">Add to cart</button>\n'
+            '<button data-product-id="2">Add to cart</button>\n'
+            '<button data-product-id="1" style="display:none">Add to cart</button>'
+        )
+        strategy, locator = _resolve_locator(
+            page, {"role": "button", "name": "Add to cart",
+                   "identity": {"attr": "data-product-id", "value": "1"}},
+        )
+        assert strategy == "identity_exact"
+        assert locator.count() == 1
+        assert locator.is_visible()
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_a42_identity_2_visible_equivalent_resolved():
+    """S1：同 identity + 动作语义等价（同 role/文本）→ 同一动作的多个
+    representation（normal/overlay/多区卡片）→ resolved 选第一个。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button data-product-id="1" id="first">Add to cart</button>\n'
+            '<button data-product-id="1" id="second">Add to cart</button>'
+        )
+        strategy, locator = _resolve_locator(
+            page, {"role": "button", "name": "Add to cart",
+                   "identity": {"attr": "data-product-id", "value": "1"}},
+        )
+        assert strategy == "identity_exact"
+        assert locator.count() == 1
+        assert locator.get_attribute("id") == "first"
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_a42_identity_2_visible_diff_action_ambiguous():
+    """S1：同 identity 但动作语义不一致（Add to cart vs Remove）——
+    不是同一动作的 representation → AMBIGUOUS（不因 identity 相同乱点）。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<button data-product-id="1">Add to cart</button>\n'
+            '<button data-product-id="1">Remove</button>'
+        )
+        try:
+            _resolve_locator(
+                page, {"role": "button", "name": "Add to cart",
+                       "identity": {"attr": "data-product-id", "value": "1"}},
+            )
+        except LocatorAmbiguousError:
+            return
+        raise AssertionError("不同动作语义未被拒绝")
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_identity_global_not_scoped():
+    """S1：identity 是业务实体约束——全局建立候选集，scope 容器内
+    0 匹配不得过滤正确 identity（BFC 实测：scope_has_text 采集到相邻
+    卡片时 scoped=0 global=2 → 加购目标被 scope 抹掉）。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content(
+            '<div data-product-id="1"><p>Blue Top</p><a href="#">Add to cart</a></div>\n'
+            '<div data-product-id="8"><p>Fancy Green Top</p><a href="#">Add to cart</a></div>'
+        )
+        # scope 容器错误指向 Blue Top（id=1 卡片），但 identity=8 全局唯一
+        strategy, locator = _resolve_locator(
+            page, {"role": "link", "name": "Add to cart",
+                   "identity": {"attr": "data-product-id", "value": "8"}},
+            scope={"has_text": "Blue Top"},
+        )
+        assert strategy == "identity_exact"
+        assert locator.count() == 1
+        assert "Fancy Green Top" in locator.inner_text()
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def test_href_less_link_text_fallback():
+    """S1：无 href 的 <a>——CDP AX 观察是 link，Playwright 语义是 text。
+    role 定位 0 命中 → text 兜底（get_by_text exact）解决，不放大歧义。"""
+    from execution.runner import _resolve_locator
+    pw, browser, page = _launch()
+    try:
+        page.set_content('<a class="check_out">Proceed To Checkout</a>')
+        strategy, locator = _resolve_locator(
+            page, {"role": "link", "name": "Proceed To Checkout"})
+        assert strategy == "text"
+        assert locator.count() == 1
+        # 兜底不放大歧义：多个同名文本时仍拒绝（诚实）
+        page.set_content(
+            '<a>Proceed To Checkout</a>\n<span>Proceed To Checkout</span>')
+        try:
+            _resolve_locator(page, {"role": "link", "name": "Proceed To Checkout"})
+        except LocatorAmbiguousError:
+            return
+        raise AssertionError("多个同名文本未被拒绝")
+    finally:
+        browser.close()
+        pw.stop()
+
+
 def test_text_node_scope_resolution():
     """文本节点 + 编译 scope：图标前缀文本在容器内唯一命中（I1 完整闭环）。"""
     from execution.runner import _resolve_locator
@@ -442,25 +564,26 @@ def test_text_node_scope_resolution():
         pw.stop()
 
 
-def test_capture_anchors_text_nodes():
-    """采集：重复文本节点（无 role）同样获得容器锚点。"""
-    from explore import ExploreState, _attach_scope_context
+def test_legacy_scope_ignores_evidence():
+    """A4.1 契约：evidence（无 kind=action）不进 legacy DOM scope——
+    get_by_role 只对 action 执行（性能根因防回归：CDP evidence 曾导致
+    空匹配 inner_text 等满超时）。"""
+    from explore import ExploreState, _attach_legacy_dom_scope
     pw, browser, page = _launch()
     try:
         page.set_content(
             '<div data-product-id="p1"><div>Blue Top</div>'
-            '<a class="add">Add to cart</a></div>\n'
-            '<div data-product-id="p2"><div>Red Top</div>'
             '<a class="add">Add to cart</a></div>'
         )
         state = ExploreState(goal="t", entry_url="https://x.com")
         state.elements = [
-            {"ref": "e1", "type": "text", "text": chr(0xF07A) + " Add to cart"},
-            {"ref": "e2", "type": "text", "text": chr(0xF07A) + " Add to cart"},
+            {"ref": "e1", "type": "text", "text": "Add to cart",
+             "kind": "evidence"},   # evidence 不应参与 scope 采集
+            {"ref": "e2", "role": "link", "name": "Add to cart",
+             "kind": "action", "context_role": "listitem"},   # 有 AX context → 不进来
         ]
-        _attach_scope_context(state, page)
-        anchors = {e.get("scope_has_text") for e in state.elements}
-        assert anchors == {"Blue Top", "Red Top"}
+        _attach_legacy_dom_scope(page, state.elements)
+        assert all(e.get("scope_has_text") is None for e in state.elements)
     finally:
         browser.close()
         pw.stop()
